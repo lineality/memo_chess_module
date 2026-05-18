@@ -1,0 +1,1 @@
+# memo_chess_module
