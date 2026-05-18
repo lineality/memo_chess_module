@@ -1339,3 +1339,1370 @@ mod tests_part_1_data_types_and_initial_state {
         assert_copy::<LegalMovesForCurrentTurn>();
     }
 }
+
+// ============================================================================
+// SECTION 13: Notation Parsing — Pre-Screen / Normalize
+// ============================================================================
+/*
+In parse_residue_with_one_digit, the "preamble" extends from the start of the
+residue to one byte before the destination file letter. This means a notation
+like Rac1 decomposes as: preamble = "ra", destination file = 'c', destination
+rank = '1'. The preamble decoder then reads 'r' as Rook and 'a' as a
+disambiguation file. This is consistent with standard chess notation and is
+exercised by the parses_rook_disambiguation_file_rac1 test.
+*/
+
+/// Maximum length of normalized notation input.
+///
+/// ## Sizing Rationale
+///
+/// The longest legal notation byte sequence we accept, after stripping
+/// whitespace and parentheses, is 9 bytes. Examples:
+///
+/// - `"Qa1xb2=Q"` — 8 bytes (piece + full source + capture + dest + promo)
+/// - `"Nbg1xf3"`  — 7 bytes (piece + disambig + source + capture + dest)
+/// - `"resign"`   — 6 bytes (non-move command)
+/// - `"O-O-O"`    — 5 bytes (queenside castle)
+///
+/// The check suffix `+` and mate suffix `#` and annotations (`!`, `?`)
+/// extend this slightly, but every legal form fits in 9 bytes. We use 9
+/// as a hard cap and reject any input that exceeds it after pre-screening.
+pub const NOTATION_NORMALIZED_BUFFER_BYTES: usize = 9;
+
+/// Pre-screens and normalizes a raw notation byte slice.
+///
+/// ## Project Context
+///
+/// This is the first stage of the notation parsing pipeline. The
+/// file-ingestion layer reads `text_message` from a TOML memo file and
+/// passes the resulting byte slice here. This function:
+///
+/// 1. Strips cosmetic characters (whitespace, parentheses).
+/// 2. Lowercases ASCII uppercase letters (so the rest of the pipeline
+///    can compare bytes literally without case-handling everywhere).
+/// 3. Rejects any byte not in the allowed character set.
+/// 4. Enforces the 9-byte maximum length.
+/// 5. Rejects empty input.
+///
+/// By placing this normalization at the front of the pipeline, the
+/// downstream parsers (`parse_move_notation`, `parse_non_move_player_command`)
+/// can assume a canonical, all-lowercase, no-whitespace, bounded-length
+/// input slice with no further input validation needed.
+///
+/// ## Allowed Character Set (after lowercasing)
+///
+/// - Digits:  `0 1 2 3 4 5 6 7 8` (note: `9` is excluded)
+/// - Symbols: `= - + # ! ?`
+/// - Letters: `a b c d e f g h i k n o p q r s w x`
+///
+/// The letters `i`, `s`, `w` are included only because they appear in
+/// the non-move commands `resign` and `draw`. They never appear in legal
+/// chess notation.
+///
+/// ## Arguments
+///
+/// - `input`: the raw byte slice from the TOML memo (or any caller).
+/// - `output_buffer`: a caller-provided fixed-size buffer of exactly
+///   `NOTATION_NORMALIZED_BUFFER_BYTES` (9) bytes into which the
+///   normalized output is written.
+///
+/// ## Returns
+///
+/// - `Some(length)`: success; the normalized bytes occupy
+///   `output_buffer[0..length]`.
+/// - `None`: rejected (empty, oversize, contained non-ASCII, or
+///   contained a disallowed character).
+///
+/// ## Failure Modes
+///
+/// Returns `None` for any of:
+/// - Empty input, or all-whitespace input.
+/// - Input containing any byte `>= 128` (non-ASCII).
+/// - Input containing any byte not in the allowed set above (after
+///   lowercasing and after skipping whitespace/parens).
+/// - Input whose post-stripping length exceeds `NOTATION_NORMALIZED_BUFFER_BYTES`.
+///
+/// ## Memory & Panic Policy
+///
+/// No heap allocation. No panics. Single pass over the input. Bounded
+/// loop (the loop terminates after at most `input.len()` iterations,
+/// and writes are bounds-checked against the output buffer size).
+pub fn pre_screen_and_normalize_notation_input(
+    input: &[u8],
+    output_buffer: &mut [u8; NOTATION_NORMALIZED_BUFFER_BYTES],
+) -> Option<u8> {
+    let mut written_length: usize = 0;
+
+    // Bounded loop: at most input.len() iterations.
+    let mut input_cursor: usize = 0;
+    while input_cursor < input.len() {
+        let raw_byte = input[input_cursor];
+        input_cursor += 1;
+
+        // Skip cosmetic characters silently.
+        match raw_byte {
+            b' ' | b'\t' | b'\r' | b'\n' | b'(' | b')' => continue,
+            _ => {}
+        }
+
+        // Reject non-ASCII outright. The allowed-character check below
+        // would also catch these, but checking explicitly here makes the
+        // failure mode unambiguous.
+        if raw_byte >= 128 {
+            return None;
+        }
+
+        // Lowercase ASCII uppercase letters by adding 32.
+        // `b'A' = 65`, `b'a' = 97`, so b'A' + 32 = b'a'.
+        let normalized_byte: u8 = if raw_byte >= b'A' && raw_byte <= b'Z' {
+            raw_byte + 32
+        } else {
+            raw_byte
+        };
+
+        // Verify the normalized byte is in the allowed set.
+        if !is_byte_in_allowed_notation_set(normalized_byte) {
+            return None;
+        }
+
+        // Bounds-check before writing.
+        if written_length >= NOTATION_NORMALIZED_BUFFER_BYTES {
+            return None;
+        }
+        output_buffer[written_length] = normalized_byte;
+        written_length += 1;
+    }
+
+    // Reject empty result (input was empty or all whitespace/parens).
+    if written_length == 0 {
+        return None;
+    }
+
+    // Safe conversion: `written_length` is at most
+    // `NOTATION_NORMALIZED_BUFFER_BYTES` (9), which fits in u8.
+    Some(written_length as u8)
+}
+
+/// Returns true if the given byte (already lowercased) is in the allowed
+/// notation character set.
+///
+/// This is a private helper used by `pre_screen_and_normalize_notation_input`.
+/// It is a `const fn` so the compiler can optimize the membership check
+/// into a direct match table.
+const fn is_byte_in_allowed_notation_set(lowercased_byte: u8) -> bool {
+    matches!(
+        lowercased_byte,
+        // Digits 0..=8 (9 excluded).
+        b'0' | b'1' | b'2' | b'3' | b'4' | b'5' | b'6' | b'7' | b'8'
+        // Symbols.
+        | b'=' | b'-' | b'+' | b'#' | b'!' | b'?'
+        // File letters a..=h.
+        | b'a' | b'b' | b'c' | b'd' | b'e' | b'f' | b'g' | b'h'
+        // Piece letters (k=King, q=Queen, r=Rook, n=Knight, p=Pawn;
+        // b is already covered above as a file letter; bishop is
+        // disambiguated contextually).
+        | b'k' | b'n' | b'p' | b'q' | b'r'
+        // Castling letter.
+        | b'o'
+        // Capture marker.
+        | b'x'
+        // Letters required only for `draw` and `resign`.
+        | b'i' | b's' | b'w'
+    )
+}
+
+// ============================================================================
+// SECTION 14: Notation Parsing — parse_move_notation / parse_non_move_player_command
+// ============================================================================
+
+/// Parses a notation byte slice into a `ParsedMoveNotation`.
+///
+/// ## Project Context
+///
+/// This is the *syntactic* parser. It accepts the raw bytes of the
+/// `text_message` field from a TOML memo and produces an intermediate
+/// `ParsedMoveNotation` capturing what the player wrote. It does **not**
+/// consult any board state and does **not** check legality.
+///
+/// The output is consumed downstream by
+/// `resolve_parsed_move_to_legal_chess_move` (Part 4/5 of the project),
+/// which matches the parsed notation against the set of legal moves in
+/// the current position.
+///
+/// ## Accepted Notation Forms
+///
+/// - Pawn moves: `e4`, `exd5`, `e8=Q`, `exd8=Q`, `e8Q` (no separator)
+/// - Piece moves: `Nf3`, `Bxc6`, `Rac1`, `R1c3`, `Qa1b2`, `Naxb4`
+/// - Long algebraic: `e2e4`, `e2-e4`, `e4xd5`, `Ng1f3`, `Ng1-f3`, `Bf3xc6`
+/// - Castling: `O-O`, `O-O-O`, `0-0`, `0-0-0` (also `OO`, `OOO` without dashes)
+/// - Suffixes accepted and discarded: `+`, `#`, `!`, `?`, `!!`, `??`, `!?`, `?!`
+///
+/// All forms are accepted case-insensitively (pre-screen lowercases).
+///
+/// ## Returns
+///
+/// - `Ok(ParsedMoveNotation)` on syntactic success.
+/// - `Err(MoveValidationError::InvalidNotation)` for any syntactic failure.
+/// - `Err(MoveValidationError::InvalidPromotionPieceKind)` if the player
+///   explicitly designated promotion to King or Pawn.
+///
+/// ## Failure Modes (all return `Err`)
+///
+/// - Pre-screen rejection (empty, oversize, illegal character).
+/// - Malformed castling sequence.
+/// - Wrong number of rank digits (0, or > 2) in non-castling residue.
+/// - File letter out of `a..=h` range in destination or source position.
+/// - Rank digit `0` or `9` used as a rank (digit `0` is only valid in castling).
+/// - Trailing `=` with no piece letter (e.g., `e8=`).
+/// - Promotion piece is king or pawn (e.g., `e8=K`, `e8=P`).
+///
+/// ## Memory & Panic Policy
+///
+/// No heap. No panics. Operates entirely on a stack `[u8; 9]` buffer.
+pub fn parse_move_notation(input: &[u8]) -> Result<ParsedMoveNotation, MoveValidationError> {
+    // Step 1: pre-screen and normalize.
+    let mut normalized_buffer: [u8; NOTATION_NORMALIZED_BUFFER_BYTES] =
+        [0u8; NOTATION_NORMALIZED_BUFFER_BYTES];
+    let normalized_length =
+        match pre_screen_and_normalize_notation_input(input, &mut normalized_buffer) {
+            Some(length_value) => length_value as usize,
+            None => return Err(MoveValidationError::InvalidNotation),
+        };
+
+    // Defensive: pre-screen guarantees length >= 1 and <= 9.
+    if normalized_length == 0 || normalized_length > NOTATION_NORMALIZED_BUFFER_BYTES {
+        return Err(MoveValidationError::InvalidNotation);
+    }
+
+    // Step 2: strip trailing annotation/check/mate markers (+, #, !, ?).
+    let mut working_length = normalized_length;
+    while working_length > 0 {
+        let last_byte = normalized_buffer[working_length - 1];
+        if last_byte == b'+' || last_byte == b'#' || last_byte == b'!' || last_byte == b'?' {
+            working_length -= 1;
+        } else {
+            break;
+        }
+    }
+    if working_length == 0 {
+        return Err(MoveValidationError::InvalidNotation);
+    }
+
+    // The slice we now operate on is `normalized_buffer[..working_length]`.
+    let residue = &normalized_buffer[..working_length];
+
+    // Step 3: castling detection. A castling residue contains only
+    // `o`, `0`, and `-` characters (after lowercasing).
+    if is_residue_castling_only_characters(residue) {
+        return parse_castling_residue(residue);
+    }
+
+    // Step 4: non-castling decoding by digit-position-first strategy.
+    parse_non_castling_residue(residue)
+}
+
+/// Returns true if every byte in `residue` is one of `o`, `0`, or `-`.
+///
+/// Used to short-circuit castling detection before the more general
+/// non-castling parser runs.
+const fn is_residue_castling_only_characters(residue: &[u8]) -> bool {
+    let mut scan_index: usize = 0;
+    while scan_index < residue.len() {
+        let current_byte = residue[scan_index];
+        if current_byte != b'o' && current_byte != b'0' && current_byte != b'-' {
+            return false;
+        }
+        scan_index += 1;
+    }
+    true
+}
+
+/// Parses a residue known to contain only `o`, `0`, `-`.
+///
+/// After dropping the dashes (which are purely cosmetic), the remaining
+/// length determines castling side:
+/// - Length 2 (`oo`, `00`, `o0`, `0o`) → kingside.
+/// - Length 3 (`ooo`, etc.) → queenside.
+/// - Anything else → `InvalidNotation`.
+///
+/// This lenient policy accepts `O-O`, `O-O-O`, `0-0`, `0-0-0`, and
+/// minor variations like `OO`, `OOO`, mixed `0`/`O`. It does not accept
+/// e.g. a single `O` or four+ `O`s.
+fn parse_castling_residue(residue: &[u8]) -> Result<ParsedMoveNotation, MoveValidationError> {
+    let mut letter_count: u8 = 0;
+    let mut scan_index: usize = 0;
+    while scan_index < residue.len() {
+        let current_byte = residue[scan_index];
+        if current_byte == b'o' || current_byte == b'0' {
+            // Bounded saturating add; in practice letter_count cannot
+            // exceed residue.len() which is at most 9.
+            letter_count = letter_count.saturating_add(1);
+        }
+        scan_index += 1;
+    }
+
+    match letter_count {
+        2 => Ok(make_parsed_castling_notation(true, false)),
+        3 => Ok(make_parsed_castling_notation(false, true)),
+        _ => Err(MoveValidationError::InvalidNotation),
+    }
+}
+
+/// Constructs a `ParsedMoveNotation` representing a castling move.
+const fn make_parsed_castling_notation(
+    is_kingside: bool,
+    is_queenside: bool,
+) -> ParsedMoveNotation {
+    ParsedMoveNotation {
+        piece_kind: PieceKind::King,
+        // Destination fields are unused for castling; set to a sentinel
+        // value (0,0) and let the resolution layer recognize the
+        // castling flags.
+        destination_file: 0,
+        destination_rank: 0,
+        is_capture: false,
+        disambiguation_source_file: None,
+        disambiguation_source_rank: None,
+        promotion_piece_kind: None,
+        explicit_source_file: None,
+        explicit_source_rank: None,
+        is_castle_kingside: is_kingside,
+        is_castle_queenside: is_queenside,
+    }
+}
+
+/// Parses a non-castling notation residue using the digit-position-first
+/// strategy documented in the module-level docs.
+///
+/// The residue at this point:
+/// - Contains no whitespace, parens, or trailing annotation markers.
+/// - Is all lowercase ASCII.
+/// - Is in the allowed character set.
+/// - Does NOT consist entirely of `o`/`0`/`-` (that case was handled
+///   by `parse_castling_residue`).
+///
+/// The strategy:
+/// 1. Locate all rank-digit positions (`1`..=`8`) in the residue.
+/// 2. Branch on digit count: exactly 1 (destination only) or exactly 2
+///    (source + destination, where the leftmost digit may be a
+///    disambiguation rank rather than a source rank).
+/// 3. Extract preamble bytes (before the source square or destination
+///    square), which may contain an optional piece letter, optional
+///    disambiguation character, and an optional `x` capture marker.
+/// 4. Extract suffix bytes (after the destination square), which may
+///    contain an optional promotion designation.
+fn parse_non_castling_residue(residue: &[u8]) -> Result<ParsedMoveNotation, MoveValidationError> {
+    // Locate digit positions. A residue of length <= 9 has at most 9
+    // digit positions; bounded loop.
+    let mut digit_position_buffer: [usize; NOTATION_NORMALIZED_BUFFER_BYTES] =
+        [0usize; NOTATION_NORMALIZED_BUFFER_BYTES];
+    let mut digit_count: usize = 0;
+    let mut scan_index: usize = 0;
+    while scan_index < residue.len() {
+        let current_byte = residue[scan_index];
+        // `0` is rejected here for non-castling notation: as a rank, the
+        // only valid digits are 1..=8. (Pre-screen lets `0` through for
+        // castling; that branch has already been taken.)
+        if current_byte == b'0' {
+            return Err(MoveValidationError::InvalidNotation);
+        }
+        if current_byte >= b'1' && current_byte <= b'8' {
+            if digit_count >= NOTATION_NORMALIZED_BUFFER_BYTES {
+                // Defensive backstop; cannot occur in practice.
+                return Err(MoveValidationError::InvalidNotation);
+            }
+            digit_position_buffer[digit_count] = scan_index;
+            digit_count += 1;
+        }
+        scan_index += 1;
+    }
+
+    if digit_count == 0 || digit_count > 2 {
+        return Err(MoveValidationError::InvalidNotation);
+    }
+
+    if digit_count == 1 {
+        return parse_residue_with_one_digit(residue, digit_position_buffer[0]);
+    }
+
+    // digit_count == 2
+    parse_residue_with_two_digits(residue, digit_position_buffer[0], digit_position_buffer[1])
+}
+
+/// Parses a residue containing exactly one rank digit.
+///
+/// Layout:
+///
+/// ```text
+///   [ preamble bytes ] [ destination_file ] [ destination_rank ] [ promotion suffix ]
+/// ```
+///
+/// - The destination rank is the digit at `digit_index`.
+/// - The destination file is the byte immediately preceding it.
+/// - The preamble (everything before the destination file) may contain:
+///     - An optional piece letter (`k`, `q`, `r`, `b`, `n`, `p`).
+///     - An optional disambiguation character (file letter or rank
+///       digit — but rank digit disambiguation is excluded here because
+///       we already know there is only one digit and it is the
+///       destination rank).
+///     - An optional `x` capture marker.
+/// - The suffix (everything after the destination rank) may be a
+///   promotion designation: `=Q`, `Q`, etc.
+fn parse_residue_with_one_digit(
+    residue: &[u8],
+    digit_index: usize,
+) -> Result<ParsedMoveNotation, MoveValidationError> {
+    // Defensive bounds: digit_index must be at least 1 (need a file
+    // letter before it) and within the residue.
+    if digit_index == 0 || digit_index >= residue.len() {
+        return Err(MoveValidationError::InvalidNotation);
+    }
+
+    let destination_rank_byte = residue[digit_index];
+    let destination_file_byte = residue[digit_index - 1];
+
+    let destination_rank = match rank_index_from_digit_byte(destination_rank_byte) {
+        Some(rank_value) => rank_value,
+        None => return Err(MoveValidationError::InvalidNotation),
+    };
+    let destination_file = match file_index_from_letter_byte(destination_file_byte) {
+        Some(file_value) => file_value,
+        None => return Err(MoveValidationError::InvalidNotation),
+    };
+
+    // Preamble = residue[0..(digit_index - 1)].
+    let preamble = &residue[..(digit_index - 1)];
+
+    // Suffix = residue[(digit_index + 1)..].
+    let suffix = &residue[(digit_index + 1)..];
+
+    let (piece_kind_value, disambig_file_opt, disambig_rank_opt, is_capture_flag) =
+        decode_preamble_bytes(preamble)?;
+
+    let promotion_piece_kind_opt = decode_promotion_suffix_bytes(suffix)?;
+
+    Ok(ParsedMoveNotation {
+        piece_kind: piece_kind_value,
+        destination_file,
+        destination_rank,
+        is_capture: is_capture_flag,
+        disambiguation_source_file: disambig_file_opt,
+        disambiguation_source_rank: disambig_rank_opt,
+        promotion_piece_kind: promotion_piece_kind_opt,
+        explicit_source_file: None,
+        explicit_source_rank: None,
+        is_castle_kingside: false,
+        is_castle_queenside: false,
+    })
+}
+
+/// Parses a residue containing exactly two rank digits.
+///
+/// Two cases distinguished by the byte immediately before the *leftmost*
+/// digit:
+///
+/// **Case A: byte before leftmost digit is a file letter `a..=h`.**
+/// This is long-algebraic notation. Layout:
+///
+/// ```text
+///   [ preamble bytes ] [ source_file ] [ source_rank ] [ optional separator(s) ]
+///   [ destination_file ] [ destination_rank ] [ promotion suffix ]
+/// ```
+///
+/// The preamble may contain an optional piece letter and an optional
+/// disambiguation character. The separators between the source square
+/// and destination square may be `-` (cosmetic) and/or `x` (capture).
+///
+/// **Case B: byte before leftmost digit is NOT a file letter.**
+/// The leftmost digit is a disambiguation rank. Layout:
+///
+/// ```text
+///   [ piece letter? ] [ disambig_rank (= leftmost digit) ] [ optional `x` ]
+///   [ destination_file ] [ destination_rank ] [ promotion suffix ]
+/// ```
+fn parse_residue_with_two_digits(
+    residue: &[u8],
+    left_digit_index: usize,
+    right_digit_index: usize,
+) -> Result<ParsedMoveNotation, MoveValidationError> {
+    // Defensive ordering check.
+    if left_digit_index >= right_digit_index {
+        return Err(MoveValidationError::InvalidNotation);
+    }
+    // Destination file must immediately precede the right digit.
+    if right_digit_index == 0 {
+        return Err(MoveValidationError::InvalidNotation);
+    }
+
+    let destination_file_byte = residue[right_digit_index - 1];
+    let destination_rank_byte = residue[right_digit_index];
+
+    let destination_rank = match rank_index_from_digit_byte(destination_rank_byte) {
+        Some(rank_value) => rank_value,
+        None => return Err(MoveValidationError::InvalidNotation),
+    };
+    let destination_file = match file_index_from_letter_byte(destination_file_byte) {
+        Some(file_value) => file_value,
+        None => return Err(MoveValidationError::InvalidNotation),
+    };
+
+    let left_digit_rank = match rank_index_from_digit_byte(residue[left_digit_index]) {
+        Some(rank_value) => rank_value,
+        None => return Err(MoveValidationError::InvalidNotation),
+    };
+
+    // Classify by the byte immediately to the left of the leftmost digit.
+    let has_byte_before_left_digit = left_digit_index > 0;
+    let byte_before_left_digit_opt: Option<u8> = if has_byte_before_left_digit {
+        Some(residue[left_digit_index - 1])
+    } else {
+        None
+    };
+
+    let suffix = &residue[(right_digit_index + 1)..];
+    let promotion_piece_kind_opt = decode_promotion_suffix_bytes(suffix)?;
+
+    if let Some(byte_before_left) = byte_before_left_digit_opt {
+        if let Some(source_file_value) = file_index_from_letter_byte(byte_before_left) {
+            // Case A: long algebraic.
+            // The bytes between the source rank digit and the destination
+            // file byte are optional separators (`-`, `x`).
+            // Destination file is at `right_digit_index - 1`.
+            // Source rank digit is at `left_digit_index`.
+            let separator_slice =
+                if right_digit_index >= 1 && (right_digit_index - 1) > (left_digit_index + 1) {
+                    &residue[(left_digit_index + 1)..(right_digit_index - 1)]
+                } else {
+                    // Empty separator region (source square is directly
+                    // followed by destination square, e.g. `e2e4`).
+                    &residue[0..0]
+                };
+
+            let mut is_capture_flag = false;
+            let mut separator_scan: usize = 0;
+            while separator_scan < separator_slice.len() {
+                let separator_byte = separator_slice[separator_scan];
+                match separator_byte {
+                    b'-' => {} // cosmetic, discard
+                    b'x' => is_capture_flag = true,
+                    _ => return Err(MoveValidationError::InvalidNotation),
+                }
+                separator_scan += 1;
+            }
+
+            // The preamble (bytes before the source file letter) may
+            // contain an optional piece letter and an optional
+            // disambiguation character.
+            let preamble_end_index = left_digit_index - 1; // position of source file letter
+            let preamble = &residue[..preamble_end_index];
+
+            // For long-algebraic forms, the preamble decoder must not
+            // emit a capture marker (`x` would have to appear before the
+            // source square, which is not a legal position for it). We
+            // call the standard preamble decoder and combine its
+            // capture flag with the one we found in the separator region.
+            let (piece_kind_value, disambig_file_opt, disambig_rank_opt, preamble_capture_flag) =
+                decode_preamble_bytes(preamble)?;
+
+            let combined_capture_flag = is_capture_flag || preamble_capture_flag;
+
+            return Ok(ParsedMoveNotation {
+                piece_kind: piece_kind_value,
+                destination_file,
+                destination_rank,
+                is_capture: combined_capture_flag,
+                disambiguation_source_file: disambig_file_opt,
+                disambiguation_source_rank: disambig_rank_opt,
+                promotion_piece_kind: promotion_piece_kind_opt,
+                explicit_source_file: Some(source_file_value),
+                explicit_source_rank: Some(left_digit_rank),
+                is_castle_kingside: false,
+                is_castle_queenside: false,
+            });
+        }
+    }
+
+    // Case B: leftmost digit is a disambiguation rank.
+    // Preamble = residue[..left_digit_index] is the piece letter (optional).
+    // Between left_digit_index and (right_digit_index - 1): optional `x`.
+    let preamble = &residue[..left_digit_index];
+    let between_slice = &residue[(left_digit_index + 1)..(right_digit_index - 1)];
+
+    let mut is_capture_flag = false;
+    let mut between_scan: usize = 0;
+    while between_scan < between_slice.len() {
+        let between_byte = between_slice[between_scan];
+        match between_byte {
+            b'x' => is_capture_flag = true,
+            _ => return Err(MoveValidationError::InvalidNotation),
+        }
+        between_scan += 1;
+    }
+
+    let (piece_kind_value, disambig_file_opt, _ignored_disambig_rank, preamble_capture_flag) =
+        decode_preamble_bytes(preamble)?;
+
+    let combined_capture_flag = is_capture_flag || preamble_capture_flag;
+
+    Ok(ParsedMoveNotation {
+        piece_kind: piece_kind_value,
+        destination_file,
+        destination_rank,
+        is_capture: combined_capture_flag,
+        disambiguation_source_file: disambig_file_opt,
+        // The leftmost digit is the disambiguation rank in case B.
+        disambiguation_source_rank: Some(left_digit_rank),
+        promotion_piece_kind: promotion_piece_kind_opt,
+        explicit_source_file: None,
+        explicit_source_rank: None,
+        is_castle_kingside: false,
+        is_castle_queenside: false,
+    })
+}
+
+/// Decodes a preamble byte slice.
+///
+/// The preamble is everything that appears before a destination square
+/// (or before a source square in long-algebraic notation). It may
+/// contain:
+///
+/// - An optional leading piece letter (`k`, `q`, `r`, `b`, `n`, `p`).
+///   - Note: a leading `b` is ambiguous between "bishop" and "file b".
+///     This decoder treats a leading `b` as a *file letter (i.e.,
+///     disambiguation)* if and only if the preamble is exactly one byte
+///     long (e.g., `bxc4` produces preamble `"b"`, which is the b-file
+///     pawn). Otherwise, a leading `b` followed by more bytes is treated
+///     as the bishop piece letter (e.g., `bc4` preamble `"b"` would
+///     conflict — see disambiguation logic below).
+///   - In practice, the disambiguation rule is: if the preamble starts
+///     with a piece letter `k q r n` (unambiguous piece letters), strip
+///     it as the piece. If it starts with `p`, strip it as Pawn. If it
+///     starts with `b`, examine the remaining preamble: if the remaining
+///     bytes form a valid disambiguation set (file letter and/or rank
+///     digit) plus optional `x`, then `b` is the Bishop piece letter;
+///     otherwise `b` is a disambiguation file. We use a simple
+///     length-based heuristic: a `b` followed by exactly one
+///     disambiguation character (file letter, rank digit, or `x`) is
+///     ambiguous; we resolve it as **bishop** by default (the more
+///     common case in real play).
+///
+///     *Concretely for this parser:* any leading letter in
+///     `{k, q, r, b, n, p}` is treated as a piece letter. So `bxc4`
+///     produces preamble `"b"` which is Bishop (preamble length 1, just
+///     the piece letter). To express "b-file pawn captures c4" the
+///     player must write `bxc4` as well — and the resolution layer
+///     handles this: if Bishop cannot reach c4 but the b-pawn can, the
+///     legal-move match will fail and the layer can re-try as a pawn.
+///
+///     **However**, for this parser's level of responsibility (pure
+///     syntax), we take the simplest rule: leading `b` is Bishop. If
+///     this turns out to cause friction in real play, the resolution
+///     layer can be enhanced to retry pawn interpretation.
+///
+/// - An optional disambiguation file letter (`a`..=`h`) and/or
+///   disambiguation rank digit (`1`..=`8`). Only one of each.
+/// - An optional `x` capture marker (must be the last byte of the
+///   preamble if present).
+///
+/// ## Returns
+///
+/// `(piece_kind, disambig_file_opt, disambig_rank_opt, is_capture_flag)`.
+///
+/// Defaults if preamble is empty: `Pawn`, `None`, `None`, `false`.
+fn decode_preamble_bytes(
+    preamble: &[u8],
+) -> Result<(PieceKind, Option<u8>, Option<u8>, bool), MoveValidationError> {
+    let mut cursor: usize = 0;
+    let mut piece_kind_value: PieceKind = PieceKind::Pawn;
+    let mut disambig_file_opt: Option<u8> = None;
+    let mut disambig_rank_opt: Option<u8> = None;
+    let mut is_capture_flag: bool = false;
+
+    // Step 1: optional leading piece letter.
+    if cursor < preamble.len() {
+        let first_byte = preamble[cursor];
+        match first_byte {
+            b'k' => {
+                piece_kind_value = PieceKind::King;
+                cursor += 1;
+            }
+            b'q' => {
+                piece_kind_value = PieceKind::Queen;
+                cursor += 1;
+            }
+            b'r' => {
+                piece_kind_value = PieceKind::Rook;
+                cursor += 1;
+            }
+            b'n' => {
+                piece_kind_value = PieceKind::Knight;
+                cursor += 1;
+            }
+            b'p' => {
+                piece_kind_value = PieceKind::Pawn;
+                cursor += 1;
+            }
+            b'b' => {
+                // Ambiguous: bishop OR file-b disambiguation.
+                // Resolve as Bishop if there is at least one more byte
+                // after `b` that is NOT an `x` (i.e., something that
+                // could be a destination-related continuation).
+                // For `bxc4`-style: preamble is `b` only (length 1), so
+                // there is no "more byte after b" — Bishop with no
+                // disambiguation. For `bxc4` the preamble after the
+                // destination scan is actually `bx`, which we handle as
+                // Bishop + capture below.
+                piece_kind_value = PieceKind::Bishop;
+                cursor += 1;
+            }
+            _ => {
+                // No piece letter; leave as Pawn.
+            }
+        }
+    }
+
+    // Step 2: optional disambiguation chars and capture marker.
+    // The remaining preamble may contain at most: one file letter, one
+    // rank digit, one `x` — in any order, with no other characters.
+    while cursor < preamble.len() {
+        let current_byte = preamble[cursor];
+        cursor += 1;
+
+        if current_byte == b'x' {
+            if is_capture_flag {
+                // Two `x` markers — invalid.
+                return Err(MoveValidationError::InvalidNotation);
+            }
+            is_capture_flag = true;
+            continue;
+        }
+
+        if let Some(file_value) = file_index_from_letter_byte(current_byte) {
+            if disambig_file_opt.is_some() {
+                return Err(MoveValidationError::InvalidNotation);
+            }
+            disambig_file_opt = Some(file_value);
+            continue;
+        }
+
+        if let Some(rank_value) = rank_index_from_digit_byte(current_byte) {
+            if disambig_rank_opt.is_some() {
+                return Err(MoveValidationError::InvalidNotation);
+            }
+            disambig_rank_opt = Some(rank_value);
+            continue;
+        }
+
+        // Anything else in the preamble is invalid.
+        return Err(MoveValidationError::InvalidNotation);
+    }
+
+    Ok((
+        piece_kind_value,
+        disambig_file_opt,
+        disambig_rank_opt,
+        is_capture_flag,
+    ))
+}
+
+/// Decodes a promotion suffix slice.
+///
+/// Accepted forms:
+/// - Empty slice → `None` (no promotion).
+/// - `=q`, `=r`, `=b`, `=n` → `Some(corresponding PieceKind)`.
+/// - `q`, `r`, `b`, `n` (no `=`) → `Some(corresponding PieceKind)`.
+///
+/// Rejected forms:
+/// - `=k`, `=p`, bare `k`, bare `p` → `InvalidPromotionPieceKind`.
+/// - `=` alone (no piece letter after) → `InvalidNotation`.
+/// - Any other byte content → `InvalidNotation`.
+fn decode_promotion_suffix_bytes(suffix: &[u8]) -> Result<Option<PieceKind>, MoveValidationError> {
+    if suffix.is_empty() {
+        return Ok(None);
+    }
+
+    let piece_letter_byte: u8 = if suffix[0] == b'=' {
+        // Form: `=X`.
+        if suffix.len() != 2 {
+            return Err(MoveValidationError::InvalidNotation);
+        }
+        suffix[1]
+    } else {
+        // Form: bare `X`.
+        if suffix.len() != 1 {
+            return Err(MoveValidationError::InvalidNotation);
+        }
+        suffix[0]
+    };
+
+    match piece_letter_byte {
+        b'q' => Ok(Some(PieceKind::Queen)),
+        b'r' => Ok(Some(PieceKind::Rook)),
+        b'b' => Ok(Some(PieceKind::Bishop)),
+        b'n' => Ok(Some(PieceKind::Knight)),
+        b'k' | b'p' => Err(MoveValidationError::InvalidPromotionPieceKind),
+        _ => Err(MoveValidationError::InvalidNotation),
+    }
+}
+
+/// Converts a rank digit byte (`b'1'`..=`b'8'`) to a rank index (0..=7).
+///
+/// Returns `None` for any other byte, including `b'0'` and `b'9'`.
+const fn rank_index_from_digit_byte(byte_value: u8) -> Option<u8> {
+    if byte_value >= b'1' && byte_value <= b'8' {
+        Some(byte_value - b'1')
+    } else {
+        None
+    }
+}
+
+/// Converts a file letter byte (`b'a'`..=`b'h'`) to a file index (0..=7).
+///
+/// Returns `None` for any other byte. Assumes the byte has already been
+/// lowercased by the pre-screener.
+const fn file_index_from_letter_byte(byte_value: u8) -> Option<u8> {
+    if byte_value >= b'a' && byte_value <= b'h' {
+        Some(byte_value - b'a')
+    } else {
+        None
+    }
+}
+
+/// Parses a notation byte slice as a non-move player command.
+///
+/// ## Project Context
+///
+/// Players may write `draw` or `resign` in the `text_message` field of
+/// a TOML memo instead of a chess move. The file-ingestion layer should
+/// call this function first; if it returns `None`, the layer should
+/// then attempt `parse_move_notation`.
+///
+/// ## Returns
+///
+/// - `Some(NonMovePlayerCommand::Draw)` for input that normalizes to `"draw"`.
+/// - `Some(NonMovePlayerCommand::Resign)` for input that normalizes to `"resign"`.
+/// - `None` for anything else, including pre-screen rejection.
+///
+/// ## Memory & Panic Policy
+///
+/// No heap. No panics. Bounded loop.
+pub fn parse_non_move_player_command(input: &[u8]) -> Option<NonMovePlayerCommand> {
+    let mut normalized_buffer: [u8; NOTATION_NORMALIZED_BUFFER_BYTES] =
+        [0u8; NOTATION_NORMALIZED_BUFFER_BYTES];
+    let normalized_length = pre_screen_and_normalize_notation_input(input, &mut normalized_buffer)?;
+
+    let normalized_slice = &normalized_buffer[..(normalized_length as usize)];
+
+    if normalized_slice == b"draw" {
+        return Some(NonMovePlayerCommand::Draw);
+    }
+    if normalized_slice == b"resign" {
+        return Some(NonMovePlayerCommand::Resign);
+    }
+    None
+}
+
+// ============================================================================
+// SECTION 15: Tests for Notation Parsing
+// ============================================================================
+
+#[cfg(test)]
+mod tests_pre_screen {
+    //! Tests for `pre_screen_and_normalize_notation_input`.
+    //!
+    //! These tests verify acceptance/rejection at the pre-screen stage
+    //! independent of any downstream parsing.
+
+    use super::*;
+
+    #[test]
+    fn pre_screen_rejects_empty_input() {
+        let mut output_buffer = [0u8; NOTATION_NORMALIZED_BUFFER_BYTES];
+        assert_eq!(
+            pre_screen_and_normalize_notation_input(b"", &mut output_buffer),
+            None
+        );
+    }
+
+    #[test]
+    fn pre_screen_rejects_all_whitespace_input() {
+        let mut output_buffer = [0u8; NOTATION_NORMALIZED_BUFFER_BYTES];
+        assert_eq!(
+            pre_screen_and_normalize_notation_input(b"   \t \r\n  ", &mut output_buffer),
+            None
+        );
+    }
+
+    #[test]
+    fn pre_screen_rejects_oversize_input() {
+        // 10 valid chars after stripping → reject.
+        let mut output_buffer = [0u8; NOTATION_NORMALIZED_BUFFER_BYTES];
+        assert_eq!(
+            pre_screen_and_normalize_notation_input(b"abcdefghij", &mut output_buffer),
+            None
+        );
+    }
+
+    #[test]
+    fn pre_screen_rejects_non_ascii_input() {
+        let non_ascii_input: [u8; 3] = [b'e', 0xC3, b'4'];
+        let mut output_buffer = [0u8; NOTATION_NORMALIZED_BUFFER_BYTES];
+        assert_eq!(
+            pre_screen_and_normalize_notation_input(&non_ascii_input, &mut output_buffer),
+            None
+        );
+    }
+
+    #[test]
+    fn pre_screen_rejects_disallowed_punctuation() {
+        let mut output_buffer = [0u8; NOTATION_NORMALIZED_BUFFER_BYTES];
+        assert_eq!(
+            pre_screen_and_normalize_notation_input(b"e4@", &mut output_buffer),
+            None
+        );
+        assert_eq!(
+            pre_screen_and_normalize_notation_input(b"e4/", &mut output_buffer),
+            None
+        );
+    }
+
+    #[test]
+    fn pre_screen_accepts_and_lowercases_uppercase_letters() {
+        let mut output_buffer = [0u8; NOTATION_NORMALIZED_BUFFER_BYTES];
+        let length_opt = pre_screen_and_normalize_notation_input(b"E4", &mut output_buffer);
+        assert_eq!(length_opt, Some(2));
+        assert_eq!(&output_buffer[..2], b"e4");
+    }
+
+    #[test]
+    fn pre_screen_strips_parentheses() {
+        let mut output_buffer = [0u8; NOTATION_NORMALIZED_BUFFER_BYTES];
+        let length_opt = pre_screen_and_normalize_notation_input(b"(e4)", &mut output_buffer);
+        assert_eq!(length_opt, Some(2));
+        assert_eq!(&output_buffer[..2], b"e4");
+    }
+
+    #[test]
+    fn pre_screen_strips_internal_whitespace() {
+        let mut output_buffer = [0u8; NOTATION_NORMALIZED_BUFFER_BYTES];
+        let length_opt = pre_screen_and_normalize_notation_input(b" N f 3 ", &mut output_buffer);
+        assert_eq!(length_opt, Some(3));
+        assert_eq!(&output_buffer[..3], b"nf3");
+    }
+}
+
+#[cfg(test)]
+mod tests_pawn_moves {
+    //! Tests for pawn move notation parsing.
+
+    use super::*;
+
+    #[test]
+    fn parses_pawn_advance_e4() {
+        let result = parse_move_notation(b"e4").expect("e4 should parse");
+        assert_eq!(result.piece_kind, PieceKind::Pawn);
+        assert_eq!(result.destination_file, 4); // 'e' - 'a' = 4
+        assert_eq!(result.destination_rank, 3); // '4' - '1' = 3
+        assert!(!result.is_capture);
+        assert_eq!(result.disambiguation_source_file, None);
+        assert_eq!(result.disambiguation_source_rank, None);
+        assert_eq!(result.promotion_piece_kind, None);
+    }
+
+    #[test]
+    fn parses_pawn_capture_exd5() {
+        let result = parse_move_notation(b"exd5").expect("exd5 should parse");
+        assert_eq!(result.piece_kind, PieceKind::Pawn);
+        assert_eq!(result.destination_file, 3); // 'd'
+        assert_eq!(result.destination_rank, 4); // '5'
+        assert!(result.is_capture);
+        assert_eq!(result.disambiguation_source_file, Some(4)); // 'e'
+    }
+
+    #[test]
+    fn parses_pawn_promotion_e8_eq_q() {
+        let result = parse_move_notation(b"e8=Q").expect("e8=Q should parse");
+        assert_eq!(result.piece_kind, PieceKind::Pawn);
+        assert_eq!(result.destination_file, 4);
+        assert_eq!(result.destination_rank, 7);
+        assert_eq!(result.promotion_piece_kind, Some(PieceKind::Queen));
+    }
+
+    #[test]
+    fn parses_pawn_capture_with_promotion_exd8_eq_q() {
+        let result = parse_move_notation(b"exd8=Q").expect("exd8=Q should parse");
+        assert_eq!(result.piece_kind, PieceKind::Pawn);
+        assert_eq!(result.destination_file, 3);
+        assert_eq!(result.destination_rank, 7);
+        assert!(result.is_capture);
+        assert_eq!(result.disambiguation_source_file, Some(4)); // 'e'
+        assert_eq!(result.promotion_piece_kind, Some(PieceKind::Queen));
+    }
+
+    #[test]
+    fn parses_pawn_promotion_no_separator_e8q() {
+        let result = parse_move_notation(b"e8Q").expect("e8Q should parse");
+        assert_eq!(result.destination_file, 4);
+        assert_eq!(result.destination_rank, 7);
+        assert_eq!(result.promotion_piece_kind, Some(PieceKind::Queen));
+    }
+
+    #[test]
+    fn rejects_promotion_to_king() {
+        assert_eq!(
+            parse_move_notation(b"e8=K"),
+            Err(MoveValidationError::InvalidPromotionPieceKind)
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests_piece_moves {
+    //! Tests for piece (non-pawn) move notation parsing.
+
+    use super::*;
+
+    #[test]
+    fn parses_knight_nf3() {
+        let result = parse_move_notation(b"Nf3").expect("Nf3 should parse");
+        assert_eq!(result.piece_kind, PieceKind::Knight);
+        assert_eq!(result.destination_file, 5); // 'f'
+        assert_eq!(result.destination_rank, 2); // '3'
+    }
+
+    #[test]
+    fn parses_bishop_capture_bxc6() {
+        let result = parse_move_notation(b"Bxc6").expect("Bxc6 should parse");
+        assert_eq!(result.piece_kind, PieceKind::Bishop);
+        assert_eq!(result.destination_file, 2); // 'c'
+        assert_eq!(result.destination_rank, 5); // '6'
+        assert!(result.is_capture);
+    }
+
+    #[test]
+    fn parses_rook_rc1() {
+        let result = parse_move_notation(b"Rc1").expect("Rc1 should parse");
+        assert_eq!(result.piece_kind, PieceKind::Rook);
+        assert_eq!(result.destination_file, 2);
+        assert_eq!(result.destination_rank, 0);
+    }
+
+    #[test]
+    fn parses_queen_qd1() {
+        let result = parse_move_notation(b"Qd1").expect("Qd1 should parse");
+        assert_eq!(result.piece_kind, PieceKind::Queen);
+        assert_eq!(result.destination_file, 3);
+        assert_eq!(result.destination_rank, 0);
+    }
+
+    #[test]
+    fn parses_king_ke2() {
+        let result = parse_move_notation(b"Ke2").expect("Ke2 should parse");
+        assert_eq!(result.piece_kind, PieceKind::King);
+        assert_eq!(result.destination_file, 4);
+        assert_eq!(result.destination_rank, 1);
+    }
+
+    #[test]
+    fn parses_rook_disambiguation_file_rac1() {
+        let result = parse_move_notation(b"Rac1").expect("Rac1 should parse");
+        assert_eq!(result.piece_kind, PieceKind::Rook);
+        assert_eq!(result.disambiguation_source_file, Some(0)); // 'a'
+        assert_eq!(result.destination_file, 2);
+        assert_eq!(result.destination_rank, 0);
+    }
+
+    #[test]
+    fn parses_rook_disambiguation_rank_r1c3() {
+        let result = parse_move_notation(b"R1c3").expect("R1c3 should parse");
+        assert_eq!(result.piece_kind, PieceKind::Rook);
+        assert_eq!(result.disambiguation_source_rank, Some(0)); // '1'
+        assert_eq!(result.destination_file, 2);
+        assert_eq!(result.destination_rank, 2);
+    }
+}
+
+#[cfg(test)]
+mod tests_disambiguation {
+    //! Tests for disambiguation parsing.
+
+    use super::*;
+
+    #[test]
+    fn file_only_disambiguation() {
+        let result = parse_move_notation(b"Nbd2").expect("Nbd2 should parse");
+        assert_eq!(result.piece_kind, PieceKind::Knight);
+        assert_eq!(result.disambiguation_source_file, Some(1)); // 'b'
+        assert_eq!(result.disambiguation_source_rank, None);
+        assert_eq!(result.destination_file, 3); // 'd'
+        assert_eq!(result.destination_rank, 1); // '2'
+    }
+
+    #[test]
+    fn rank_only_disambiguation() {
+        let result = parse_move_notation(b"N3d2").expect("N3d2 should parse");
+        assert_eq!(result.piece_kind, PieceKind::Knight);
+        assert_eq!(result.disambiguation_source_file, None);
+        assert_eq!(result.disambiguation_source_rank, Some(2)); // '3'
+        assert_eq!(result.destination_file, 3);
+        assert_eq!(result.destination_rank, 1);
+    }
+
+    #[test]
+    fn full_square_disambiguation_qa1b2() {
+        // "Qa1b2" is two-digit residue. Left digit '1' is preceded by
+        // file letter 'a', so this is long algebraic: source a1 → b2.
+        let result = parse_move_notation(b"Qa1b2").expect("Qa1b2 should parse");
+        assert_eq!(result.piece_kind, PieceKind::Queen);
+        assert_eq!(result.explicit_source_file, Some(0));
+        assert_eq!(result.explicit_source_rank, Some(0));
+        assert_eq!(result.destination_file, 1);
+        assert_eq!(result.destination_rank, 1);
+    }
+
+    #[test]
+    fn file_disambiguation_with_capture_naxb4() {
+        let result = parse_move_notation(b"Naxb4").expect("Naxb4 should parse");
+        assert_eq!(result.piece_kind, PieceKind::Knight);
+        assert_eq!(result.disambiguation_source_file, Some(0)); // 'a'
+        assert!(result.is_capture);
+        assert_eq!(result.destination_file, 1); // 'b'
+        assert_eq!(result.destination_rank, 3); // '4'
+    }
+}
+
+#[cfg(test)]
+mod tests_long_algebraic {
+    //! Tests for long-algebraic notation parsing.
+
+    use super::*;
+
+    #[test]
+    fn parses_long_algebraic_e2e4() {
+        let result = parse_move_notation(b"e2e4").expect("e2e4 should parse");
+        assert_eq!(result.piece_kind, PieceKind::Pawn);
+        assert_eq!(result.explicit_source_file, Some(4));
+        assert_eq!(result.explicit_source_rank, Some(1));
+        assert_eq!(result.destination_file, 4);
+        assert_eq!(result.destination_rank, 3);
+        assert!(!result.is_capture);
+    }
+
+    #[test]
+    fn parses_long_algebraic_with_hyphen_e2_dash_e4() {
+        let result = parse_move_notation(b"e2-e4").expect("e2-e4 should parse");
+        assert_eq!(result.explicit_source_file, Some(4));
+        assert_eq!(result.explicit_source_rank, Some(1));
+        assert_eq!(result.destination_file, 4);
+        assert_eq!(result.destination_rank, 3);
+        assert!(!result.is_capture);
+    }
+
+    #[test]
+    fn parses_long_algebraic_with_capture_e4xd5() {
+        let result = parse_move_notation(b"e4xd5").expect("e4xd5 should parse");
+        assert_eq!(result.explicit_source_file, Some(4));
+        assert_eq!(result.explicit_source_rank, Some(3));
+        assert_eq!(result.destination_file, 3);
+        assert_eq!(result.destination_rank, 4);
+        assert!(result.is_capture);
+    }
+
+    #[test]
+    fn parses_long_algebraic_with_piece_ng1f3() {
+        let result = parse_move_notation(b"Ng1f3").expect("Ng1f3 should parse");
+        assert_eq!(result.piece_kind, PieceKind::Knight);
+        assert_eq!(result.explicit_source_file, Some(6)); // 'g'
+        assert_eq!(result.explicit_source_rank, Some(0)); // '1'
+        assert_eq!(result.destination_file, 5); // 'f'
+        assert_eq!(result.destination_rank, 2); // '3'
+    }
+
+    #[test]
+    fn parses_long_algebraic_with_piece_and_hyphen_ng1_dash_f3() {
+        let result = parse_move_notation(b"Ng1-f3").expect("Ng1-f3 should parse");
+        assert_eq!(result.piece_kind, PieceKind::Knight);
+        assert_eq!(result.explicit_source_file, Some(6));
+        assert_eq!(result.explicit_source_rank, Some(0));
+        assert_eq!(result.destination_file, 5);
+        assert_eq!(result.destination_rank, 2);
+    }
+
+    #[test]
+    fn parses_long_algebraic_with_piece_and_capture_bf3xc6() {
+        let result = parse_move_notation(b"Bf3xc6").expect("Bf3xc6 should parse");
+        assert_eq!(result.piece_kind, PieceKind::Bishop);
+        assert_eq!(result.explicit_source_file, Some(5));
+        assert_eq!(result.explicit_source_rank, Some(2));
+        assert_eq!(result.destination_file, 2);
+        assert_eq!(result.destination_rank, 5);
+        assert!(result.is_capture);
+    }
+}
+
+#[cfg(test)]
+mod tests_castling {
+    //! Tests for castling notation parsing.
+
+    use super::*;
+
+    #[test]
+    fn parses_kingside_castle_letter_o() {
+        let result = parse_move_notation(b"O-O").expect("O-O should parse");
+        assert!(result.is_castle_kingside);
+        assert!(!result.is_castle_queenside);
+    }
+
+    #[test]
+    fn parses_queenside_castle_letter_o() {
+        let result = parse_move_notation(b"O-O-O").expect("O-O-O should parse");
+        assert!(!result.is_castle_kingside);
+        assert!(result.is_castle_queenside);
+    }
+
+    #[test]
+    fn parses_kingside_castle_digit_zero() {
+        let result = parse_move_notation(b"0-0").expect("0-0 should parse");
+        assert!(result.is_castle_kingside);
+    }
+
+    #[test]
+    fn parses_queenside_castle_digit_zero() {
+        let result = parse_move_notation(b"0-0-0").expect("0-0-0 should parse");
+        assert!(result.is_castle_queenside);
+    }
+
+    #[test]
+    fn parses_kingside_castle_with_check_suffix() {
+        let result = parse_move_notation(b"O-O+").expect("O-O+ should parse");
+        assert!(result.is_castle_kingside);
+    }
+}
+
+#[cfg(test)]
+mod tests_suffix_stripping {
+    //! Tests verifying that `+`, `#`, `!`, `?` suffixes are accepted and
+    //! discarded.
+
+    use super::*;
+
+    #[test]
+    fn check_suffix_stripped_from_pawn_move() {
+        let result = parse_move_notation(b"e4+").expect("e4+ should parse");
+        assert_eq!(result.destination_file, 4);
+        assert_eq!(result.destination_rank, 3);
+    }
+
+    #[test]
+    fn mate_suffix_stripped_from_piece_move() {
+        let result = parse_move_notation(b"Nf3#").expect("Nf3# should parse");
+        assert_eq!(result.piece_kind, PieceKind::Knight);
+        assert_eq!(result.destination_file, 5);
+        assert_eq!(result.destination_rank, 2);
+    }
+
+    #[test]
+    fn annotation_suffix_stripped_combined_markers() {
+        let result = parse_move_notation(b"e4!?").expect("e4!? should parse");
+        assert_eq!(result.destination_file, 4);
+        assert_eq!(result.destination_rank, 3);
+    }
+}
+
+#[cfg(test)]
+mod tests_non_move_commands {
+    //! Tests for `parse_non_move_player_command`.
+
+    use super::*;
+
+    #[test]
+    fn parses_draw_lowercase() {
+        assert_eq!(
+            parse_non_move_player_command(b"draw"),
+            Some(NonMovePlayerCommand::Draw)
+        );
+    }
+
+    #[test]
+    fn parses_resign_lowercase() {
+        assert_eq!(
+            parse_non_move_player_command(b"resign"),
+            Some(NonMovePlayerCommand::Resign)
+        );
+    }
+
+    #[test]
+    fn parses_draw_uppercase() {
+        assert_eq!(
+            parse_non_move_player_command(b"DRAW"),
+            Some(NonMovePlayerCommand::Draw)
+        );
+    }
+
+    #[test]
+    fn parses_resign_mixed_case() {
+        assert_eq!(
+            parse_non_move_player_command(b"Resign"),
+            Some(NonMovePlayerCommand::Resign)
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests_rejection_cases {
+    //! Tests for syntactic rejection of malformed notation.
+
+    use super::*;
+
+    #[test]
+    fn rejects_pawn_on_impossible_rank_e9() {
+        // Digit '9' is not in the allowed character set; the pre-screen
+        // rejects it before parsing.
+        assert_eq!(
+            parse_move_notation(b"e9"),
+            Err(MoveValidationError::InvalidNotation)
+        );
+    }
+
+    #[test]
+    fn rejects_file_out_of_range_i4() {
+        // 'i' is in the allowed set (because of "resign") but it is not
+        // a valid file letter. The parser rejects it at the
+        // file-extraction step.
+        assert_eq!(
+            parse_move_notation(b"i4"),
+            Err(MoveValidationError::InvalidNotation)
+        );
+    }
+
+    #[test]
+    fn rejects_promotion_to_king_e8_eq_k() {
+        assert_eq!(
+            parse_move_notation(b"e8=K"),
+            Err(MoveValidationError::InvalidPromotionPieceKind)
+        );
+    }
+
+    #[test]
+    fn rejects_trailing_equals_with_no_piece_letter_e8_eq() {
+        // Per project policy, this is `InvalidNotation` (syntactic
+        // malformation), not `InvalidPromotionPieceKind`.
+        assert_eq!(
+            parse_move_notation(b"e8="),
+            Err(MoveValidationError::InvalidNotation)
+        );
+    }
+
+    #[test]
+    fn rejects_interior_check_marker_e_plus_4() {
+        // The `+` is only valid as a trailing suffix. In the interior
+        // of the notation it leaves a malformed residue after suffix
+        // stripping (suffix stripping only strips the trailing tail).
+        // After stripping: residue is "e+4" → the `+` is in the
+        // disallowed position; the parser fails at preamble decoding.
+        assert_eq!(
+            parse_move_notation(b"e+4"),
+            Err(MoveValidationError::InvalidNotation)
+        );
+    }
+}
