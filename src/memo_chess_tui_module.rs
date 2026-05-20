@@ -3715,3 +3715,705 @@ mod game_time_tests {
         assert_eq!(result, Err(MoveValidationError::InternalIndexOutOfBounds));
     }
 }
+
+// ============================================================================
+// SECTION 28: Memochess Game Config — Constants
+// ============================================================================
+
+/// Maximum bytes of the absolute directory path that holds the memo TOML
+/// files for one memo_chess game.
+///
+/// ## Sizing Rationale
+///
+/// POSIX `PATH_MAX` is commonly 4096 on Linux, but realistic game-directory
+/// paths in this project are well under 256 bytes. We accept 256 as a
+/// hard upper bound for MVP-1. A user whose chosen path exceeds this limit
+/// will receive an explicit configuration error rather than a silent
+/// truncation.
+///
+/// If this limit proves too tight in practice, it may be raised in a
+/// future revision. Raising it is a non-breaking change because all
+/// callers reference the constant rather than hard-coding 256.
+pub const MAX_DIRECTORY_PATH_BYTES: usize = 256;
+
+/// Maximum bytes of a player or local-user name.
+///
+/// ## Sizing Rationale
+///
+/// 16 bytes is sufficient for short identifiers used in the TOML `owner`
+/// field. This intentionally favors brevity. Names longer than 16 bytes
+/// are rejected at configuration time with an explicit error so that no
+/// later layer ever sees a truncated name.
+pub const MAX_USERNAME_BYTES: usize = 16;
+
+/// Lowest accepted value for `refresh_rate_seconds` in `MemochessGameConfig`.
+///
+/// A refresh rate of zero would cause a tight loop with no waiting; we
+/// reject it.
+pub const MIN_REFRESH_RATE_SECONDS: u8 = 1;
+
+/// Highest accepted value for `refresh_rate_seconds` in `MemochessGameConfig`.
+///
+/// 240 seconds (4 minutes) is comfortably above any sensible refresh rate
+/// for an interactive TUI; it gives a sanity-check ceiling without
+/// constraining real use. The full `u8` range (up to 255) is also fine;
+/// 240 is chosen to leave a small margin for any later "documented sentinel
+/// values" without breaking compatibility.
+pub const MAX_REFRESH_RATE_SECONDS: u8 = 240;
+
+/// Lowest accepted value for `max_time_limit_per_player_seconds`.
+///
+/// One second is the floor. A zero per-player time budget would mean the
+/// player flags before their first move, which is not a meaningful game.
+pub const MIN_TIME_LIMIT_PER_PLAYER_SECONDS: u32 = 1;
+
+/// Lowest accepted value of the N-move-rule, when enabled.
+///
+/// A "1-move rule" is not meaningful. 10 is a defensible floor that
+/// admits all realistic N-move-rule choices (50 and 75 being the common
+/// values).
+pub const MIN_N_MOVE_RULE_VALUE: u16 = 10;
+
+/// Highest accepted value of the N-move-rule, when enabled.
+///
+/// A 1000-move rule is well above any practical setting. This ceiling
+/// exists only as a sanity check against malformed configuration values.
+pub const MAX_N_MOVE_RULE_VALUE: u16 = 1000;
+
+// ============================================================================
+// SECTION 29: Memochess Game Config — Error Type
+// ============================================================================
+
+/// All possible failure modes when constructing or validating a
+/// `MemochessGameConfig`.
+///
+/// ## Design Note
+///
+/// Like `MoveValidationError`, every variant is a unit variant. The enum
+/// carries no data so that error values produced here cannot leak user
+/// input, file paths, or other diagnostic content into production logs.
+/// Callers that want to log a failure use `{:?}` formatting on the variant
+/// at the layer where logging policy lives — not inside this module.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MemochessGameConfigError {
+    /// The supplied directory-path byte slice was longer than
+    /// `MAX_DIRECTORY_PATH_BYTES`.
+    DirectoryPathTooLong,
+    /// The supplied directory-path byte slice was empty.
+    DirectoryPathEmpty,
+    /// The supplied local-user-name byte slice was longer than
+    /// `MAX_USERNAME_BYTES`.
+    LocalUserNameTooLong,
+    /// The supplied local-user-name byte slice was empty.
+    LocalUserNameEmpty,
+    /// The supplied white-player-name byte slice was longer than
+    /// `MAX_USERNAME_BYTES`.
+    WhitePlayerNameTooLong,
+    /// The supplied white-player-name byte slice was empty.
+    WhitePlayerNameEmpty,
+    /// The supplied black-player-name byte slice was longer than
+    /// `MAX_USERNAME_BYTES`.
+    BlackPlayerNameTooLong,
+    /// The supplied black-player-name byte slice was empty.
+    BlackPlayerNameEmpty,
+    /// The supplied per-player time limit was below
+    /// `MIN_TIME_LIMIT_PER_PLAYER_SECONDS`.
+    TimeLimitPerPlayerBelowMinimum,
+    /// The supplied refresh rate was outside the closed interval
+    /// [`MIN_REFRESH_RATE_SECONDS`, `MAX_REFRESH_RATE_SECONDS`].
+    RefreshRateOutOfRange,
+    /// The supplied N-move-rule value (when `Some`) was outside the
+    /// closed interval [`MIN_N_MOVE_RULE_VALUE`, `MAX_N_MOVE_RULE_VALUE`].
+    NMoveRuleOutOfRange,
+    /// The supplied white and black player names were byte-identical.
+    /// A game cannot be played with a single player on both sides via
+    /// this configuration mechanism.
+    WhiteAndBlackPlayerNamesIdentical,
+}
+
+// ============================================================================
+// SECTION 30: Memochess Game Config — Struct
+// ============================================================================
+
+/// Configuration for one memo_chess game.
+///
+/// ## Project Context
+///
+/// This struct is the contract between the bootstrap layer
+/// (`q_and_a_setup_bootstrap`, to be implemented) and the game-loop layer
+/// (`DungeonMasterState`, to be implemented). The bootstrap layer
+/// constructs and returns a fully-validated `MemochessGameConfig`; the
+/// game-loop layer consumes it as input and never modifies it.
+///
+/// Two of these values cannot be supplied via the TOML memo files
+/// themselves because they bootstrap the TOML-reading process:
+///
+/// - `directory_path` — where the memo files live.
+/// - `local_user_name` — the identity of the user running this TUI
+///   instance (which may or may not be one of the players; spectators
+///   are supported).
+///
+/// All other fields are sourced from TOML memo files written by users
+/// during bootstrap and parsed by `q_and_a_setup_bootstrap`.
+///
+/// ## Storage Strategy
+///
+/// All strings are stored as fixed-size byte arrays paired with a
+/// `u8` length field (since both `MAX_DIRECTORY_PATH_BYTES` ≤ 256 and
+/// `MAX_USERNAME_BYTES` ≤ 16 fit in a `u8`-representable length, and
+/// we use `u16` for the directory length to leave headroom).
+///
+/// This pattern is consistent with the no-heap policy of the project.
+/// `MemochessGameConfig` is `Copy`, so it can be passed by value to any
+/// consumer without heap touches.
+///
+/// ## Bytes vs. UTF-8
+///
+/// Path and name bytes are stored as raw `u8` and are NOT validated as
+/// UTF-8 at construction time. This is deliberate: filesystem paths are
+/// byte strings on POSIX, and player names appear in user-controlled
+/// TOML files. Layers that need to display these as text are responsible
+/// for their own UTF-8 validation at the display boundary.
+///
+/// ## Threefold-Repetition Fields
+///
+/// The threefold-repetition rule fields are intentionally omitted from
+/// MVP-1 (see the kept-but-commented lines in the struct body below).
+/// The discussion in the project notes establishes that hash-based
+/// threefold repetition is feasible but is deferred to a later
+/// milestone. The commented lines remain as documentation of the future
+/// shape; they are not active code.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MemochessGameConfig {
+    /// Absolute path to the directory holding memo TOML files for this
+    /// game. Bytes occupy `directory_path_buffer[..directory_path_length]`.
+    pub directory_path_buffer: [u8; MAX_DIRECTORY_PATH_BYTES],
+    /// Number of meaningful bytes in `directory_path_buffer`.
+    /// In range `1..=MAX_DIRECTORY_PATH_BYTES`.
+    pub directory_path_length: u16,
+
+    /// Name of the user running this TUI instance.
+    /// Bytes occupy `local_user_name_buffer[..local_user_name_length]`.
+    pub local_user_name_buffer: [u8; MAX_USERNAME_BYTES],
+    /// Number of meaningful bytes in `local_user_name_buffer`.
+    /// In range `1..=MAX_USERNAME_BYTES`.
+    pub local_user_name_length: u8,
+
+    /// Name of the player playing White.
+    pub white_player_name_buffer: [u8; MAX_USERNAME_BYTES],
+    /// Number of meaningful bytes in `white_player_name_buffer`.
+    pub white_player_name_length: u8,
+
+    /// Name of the player playing Black.
+    pub black_player_name_buffer: [u8; MAX_USERNAME_BYTES],
+    /// Number of meaningful bytes in `black_player_name_buffer`.
+    pub black_player_name_length: u8,
+
+    /// Per-player thinking-time budget in seconds. When either player's
+    /// cumulative thinking time reaches this value, that player flags.
+    pub max_time_limit_per_player_seconds: u32,
+
+    /// Refresh cadence of the game loop, in seconds. The loop wakes,
+    /// scans for new files, updates state, and renders once per
+    /// `refresh_rate_seconds`.
+    pub refresh_rate_seconds: u8,
+
+    /// Optional automatic-draw rule: if `Some(n)`, the game is drawn
+    /// after `n` consecutive half-moves with no pawn move and no
+    /// capture. `None` disables the rule. Common settings are 50 or 75.
+    pub n_move_rule: Option<u16>,
+    // -------------------------------------------------------------------
+    // MVP-1: threefold-repetition is intentionally out of scope.
+    // The shape below documents the future fields without enabling them.
+    //
+    // /// If true, the game enforces a soft threefold-repetition rule
+    // /// (game is drawn when a position recurs three times). Implementation
+    // /// will require hashed position history.
+    // pub three_time_rep_rule: bool,
+    //
+    // /// If true, the game enforces a hard threefold-repetition rule
+    // /// (automatic draw on detection, no negotiation). Implementation
+    // /// will require hashed position history.
+    // pub hard_3time_rep_rule: bool,
+    // -------------------------------------------------------------------
+}
+
+// ============================================================================
+// SECTION 31: Memochess Game Config — Construction
+// ============================================================================
+
+impl MemochessGameConfig {
+    /// Construct a `MemochessGameConfig` from validated inputs.
+    ///
+    /// ## Project Context
+    ///
+    /// Called by `q_and_a_setup_bootstrap` once all required configuration
+    /// values have been collected. May also be called by a test or by
+    /// `main.rs` of a stand-alone demo with hard-coded values.
+    ///
+    /// All inputs are validated; any failure produces a unit-variant
+    /// `MemochessGameConfigError`. On success, the returned struct is
+    /// guaranteed to satisfy the invariants documented on each field.
+    ///
+    /// ## Arguments
+    ///
+    /// - `directory_path_bytes`: absolute path bytes. Must be non-empty
+    ///   and no longer than `MAX_DIRECTORY_PATH_BYTES`.
+    /// - `local_user_name_bytes`: local user name. Must be non-empty
+    ///   and no longer than `MAX_USERNAME_BYTES`.
+    /// - `white_player_name_bytes`: White player name. Must be non-empty
+    ///   and no longer than `MAX_USERNAME_BYTES`.
+    /// - `black_player_name_bytes`: Black player name. Must be non-empty,
+    ///   no longer than `MAX_USERNAME_BYTES`, and not byte-equal to
+    ///   the white name.
+    /// - `max_time_limit_per_player_seconds`: per-player time budget.
+    ///   Must be at least `MIN_TIME_LIMIT_PER_PLAYER_SECONDS`.
+    /// - `refresh_rate_seconds`: game-loop tick interval. Must lie in
+    ///   `[MIN_REFRESH_RATE_SECONDS, MAX_REFRESH_RATE_SECONDS]`.
+    /// - `n_move_rule`: optional N-move rule. If `Some(n)`, `n` must
+    ///   lie in `[MIN_N_MOVE_RULE_VALUE, MAX_N_MOVE_RULE_VALUE]`.
+    ///
+    /// ## Failure Modes
+    ///
+    /// Returns `Err` for any individual field that fails its bound check.
+    /// Validations are performed in field order; only the first
+    /// detected failure is reported.
+    ///
+    /// ## Memory & Panic Policy
+    ///
+    /// No heap. No panics. All buffer writes are bounds-checked
+    /// by `copy_bytes_into_fixed_buffer`.
+    pub fn try_construct_memochess_game_config(
+        directory_path_bytes: &[u8],
+        local_user_name_bytes: &[u8],
+        white_player_name_bytes: &[u8],
+        black_player_name_bytes: &[u8],
+        max_time_limit_per_player_seconds: u32,
+        refresh_rate_seconds: u8,
+        n_move_rule: Option<u16>,
+    ) -> Result<MemochessGameConfig, MemochessGameConfigError> {
+        // ── Directory path ────────────────────────────────────────────
+        if directory_path_bytes.is_empty() {
+            return Err(MemochessGameConfigError::DirectoryPathEmpty);
+        }
+        if directory_path_bytes.len() > MAX_DIRECTORY_PATH_BYTES {
+            return Err(MemochessGameConfigError::DirectoryPathTooLong);
+        }
+
+        // ── Local user name ───────────────────────────────────────────
+        if local_user_name_bytes.is_empty() {
+            return Err(MemochessGameConfigError::LocalUserNameEmpty);
+        }
+        if local_user_name_bytes.len() > MAX_USERNAME_BYTES {
+            return Err(MemochessGameConfigError::LocalUserNameTooLong);
+        }
+
+        // ── White player name ─────────────────────────────────────────
+        if white_player_name_bytes.is_empty() {
+            return Err(MemochessGameConfigError::WhitePlayerNameEmpty);
+        }
+        if white_player_name_bytes.len() > MAX_USERNAME_BYTES {
+            return Err(MemochessGameConfigError::WhitePlayerNameTooLong);
+        }
+
+        // ── Black player name ─────────────────────────────────────────
+        if black_player_name_bytes.is_empty() {
+            return Err(MemochessGameConfigError::BlackPlayerNameEmpty);
+        }
+        if black_player_name_bytes.len() > MAX_USERNAME_BYTES {
+            return Err(MemochessGameConfigError::BlackPlayerNameTooLong);
+        }
+
+        // ── Distinct white and black names ────────────────────────────
+        if white_player_name_bytes == black_player_name_bytes {
+            return Err(MemochessGameConfigError::WhiteAndBlackPlayerNamesIdentical);
+        }
+
+        // ── Time limit ────────────────────────────────────────────────
+        if max_time_limit_per_player_seconds < MIN_TIME_LIMIT_PER_PLAYER_SECONDS {
+            return Err(MemochessGameConfigError::TimeLimitPerPlayerBelowMinimum);
+        }
+
+        // ── Refresh rate ──────────────────────────────────────────────
+        if refresh_rate_seconds < MIN_REFRESH_RATE_SECONDS
+            || refresh_rate_seconds > MAX_REFRESH_RATE_SECONDS
+        {
+            return Err(MemochessGameConfigError::RefreshRateOutOfRange);
+        }
+
+        // ── N-move rule (when present) ────────────────────────────────
+        if let Some(n_value) = n_move_rule {
+            if n_value < MIN_N_MOVE_RULE_VALUE || n_value > MAX_N_MOVE_RULE_VALUE {
+                return Err(MemochessGameConfigError::NMoveRuleOutOfRange);
+            }
+        }
+
+        // ── All checks passed; populate fixed-size buffers ────────────
+        let mut directory_path_buffer = [0u8; MAX_DIRECTORY_PATH_BYTES];
+        let directory_path_length =
+            copy_bytes_into_fixed_buffer(directory_path_bytes, &mut directory_path_buffer)?;
+
+        let mut local_user_name_buffer = [0u8; MAX_USERNAME_BYTES];
+        let local_user_name_length =
+            copy_bytes_into_fixed_buffer(local_user_name_bytes, &mut local_user_name_buffer)?;
+
+        let mut white_player_name_buffer = [0u8; MAX_USERNAME_BYTES];
+        let white_player_name_length =
+            copy_bytes_into_fixed_buffer(white_player_name_bytes, &mut white_player_name_buffer)?;
+
+        let mut black_player_name_buffer = [0u8; MAX_USERNAME_BYTES];
+        let black_player_name_length =
+            copy_bytes_into_fixed_buffer(black_player_name_bytes, &mut black_player_name_buffer)?;
+
+        // Defensive narrowing: the length checks above guarantee these
+        // fit in their target types, but we re-check via debug_assert
+        // and prod-safe handling to make the narrowing explicit.
+        let directory_path_length_u16: u16 = if directory_path_length <= MAX_DIRECTORY_PATH_BYTES {
+            directory_path_length as u16
+        } else {
+            // Unreachable in practice: bounds were checked above.
+            return Err(MemochessGameConfigError::DirectoryPathTooLong);
+        };
+
+        let local_user_name_length_u8: u8 = if local_user_name_length <= MAX_USERNAME_BYTES {
+            local_user_name_length as u8
+        } else {
+            return Err(MemochessGameConfigError::LocalUserNameTooLong);
+        };
+
+        let white_player_name_length_u8: u8 = if white_player_name_length <= MAX_USERNAME_BYTES {
+            white_player_name_length as u8
+        } else {
+            return Err(MemochessGameConfigError::WhitePlayerNameTooLong);
+        };
+
+        let black_player_name_length_u8: u8 = if black_player_name_length <= MAX_USERNAME_BYTES {
+            black_player_name_length as u8
+        } else {
+            return Err(MemochessGameConfigError::BlackPlayerNameTooLong);
+        };
+
+        Ok(MemochessGameConfig {
+            directory_path_buffer,
+            directory_path_length: directory_path_length_u16,
+            local_user_name_buffer,
+            local_user_name_length: local_user_name_length_u8,
+            white_player_name_buffer,
+            white_player_name_length: white_player_name_length_u8,
+            black_player_name_buffer,
+            black_player_name_length: black_player_name_length_u8,
+            max_time_limit_per_player_seconds,
+            refresh_rate_seconds,
+            n_move_rule,
+        })
+    }
+
+    /// Borrow the directory-path bytes as a slice.
+    ///
+    /// The returned slice references only the meaningful prefix
+    /// (`..directory_path_length`). It is not null-terminated.
+    pub fn directory_path_as_bytes(&self) -> &[u8] {
+        let length_as_usize = self.directory_path_length as usize;
+        // Defensive clamp: in case length ever exceeded buffer size
+        // (it cannot via the public API), avoid panicking on slice.
+        let safe_length = if length_as_usize > MAX_DIRECTORY_PATH_BYTES {
+            MAX_DIRECTORY_PATH_BYTES
+        } else {
+            length_as_usize
+        };
+        &self.directory_path_buffer[..safe_length]
+    }
+
+    /// Borrow the local-user-name bytes as a slice.
+    pub fn local_user_name_as_bytes(&self) -> &[u8] {
+        let length_as_usize = self.local_user_name_length as usize;
+        let safe_length = if length_as_usize > MAX_USERNAME_BYTES {
+            MAX_USERNAME_BYTES
+        } else {
+            length_as_usize
+        };
+        &self.local_user_name_buffer[..safe_length]
+    }
+
+    /// Borrow the white-player-name bytes as a slice.
+    pub fn white_player_name_as_bytes(&self) -> &[u8] {
+        let length_as_usize = self.white_player_name_length as usize;
+        let safe_length = if length_as_usize > MAX_USERNAME_BYTES {
+            MAX_USERNAME_BYTES
+        } else {
+            length_as_usize
+        };
+        &self.white_player_name_buffer[..safe_length]
+    }
+
+    /// Borrow the black-player-name bytes as a slice.
+    pub fn black_player_name_as_bytes(&self) -> &[u8] {
+        let length_as_usize = self.black_player_name_length as usize;
+        let safe_length = if length_as_usize > MAX_USERNAME_BYTES {
+            MAX_USERNAME_BYTES
+        } else {
+            length_as_usize
+        };
+        &self.black_player_name_buffer[..safe_length]
+    }
+}
+
+// ============================================================================
+// SECTION 32: Memochess Game Config — Internal Helper
+// ============================================================================
+
+/// Copy `source_bytes` into the start of `destination_buffer` and return
+/// the number of bytes copied.
+///
+/// Returns `Err(MemochessGameConfigError::DirectoryPathTooLong)` if
+/// `source_bytes` does not fit. The specific error variant used here is
+/// deliberately one of the "too long" variants; the caller is expected to
+/// have already performed a more specific length check against the
+/// appropriate maximum constant *before* calling this helper, so this
+/// error path is a defensive backstop only.
+///
+/// Internal helper. No heap, no panics.
+fn copy_bytes_into_fixed_buffer(
+    source_bytes: &[u8],
+    destination_buffer: &mut [u8],
+) -> Result<usize, MemochessGameConfigError> {
+    if source_bytes.len() > destination_buffer.len() {
+        // Defensive backstop only; the caller-side length checks should
+        // make this unreachable. We surface a generic "too long"
+        // variant here. (The caller has already returned its own more
+        // specific variant before reaching this helper.)
+        return Err(MemochessGameConfigError::DirectoryPathTooLong);
+    }
+    destination_buffer[..source_bytes.len()].copy_from_slice(source_bytes);
+    Ok(source_bytes.len())
+}
+
+// ============================================================================
+// SECTION 33: Cargo Tests for MemochessGameConfig
+// ============================================================================
+
+#[cfg(test)]
+mod tests_memochess_game_config {
+    use super::*;
+
+    /// Helper: construct a valid config for tests, returning the result.
+    fn build_valid_test_config() -> Result<MemochessGameConfig, MemochessGameConfigError> {
+        MemochessGameConfig::try_construct_memochess_game_config(
+            b"/tmp/memo_chess_demo",
+            b"tom",
+            b"alice",
+            b"bob",
+            600,      // 10-minute game
+            10,       // refresh every 10 seconds
+            Some(50), // 50-move rule enabled
+        )
+    }
+
+    #[test]
+    fn valid_config_constructs_successfully() {
+        let config = build_valid_test_config().expect("test: valid inputs must construct");
+        assert_eq!(config.directory_path_as_bytes(), b"/tmp/memo_chess_demo");
+        assert_eq!(config.local_user_name_as_bytes(), b"tom");
+        assert_eq!(config.white_player_name_as_bytes(), b"alice");
+        assert_eq!(config.black_player_name_as_bytes(), b"bob");
+        assert_eq!(config.max_time_limit_per_player_seconds, 600);
+        assert_eq!(config.refresh_rate_seconds, 10);
+        assert_eq!(config.n_move_rule, Some(50));
+    }
+
+    #[test]
+    fn config_with_no_n_move_rule_constructs_successfully() {
+        let config = MemochessGameConfig::try_construct_memochess_game_config(
+            b"/tmp/game",
+            b"u",
+            b"w",
+            b"b",
+            60,
+            5,
+            None,
+        )
+        .expect("test: None n_move_rule must be accepted");
+        assert_eq!(config.n_move_rule, None);
+    }
+
+    #[test]
+    fn empty_directory_path_rejected() {
+        let result = MemochessGameConfig::try_construct_memochess_game_config(
+            b"", b"u", b"w", b"b", 60, 5, None,
+        );
+        assert_eq!(result, Err(MemochessGameConfigError::DirectoryPathEmpty));
+    }
+
+    #[test]
+    fn oversize_directory_path_rejected() {
+        let oversize_path = [b'a'; MAX_DIRECTORY_PATH_BYTES + 1];
+        let result = MemochessGameConfig::try_construct_memochess_game_config(
+            &oversize_path,
+            b"u",
+            b"w",
+            b"b",
+            60,
+            5,
+            None,
+        );
+        assert_eq!(result, Err(MemochessGameConfigError::DirectoryPathTooLong));
+    }
+
+    #[test]
+    fn maximum_length_directory_path_accepted() {
+        let max_path = [b'a'; MAX_DIRECTORY_PATH_BYTES];
+        let config = MemochessGameConfig::try_construct_memochess_game_config(
+            &max_path, b"u", b"w", b"b", 60, 5, None,
+        )
+        .expect("test: exactly max-length path must be accepted");
+        assert_eq!(
+            config.directory_path_as_bytes().len(),
+            MAX_DIRECTORY_PATH_BYTES
+        );
+    }
+
+    #[test]
+    fn empty_local_user_name_rejected() {
+        let result = MemochessGameConfig::try_construct_memochess_game_config(
+            b"/tmp/g", b"", b"w", b"b", 60, 5, None,
+        );
+        assert_eq!(result, Err(MemochessGameConfigError::LocalUserNameEmpty));
+    }
+
+    #[test]
+    fn oversize_local_user_name_rejected() {
+        let oversize_name = [b'x'; MAX_USERNAME_BYTES + 1];
+        let result = MemochessGameConfig::try_construct_memochess_game_config(
+            b"/tmp/g",
+            &oversize_name,
+            b"w",
+            b"b",
+            60,
+            5,
+            None,
+        );
+        assert_eq!(result, Err(MemochessGameConfigError::LocalUserNameTooLong));
+    }
+
+    #[test]
+    fn maximum_length_username_accepted() {
+        let max_name = [b'a'; MAX_USERNAME_BYTES];
+        let other_max_name = [b'b'; MAX_USERNAME_BYTES];
+        let config = MemochessGameConfig::try_construct_memochess_game_config(
+            b"/tmp/g",
+            b"u",
+            &max_name,
+            &other_max_name,
+            60,
+            5,
+            None,
+        )
+        .expect("test: max-length names must be accepted");
+        assert_eq!(config.white_player_name_as_bytes(), &max_name[..]);
+        assert_eq!(config.black_player_name_as_bytes(), &other_max_name[..]);
+    }
+
+    #[test]
+    fn identical_white_and_black_names_rejected() {
+        let result = MemochessGameConfig::try_construct_memochess_game_config(
+            b"/tmp/g", b"u", b"alice", b"alice", 60, 5, None,
+        );
+        assert_eq!(
+            result,
+            Err(MemochessGameConfigError::WhiteAndBlackPlayerNamesIdentical)
+        );
+    }
+
+    #[test]
+    fn zero_time_limit_rejected() {
+        let result = MemochessGameConfig::try_construct_memochess_game_config(
+            b"/tmp/g", b"u", b"w", b"b", 0, 5, None,
+        );
+        assert_eq!(
+            result,
+            Err(MemochessGameConfigError::TimeLimitPerPlayerBelowMinimum)
+        );
+    }
+
+    #[test]
+    fn refresh_rate_zero_rejected() {
+        let result = MemochessGameConfig::try_construct_memochess_game_config(
+            b"/tmp/g", b"u", b"w", b"b", 60, 0, None,
+        );
+        assert_eq!(result, Err(MemochessGameConfigError::RefreshRateOutOfRange));
+    }
+
+    #[test]
+    fn refresh_rate_too_high_rejected() {
+        let result = MemochessGameConfig::try_construct_memochess_game_config(
+            b"/tmp/g",
+            b"u",
+            b"w",
+            b"b",
+            60,
+            MAX_REFRESH_RATE_SECONDS + 1,
+            None,
+        );
+        assert_eq!(result, Err(MemochessGameConfigError::RefreshRateOutOfRange));
+    }
+
+    #[test]
+    fn n_move_rule_too_low_rejected() {
+        let result = MemochessGameConfig::try_construct_memochess_game_config(
+            b"/tmp/g",
+            b"u",
+            b"w",
+            b"b",
+            60,
+            5,
+            Some(MIN_N_MOVE_RULE_VALUE - 1),
+        );
+        assert_eq!(result, Err(MemochessGameConfigError::NMoveRuleOutOfRange));
+    }
+
+    #[test]
+    fn n_move_rule_too_high_rejected() {
+        let result = MemochessGameConfig::try_construct_memochess_game_config(
+            b"/tmp/g",
+            b"u",
+            b"w",
+            b"b",
+            60,
+            5,
+            Some(MAX_N_MOVE_RULE_VALUE + 1),
+        );
+        assert_eq!(result, Err(MemochessGameConfigError::NMoveRuleOutOfRange));
+    }
+
+    #[test]
+    fn config_is_copy() {
+        // Compile-time assertion that the struct really is Copy.
+        fn assert_copy<T: Copy>() {}
+        assert_copy::<MemochessGameConfig>();
+        assert_copy::<MemochessGameConfigError>();
+    }
+
+    #[test]
+    fn config_round_trips_through_copy() {
+        let original = build_valid_test_config().expect("test: build");
+        let copied = original; // would move if not Copy
+        // Both must remain usable.
+        assert_eq!(
+            original.directory_path_as_bytes(),
+            copied.directory_path_as_bytes()
+        );
+        assert_eq!(
+            original.white_player_name_as_bytes(),
+            copied.white_player_name_as_bytes()
+        );
+    }
+
+    #[test]
+    fn byte_slices_do_not_include_buffer_tail() {
+        let config = build_valid_test_config().expect("test: build");
+        // `tom` is 3 bytes; the buffer is 16 bytes. The slice must be
+        // exactly 3 bytes, not 16.
+        assert_eq!(config.local_user_name_as_bytes(), b"tom");
+        assert_eq!(config.local_user_name_as_bytes().len(), 3);
+    }
+}
