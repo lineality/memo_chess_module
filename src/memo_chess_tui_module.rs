@@ -2706,3 +2706,1012 @@ mod tests_rejection_cases {
         );
     }
 }
+
+// ============================================================================
+// SECTION 20: Game Time — Data Type
+// ============================================================================
+
+/// Time-related state for one game.
+///
+/// ## Source of truth
+///
+/// `white_cumulative_seconds` and `black_cumulative_seconds` are the
+/// authoritative record of thinking time used by each player.  They are
+/// updated only by `process_move_timestamp_for_game_time` (on a normal move)
+/// or by `process_non_move_command_timestamp_for_game_time` (on a confirmed
+/// resignation or mutually accepted draw).
+///
+/// ## Whose clock is running
+///
+/// `GameTimeState` does NOT store "who is on the clock."  That information
+/// lives on `BoardState::side_to_move`, which is the single source of truth
+/// for whose turn it is.  Every time function that needs to know who is on
+/// the clock either takes a `&BoardState` or an explicit `clock_owner_color`
+/// parameter (see per-function documentation for which, and why).
+///
+/// ## Live display
+///
+/// `compute_player_time_remaining_seconds` is a pure function: it adds the
+/// elapsed-since-last-normal-move to the stored cumulative on demand, using a
+/// caller-supplied `current_unix_timestamp`.  Nothing in this struct ticks.
+///
+/// ## Pre-moves
+///
+/// A move whose timestamp is earlier than `last_normal_move_unix_timestamp`
+/// is treated as a pre-move.  No time is charged.  No state is updated.
+///
+/// ## End of game
+///
+/// When a player's clock runs out, `timeflagged_player` is set to that
+/// color.  This is the sole "game over by clock" signal — there is no
+/// separate `is_finalized` boolean.  The game loop ends when the overall
+/// game status (in `BoardState::game_status`) reflects game over, by any
+/// cause (checkmate, stalemate, resignation, draw, or time flag observed by
+/// the game-orchestration layer reading `timeflagged_player`).
+///
+/// ## Sizing
+///
+/// `u32` for per-player times supports up to ~136 years of thinking time per
+/// player; this is comfortably sufficient.
+#[derive(Debug, Clone, Copy)]
+pub struct GameTimeState {
+    // ── Configuration (set once at construction; never mutated) ───────────
+    /// Maximum allowed thinking time per player in seconds.
+    /// A player whose used time meets or exceeds this value has flagged.
+    /// Example: a 10-minute game is `600`.
+    pub max_time_per_player_seconds: u32,
+
+    // ── Running totals (updated only on normal moves and end-game) ────────
+    /// Seconds of thinking time White has definitively used.
+    pub white_cumulative_seconds: u32,
+
+    /// Seconds of thinking time Black has definitively used.
+    pub black_cumulative_seconds: u32,
+
+    // ── Clock reference points ────────────────────────────────────────────
+    /// Unix timestamp (seconds) of the most recent *normal* move.
+    ///
+    /// This is the reference point for both the next move's charge
+    /// calculation and the live elapsed-time display.
+    ///
+    /// `None` until the very first normal move has been processed (i.e.,
+    /// White's first move when bootstrap arrives at it).
+    pub last_normal_move_unix_timestamp: Option<u64>,
+
+    /// Unix timestamp (seconds) of the very first move (game start).
+    ///
+    /// Used only for the total-elapsed-time display.  `None` until the
+    /// first normal move has been processed.
+    pub game_start_unix_timestamp: Option<u64>,
+
+    // ── End-of-game signal ────────────────────────────────────────────────
+    /// Set when a player's clock has run out.
+    ///
+    /// `None` while the game is ongoing or until a flag is observed.
+    /// `Some(PieceColor::White)` means White flagged; Black wins.
+    /// `Some(PieceColor::Black)` means Black flagged; White wins.
+    pub timeflagged_player: Option<PieceColor>,
+}
+
+// ============================================================================
+// SECTION 21: Game Time — Construction
+// ============================================================================
+
+impl GameTimeState {
+    /// Create a `GameTimeState` ready for the start of a game.
+    ///
+    /// `max_time_per_player_seconds` is the per-player thinking-time budget,
+    /// e.g. `600` for a 10-minute game.  No clock reference is established
+    /// until the first move is processed.
+    ///
+    /// This is a `const fn` so it can be used in static contexts if needed.
+    pub const fn new_initial_game_time_state(max_time_per_player_seconds: u32) -> GameTimeState {
+        GameTimeState {
+            max_time_per_player_seconds,
+            white_cumulative_seconds: 0,
+            black_cumulative_seconds: 0,
+            last_normal_move_unix_timestamp: None,
+            game_start_unix_timestamp: None,
+            timeflagged_player: None,
+        }
+    }
+}
+
+// ============================================================================
+// SECTION 22: Game Time — Internal Helper (charge time to one player)
+// ============================================================================
+
+/// Add `elapsed_seconds` to the cumulative time of `color`, with saturation.
+///
+/// Internal helper.  Centralizes the per-color match used by both the move
+/// processor and the non-move-command processor.
+fn add_to_cumulative_time_for_color(
+    game_time_state: &mut GameTimeState,
+    color: PieceColor,
+    elapsed_seconds: u32,
+) {
+    match color {
+        PieceColor::White => {
+            game_time_state.white_cumulative_seconds = game_time_state
+                .white_cumulative_seconds
+                .saturating_add(elapsed_seconds);
+        }
+        PieceColor::Black => {
+            game_time_state.black_cumulative_seconds = game_time_state
+                .black_cumulative_seconds
+                .saturating_add(elapsed_seconds);
+        }
+    }
+}
+
+/// Read the cumulative time used by `color`.
+///
+/// Internal helper.  Pure function.
+fn read_cumulative_time_for_color(game_time_state: &GameTimeState, color: PieceColor) -> u32 {
+    match color {
+        PieceColor::White => game_time_state.white_cumulative_seconds,
+        PieceColor::Black => game_time_state.black_cumulative_seconds,
+    }
+}
+
+/// Compute the elapsed seconds between two unix timestamps, saturating
+/// into `u32`.  If `current` is not greater than `previous`, returns 0.
+///
+/// Internal helper.  Pure function.  Saturating semantics defend against
+/// malformed or out-of-range TOML timestamps.
+fn elapsed_seconds_saturating_u32(previous_unix: u64, current_unix: u64) -> u32 {
+    if current_unix <= previous_unix {
+        return 0;
+    }
+    let diff_u64 = current_unix - previous_unix;
+    if diff_u64 > u32::MAX as u64 {
+        u32::MAX
+    } else {
+        diff_u64 as u32
+    }
+}
+
+/// Set `timeflagged_player` if `color`'s cumulative time has met or exceeded
+/// the per-player limit.  Idempotent: if already flagged, the existing flag
+/// is preserved (the first observed flag wins).
+///
+/// Internal helper.
+fn check_and_set_timeflagged_for_color(game_time_state: &mut GameTimeState, color: PieceColor) {
+    if game_time_state.timeflagged_player.is_some() {
+        return;
+    }
+    let used = read_cumulative_time_for_color(game_time_state, color);
+    if used >= game_time_state.max_time_per_player_seconds {
+        game_time_state.timeflagged_player = Some(color);
+    }
+}
+
+// ============================================================================
+// SECTION 23: Game Time — Move Timestamp Processing
+// ============================================================================
+
+/// Process a single move's timestamp and update `GameTimeState` accordingly.
+///
+/// ## When to call
+///
+/// Call this once per move, in chronological order (by `mtime`-sorted file
+/// order, which the file-ingestion layer guarantees).  Used in both modes:
+/// - **Bootstrap:** iterating historical move files to reconstruct game time.
+/// - **Live loop:** when a newly-arrived TOML file yields a validated move.
+///
+/// ## Parameter: `clock_owner_color`
+///
+/// The color of the player whose clock was running at the moment this move
+/// was issued — i.e., `side_to_move` of the `BoardState` **before** the move
+/// is applied.  The caller is responsible for passing this correctly.  The
+/// time module deliberately does not look at `BoardState` here, because at
+/// move-processing time the caller already has a clear "pre-move" state on
+/// hand and the contract is simpler with an explicit parameter than with a
+/// borrow of `BoardState` that the caller would have to remember to provide
+/// from the right side of `apply_chess_move_to_state`.
+///
+/// `clock_owner_color` is only read when this move is determined to be a
+/// normal (non-pre-move) non-first move.
+///
+/// ## Three cases handled
+///
+/// 1. **First move** (`last_normal_move_unix_timestamp.is_none()`):
+///    Sets `game_start_unix_timestamp` and `last_normal_move_unix_timestamp`
+///    to `move_unix_timestamp`.  Charges no one any time.  By chess rules
+///    this can only be White's first move.
+///
+/// 2. **Pre-move** (`move_unix_timestamp < last_normal_move_unix_timestamp`):
+///    Does nothing.  No time charged, no reference updated.  The pre-move
+///    was issued before the previous normal move's timestamp and therefore
+///    cannot have consumed any thinking time relative to that reference.
+///
+/// 3. **Normal move** (`move_unix_timestamp >= last_normal_move_unix_timestamp`):
+///    Charges `clock_owner_color` the elapsed seconds, updates
+///    `last_normal_move_unix_timestamp`, and checks whether the charge
+///    caused that player to flag (sets `timeflagged_player` if so).
+///
+/// ## Already flagged
+///
+/// If `timeflagged_player` is already set, this function returns immediately
+/// without modifying anything.  The first observed flag wins.
+///
+/// ## No return value
+///
+/// All outcomes are visible by inspecting the mutated `GameTimeState`:
+/// - First move: `game_start_unix_timestamp` becomes `Some(...)`.
+/// - Normal move: cumulative time changed; `timeflagged_player` may become
+///   `Some(...)`.
+/// - Pre-move: nothing changes.
+/// - Already flagged: nothing changes.
+pub fn process_move_timestamp_for_game_time(
+    game_time_state: &mut GameTimeState,
+    clock_owner_color: PieceColor,
+    move_unix_timestamp: u64,
+) {
+    // Guard: once flagged, no further charges happen.
+    if game_time_state.timeflagged_player.is_some() {
+        return;
+    }
+
+    // Case 1: first move.
+    let last_ts = match game_time_state.last_normal_move_unix_timestamp {
+        None => {
+            game_time_state.game_start_unix_timestamp = Some(move_unix_timestamp);
+            game_time_state.last_normal_move_unix_timestamp = Some(move_unix_timestamp);
+            return;
+        }
+        Some(t) => t,
+    };
+
+    // Case 2: pre-move.
+    if move_unix_timestamp < last_ts {
+        return;
+    }
+
+    // Case 3: normal move.
+    let elapsed = elapsed_seconds_saturating_u32(last_ts, move_unix_timestamp);
+    add_to_cumulative_time_for_color(game_time_state, clock_owner_color, elapsed);
+    game_time_state.last_normal_move_unix_timestamp = Some(move_unix_timestamp);
+
+    // Check whether this charge caused the player to flag.
+    check_and_set_timeflagged_for_color(game_time_state, clock_owner_color);
+}
+
+// ============================================================================
+// SECTION 24: Game Time — Non-Move Command Timestamp Processing
+// ============================================================================
+
+/// Process a non-move player command's timestamp (resignation, mutually
+/// accepted draw) and charge time accordingly.
+///
+/// ## When to call
+///
+/// Call this **once**, at the moment the orchestration layer decides the
+/// game is ending because of a non-move player command:
+/// - A confirmed resignation by the issuing player.
+/// - A mutually accepted draw at the moment the second "draw" arrives.
+///
+/// The single `command_unix_timestamp` is the timestamp of the deciding
+/// command — for a resignation, the timestamp of the resign file; for a
+/// mutually accepted draw, the timestamp of the second (accepting) draw
+/// file.
+///
+/// ## What it charges
+///
+/// At the moment the command is issued, exactly one player is on the clock
+/// — namely `board_state.side_to_move`.  This function charges that player
+/// the elapsed seconds from `last_normal_move_unix_timestamp` to
+/// `command_unix_timestamp`.
+///
+/// The rationale, restated from project notes: if it takes a player five
+/// minutes of staring at the position before resigning, those five minutes
+/// are properly counted against their thinking time.
+///
+/// ## Edge cases
+///
+/// - **No moves yet** (`last_normal_move_unix_timestamp.is_none()`):
+///   Nothing is charged.  No reference point exists.  The function returns
+///   without modifying anything.  (This corresponds to a resignation before
+///   the game has started, which is unusual but harmless.)
+/// - **Command timestamp <= last reference:**  Treated as zero elapsed.  No
+///   time is charged.  Saturating semantics; we do not assume timestamps
+///   are well-ordered.
+/// - **Already flagged:** Returns immediately, preserving the existing flag.
+///
+/// ## Effect on `timeflagged_player`
+///
+/// If the charge causes the player to exceed their time budget,
+/// `timeflagged_player` is set.  This is unusual (the game is ending
+/// anyway), but kept for consistency with `process_move_timestamp_for_game_time`.
+///
+/// ## After this call
+///
+/// `last_normal_move_unix_timestamp` is **not** updated by this function.
+/// There is no further move processing to anchor against; updating the
+/// reference would have no consumer.
+pub fn process_non_move_command_timestamp_for_game_time(
+    game_time_state: &mut GameTimeState,
+    board_state: &BoardState,
+    command_unix_timestamp: u64,
+) {
+    if game_time_state.timeflagged_player.is_some() {
+        return;
+    }
+
+    let last_ts = match game_time_state.last_normal_move_unix_timestamp {
+        None => return,
+        Some(t) => t,
+    };
+
+    let clock_owner_color = board_state.side_to_move;
+    let elapsed = elapsed_seconds_saturating_u32(last_ts, command_unix_timestamp);
+
+    add_to_cumulative_time_for_color(game_time_state, clock_owner_color, elapsed);
+    check_and_set_timeflagged_for_color(game_time_state, clock_owner_color);
+}
+
+// ============================================================================
+// SECTION 25: Game Time — Live Flag Check
+// ============================================================================
+
+/// Check whether the player currently on the clock has flagged as of
+/// `current_unix_timestamp`.  If so, set `timeflagged_player`.
+///
+/// ## When to call
+///
+/// Call this each refresh cycle of the game loop, after deciding that no
+/// new move has arrived.  It is the live-clock equivalent of the flag check
+/// done inside `process_move_timestamp_for_game_time`.
+///
+/// ## What it does
+///
+/// 1. If `timeflagged_player` is already `Some(_)`, returns it unchanged.
+/// 2. Otherwise, computes how much live time `board_state.side_to_move` has
+///    consumed since `last_normal_move_unix_timestamp` and compares the sum
+///    (cumulative + live) against `max_time_per_player_seconds`.
+/// 3. If the sum meets or exceeds the limit, sets `timeflagged_player` to
+///    that color.
+///
+/// ## Returns
+///
+/// `Some(color)` if anyone has flagged (now or earlier), `None` otherwise.
+///
+/// ## What it does NOT do
+///
+/// - Does not charge cumulative time.  Cumulative time advances only via
+///   the move processor or the non-move-command processor.  Live elapsed
+///   time is *computed* against the cumulative reference; it is not
+///   *committed* into cumulative until a move actually arrives.
+/// - Does not check the other player.  Only the player on the clock can
+///   flag from inactivity.
+pub fn check_for_time_flag(
+    game_time_state: &mut GameTimeState,
+    board_state: &BoardState,
+    current_unix_timestamp: u64,
+) -> Option<PieceColor> {
+    if let Some(c) = game_time_state.timeflagged_player {
+        return Some(c);
+    }
+
+    let last_ts = match game_time_state.last_normal_move_unix_timestamp {
+        None => return None, // game has not started; nothing to flag
+        Some(t) => t,
+    };
+
+    let clock_owner_color = board_state.side_to_move;
+    let cumulative = read_cumulative_time_for_color(game_time_state, clock_owner_color);
+    let live_elapsed = elapsed_seconds_saturating_u32(last_ts, current_unix_timestamp);
+
+    // total_used = cumulative + live_elapsed, saturating
+    let total_used = cumulative.saturating_add(live_elapsed);
+
+    if total_used >= game_time_state.max_time_per_player_seconds {
+        game_time_state.timeflagged_player = Some(clock_owner_color);
+        return Some(clock_owner_color);
+    }
+
+    None
+}
+
+// ============================================================================
+// SECTION 26: Game Time — Pure Queries (Display)
+// ============================================================================
+
+/// Compute the time *remaining* for `for_color`, in seconds, as of
+/// `current_unix_timestamp`.
+///
+/// ## Purpose
+///
+/// Display function for the TUI.  Pure: does not mutate any state.
+///
+/// ## Calculation
+///
+/// ```text
+/// remaining = max_time_per_player
+///           - cumulative_used(for_color)
+///           - live_elapsed                  [only if for_color is on the clock]
+/// ```
+///
+/// `live_elapsed` is `current_unix_timestamp - last_normal_move_unix_timestamp`,
+/// computed only when `for_color == board_state.side_to_move`.  Saturating
+/// arithmetic throughout; the result is always in `[0, max_time_per_player]`.
+///
+/// ## Behavior before the game starts
+///
+/// If `last_normal_move_unix_timestamp` is `None`, returns
+/// `max_time_per_player_seconds` for both colors.
+pub fn compute_player_time_remaining_seconds(
+    game_time_state: &GameTimeState,
+    board_state: &BoardState,
+    for_color: PieceColor,
+    current_unix_timestamp: u64,
+) -> u32 {
+    let cumulative = read_cumulative_time_for_color(game_time_state, for_color);
+
+    let live_elapsed: u32 = if board_state.side_to_move == for_color {
+        match game_time_state.last_normal_move_unix_timestamp {
+            Some(last_ts) => elapsed_seconds_saturating_u32(last_ts, current_unix_timestamp),
+            None => 0,
+        }
+    } else {
+        0
+    };
+
+    let total_used = cumulative.saturating_add(live_elapsed);
+    game_time_state
+        .max_time_per_player_seconds
+        .saturating_sub(total_used)
+}
+
+/// Total wall-clock seconds since the game's first move.
+///
+/// Returns `0` if the game has not started yet (i.e., no first move
+/// processed).  Returns `u64` rather than `u32` because total elapsed
+/// wall-clock time of an unattended TUI process is unbounded in principle,
+/// whereas per-player thinking time is bounded by configuration.
+///
+/// Pure: does not mutate state.
+pub fn compute_total_elapsed_seconds_since_game_start(
+    game_time_state: &GameTimeState,
+    current_unix_timestamp: u64,
+) -> u64 {
+    match game_time_state.game_start_unix_timestamp {
+        None => 0,
+        Some(start) => current_unix_timestamp.saturating_sub(start),
+    }
+}
+
+// ============================================================================
+// SECTION 27: Game Time — Time Display Formatting
+// ============================================================================
+
+/// Format `total_seconds` as decimal ASCII `"H:MM:SS"` into `output_buffer`.
+///
+/// Hours are written with no leading zero and use as many digits as needed
+/// (1 for 0–9 hours, 2 for 10–99 hours, etc.).  Minutes and seconds are
+/// always two digits, zero-padded.
+///
+/// ## Examples
+///
+/// |  input | output       | bytes |
+/// |-------:|:-------------|------:|
+/// |     0  | `0:00:00`    |   7   |
+/// |     1  | `0:00:01`    |   7   |
+/// |    75  | `0:01:15`    |   7   |
+/// |   600  | `0:10:00`    |   7   |
+/// |  3723  | `1:02:03`    |   7   |
+/// | 36000  | `10:00:00`   |   8   |
+///
+/// ## Return value
+///
+/// `Ok(bytes_written)` on success.  `Err(MoveValidationError::
+/// InternalIndexOutOfBounds)` if `output_buffer` is too small.  No partial
+/// write occurs on error.
+///
+/// ## Minimum buffer size
+///
+/// A buffer of 8 bytes is sufficient for any input up to 99h59m59s (359999
+/// seconds, almost 100 hours).  For chess games this is comfortably
+/// sufficient; callers should size at 8 bytes minimum.  For pathological
+/// inputs the function will succeed with larger buffers and fail cleanly
+/// with smaller ones.
+pub fn format_seconds_as_hms_into_buffer(
+    total_seconds: u32,
+    output_buffer: &mut [u8],
+) -> Result<usize, MoveValidationError> {
+    let hours_value = total_seconds / 3600;
+    let minutes_value = (total_seconds % 3600) / 60;
+    let seconds_value = total_seconds % 60;
+
+    // First, compute how many bytes we will need so we can fail before
+    // writing anything.  Hours-digit-count is at least 1.
+    let hour_digit_count = count_decimal_digits_u32(hours_value);
+    // Layout: <hour_digits> ":" "MM" ":" "SS"
+    let total_bytes_needed = hour_digit_count + 1 + 2 + 1 + 2;
+
+    if output_buffer.len() < total_bytes_needed {
+        return Err(MoveValidationError::InternalIndexOutOfBounds);
+    }
+
+    let mut write_position: usize = 0;
+
+    // Hours (no leading zero, variable width)
+    write_position +=
+        write_u32_decimal_into_buffer(hours_value, &mut output_buffer[write_position..])?;
+
+    // ":"
+    output_buffer[write_position] = b':';
+    write_position += 1;
+
+    // MM (always two digits)
+    output_buffer[write_position] = b'0' + (minutes_value / 10) as u8;
+    output_buffer[write_position + 1] = b'0' + (minutes_value % 10) as u8;
+    write_position += 2;
+
+    // ":"
+    output_buffer[write_position] = b':';
+    write_position += 1;
+
+    // SS (always two digits)
+    output_buffer[write_position] = b'0' + (seconds_value / 10) as u8;
+    output_buffer[write_position + 1] = b'0' + (seconds_value % 10) as u8;
+    write_position += 2;
+
+    Ok(write_position)
+}
+
+/// Count how many decimal digits are needed to represent `value`, with a
+/// minimum of 1 (value 0 is one digit).  Internal helper.  Pure.
+fn count_decimal_digits_u32(value: u32) -> usize {
+    if value == 0 {
+        return 1;
+    }
+    let mut remaining = value;
+    let mut digits: usize = 0;
+    while remaining > 0 {
+        digits += 1;
+        remaining /= 10;
+    }
+    digits
+}
+
+/// Write `value` as decimal ASCII into `output_buffer`, no leading zeros
+/// (except that value 0 produces the single character `'0'`).
+///
+/// Returns `Ok(bytes_written)` on success or
+/// `Err(MoveValidationError::InternalIndexOutOfBounds)` if the buffer is
+/// too small.
+///
+/// Internal helper.  Used by `format_seconds_as_hms_into_buffer`.
+fn write_u32_decimal_into_buffer(
+    value: u32,
+    output_buffer: &mut [u8],
+) -> Result<usize, MoveValidationError> {
+    // u32::MAX = 4_294_967_295 → 10 decimal digits maximum.
+    let mut reverse_digits = [0u8; 10];
+    let mut digit_count: usize = 0;
+    let mut remaining = value;
+
+    loop {
+        if digit_count >= reverse_digits.len() {
+            // Cannot happen for u32 (max 10 digits), but defensive.
+            return Err(MoveValidationError::InternalIndexOutOfBounds);
+        }
+        reverse_digits[digit_count] = b'0' + (remaining % 10) as u8;
+        digit_count += 1;
+        remaining /= 10;
+        if remaining == 0 {
+            break;
+        }
+    }
+
+    if digit_count > output_buffer.len() {
+        return Err(MoveValidationError::InternalIndexOutOfBounds);
+    }
+
+    for i in 0..digit_count {
+        output_buffer[i] = reverse_digits[digit_count - 1 - i];
+    }
+
+    Ok(digit_count)
+}
+
+// ============================================================================
+// SECTION 28: Game Time — Tests
+// ============================================================================
+
+#[cfg(test)]
+mod game_time_tests {
+    use super::*;
+
+    // ── Test helpers ─────────────────────────────────────────────────────────
+
+    /// A minimal `BoardState` for time-only tests.  We do not exercise any
+    /// chess logic in these tests; only `side_to_move` is read by the time
+    /// functions.  The other fields are filled with reasonable defaults
+    /// using the existing module's initial-state primitives if available.
+    fn make_test_board_state(side_to_move: PieceColor) -> BoardState {
+        BoardState {
+            board_squares: [None; BOARD_SQUARE_COUNT],
+            side_to_move,
+            castling_rights: CastlingRights::initial_castling_rights(),
+            en_passant_target_square: None,
+            fullmove_number: 1,
+            halfmove_clock: 0,
+            game_status: GameStatus::Playing,
+        }
+    }
+
+    fn new_ten_minute_game_time() -> GameTimeState {
+        GameTimeState::new_initial_game_time_state(600)
+    }
+
+    // ── Construction ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_new_game_time_state_is_zeroed() {
+        let s = new_ten_minute_game_time();
+        assert_eq!(s.max_time_per_player_seconds, 600);
+        assert_eq!(s.white_cumulative_seconds, 0);
+        assert_eq!(s.black_cumulative_seconds, 0);
+        assert_eq!(s.last_normal_move_unix_timestamp, None);
+        assert_eq!(s.game_start_unix_timestamp, None);
+        assert_eq!(s.timeflagged_player, None);
+    }
+
+    // ── First move ───────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_first_move_sets_references_charges_nobody() {
+        let mut s = new_ten_minute_game_time();
+        process_move_timestamp_for_game_time(&mut s, PieceColor::White, 1_000);
+
+        assert_eq!(s.white_cumulative_seconds, 0);
+        assert_eq!(s.black_cumulative_seconds, 0);
+        assert_eq!(s.last_normal_move_unix_timestamp, Some(1_000));
+        assert_eq!(s.game_start_unix_timestamp, Some(1_000));
+        assert_eq!(s.timeflagged_player, None);
+    }
+
+    // ── Normal moves ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_second_move_charges_correct_player() {
+        let mut s = new_ten_minute_game_time();
+        process_move_timestamp_for_game_time(&mut s, PieceColor::White, 1_000);
+        // Black was on the clock from t=1000 to t=1030 (30s)
+        process_move_timestamp_for_game_time(&mut s, PieceColor::Black, 1_030);
+
+        assert_eq!(s.white_cumulative_seconds, 0);
+        assert_eq!(s.black_cumulative_seconds, 30);
+        assert_eq!(s.last_normal_move_unix_timestamp, Some(1_030));
+    }
+
+    #[test]
+    fn test_alternating_normal_moves_accumulate() {
+        let mut s = new_ten_minute_game_time();
+        process_move_timestamp_for_game_time(&mut s, PieceColor::White, 0); // first move
+        process_move_timestamp_for_game_time(&mut s, PieceColor::Black, 10); // black used 10
+        process_move_timestamp_for_game_time(&mut s, PieceColor::White, 25); // white used 15
+        process_move_timestamp_for_game_time(&mut s, PieceColor::Black, 60); // black used 35
+
+        assert_eq!(s.white_cumulative_seconds, 15);
+        assert_eq!(s.black_cumulative_seconds, 45);
+    }
+
+    #[test]
+    fn test_same_timestamp_charges_zero() {
+        let mut s = new_ten_minute_game_time();
+        process_move_timestamp_for_game_time(&mut s, PieceColor::White, 1_000);
+        process_move_timestamp_for_game_time(&mut s, PieceColor::Black, 1_000);
+
+        assert_eq!(s.black_cumulative_seconds, 0);
+        assert_eq!(s.last_normal_move_unix_timestamp, Some(1_000));
+    }
+
+    // ── Pre-moves ────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_premove_does_nothing() {
+        let mut s = new_ten_minute_game_time();
+        process_move_timestamp_for_game_time(&mut s, PieceColor::White, 1_000);
+        // Black "moved" at t=999, earlier than the reference
+        process_move_timestamp_for_game_time(&mut s, PieceColor::Black, 999);
+
+        assert_eq!(s.black_cumulative_seconds, 0);
+        assert_eq!(s.last_normal_move_unix_timestamp, Some(1_000));
+    }
+
+    #[test]
+    fn test_premove_then_white_move_charges_from_original_reference() {
+        let mut s = new_ten_minute_game_time();
+        process_move_timestamp_for_game_time(&mut s, PieceColor::White, 1_000);
+        process_move_timestamp_for_game_time(&mut s, PieceColor::Black, 999); // pre-move
+        // White plays at t=1020.  Note: in chess this is unusual because
+        // black's "pre-move" has not actually been committed in board terms;
+        // however, from the time-module perspective black's clock was running.
+        process_move_timestamp_for_game_time(&mut s, PieceColor::Black, 1_020);
+
+        // Charge attributed to clock owner (Black) for 1000→1020 = 20s
+        assert_eq!(s.black_cumulative_seconds, 20);
+        assert_eq!(s.last_normal_move_unix_timestamp, Some(1_020));
+    }
+
+    #[test]
+    fn test_multiple_consecutive_premoves_do_nothing() {
+        let mut s = new_ten_minute_game_time();
+        process_move_timestamp_for_game_time(&mut s, PieceColor::White, 1_000);
+        process_move_timestamp_for_game_time(&mut s, PieceColor::Black, 500);
+        process_move_timestamp_for_game_time(&mut s, PieceColor::Black, 600);
+        process_move_timestamp_for_game_time(&mut s, PieceColor::Black, 700);
+
+        assert_eq!(s.white_cumulative_seconds, 0);
+        assert_eq!(s.black_cumulative_seconds, 0);
+        assert_eq!(s.last_normal_move_unix_timestamp, Some(1_000));
+    }
+
+    // ── Flag detection on move ───────────────────────────────────────────────
+
+    #[test]
+    fn test_flag_set_when_move_pushes_over_limit() {
+        let mut s = GameTimeState::new_initial_game_time_state(30);
+        process_move_timestamp_for_game_time(&mut s, PieceColor::White, 0);
+        process_move_timestamp_for_game_time(&mut s, PieceColor::Black, 35);
+
+        assert_eq!(s.timeflagged_player, Some(PieceColor::Black));
+        assert_eq!(s.black_cumulative_seconds, 35);
+    }
+
+    #[test]
+    fn test_exactly_at_limit_flags() {
+        let mut s = GameTimeState::new_initial_game_time_state(30);
+        process_move_timestamp_for_game_time(&mut s, PieceColor::White, 0);
+        process_move_timestamp_for_game_time(&mut s, PieceColor::Black, 30);
+
+        assert_eq!(s.timeflagged_player, Some(PieceColor::Black));
+    }
+
+    #[test]
+    fn test_one_under_limit_does_not_flag() {
+        let mut s = GameTimeState::new_initial_game_time_state(30);
+        process_move_timestamp_for_game_time(&mut s, PieceColor::White, 0);
+        process_move_timestamp_for_game_time(&mut s, PieceColor::Black, 29);
+
+        assert_eq!(s.timeflagged_player, None);
+    }
+
+    #[test]
+    fn test_after_flag_further_moves_are_ignored() {
+        let mut s = GameTimeState::new_initial_game_time_state(30);
+        process_move_timestamp_for_game_time(&mut s, PieceColor::White, 0);
+        process_move_timestamp_for_game_time(&mut s, PieceColor::Black, 35);
+        let snapshot_black = s.black_cumulative_seconds;
+        process_move_timestamp_for_game_time(&mut s, PieceColor::White, 40);
+        process_move_timestamp_for_game_time(&mut s, PieceColor::Black, 100);
+
+        assert_eq!(s.timeflagged_player, Some(PieceColor::Black));
+        assert_eq!(s.black_cumulative_seconds, snapshot_black);
+        assert_eq!(s.white_cumulative_seconds, 0);
+    }
+
+    // ── Non-move command processing ──────────────────────────────────────────
+
+    #[test]
+    fn test_non_move_command_charges_side_to_move() {
+        let mut s = new_ten_minute_game_time();
+        process_move_timestamp_for_game_time(&mut s, PieceColor::White, 1_000);
+        // After white's first move, side_to_move is black on the board.
+        let board = make_test_board_state(PieceColor::Black);
+
+        // Black resigns at t=1_300 (300s after white moved)
+        process_non_move_command_timestamp_for_game_time(&mut s, &board, 1_300);
+
+        assert_eq!(s.black_cumulative_seconds, 300);
+        assert_eq!(s.white_cumulative_seconds, 0);
+    }
+
+    #[test]
+    fn test_non_move_command_before_any_move_does_nothing() {
+        let mut s = new_ten_minute_game_time();
+        let board = make_test_board_state(PieceColor::White);
+        process_non_move_command_timestamp_for_game_time(&mut s, &board, 1_000);
+
+        assert_eq!(s.white_cumulative_seconds, 0);
+        assert_eq!(s.black_cumulative_seconds, 0);
+        assert_eq!(s.last_normal_move_unix_timestamp, None);
+    }
+
+    #[test]
+    fn test_non_move_command_earlier_than_reference_charges_zero() {
+        let mut s = new_ten_minute_game_time();
+        process_move_timestamp_for_game_time(&mut s, PieceColor::White, 1_000);
+        let board = make_test_board_state(PieceColor::Black);
+        process_non_move_command_timestamp_for_game_time(&mut s, &board, 500);
+
+        assert_eq!(s.black_cumulative_seconds, 0);
+    }
+
+    #[test]
+    fn test_non_move_command_can_flag() {
+        let mut s = GameTimeState::new_initial_game_time_state(60);
+        process_move_timestamp_for_game_time(&mut s, PieceColor::White, 0);
+        let board = make_test_board_state(PieceColor::Black);
+        // Black takes 90s before resigning
+        process_non_move_command_timestamp_for_game_time(&mut s, &board, 90);
+
+        assert_eq!(s.timeflagged_player, Some(PieceColor::Black));
+    }
+
+    // ── Live flag check ──────────────────────────────────────────────────────
+
+    #[test]
+    fn test_live_flag_check_returns_none_when_time_remains() {
+        let mut s = new_ten_minute_game_time();
+        process_move_timestamp_for_game_time(&mut s, PieceColor::White, 0);
+        let board = make_test_board_state(PieceColor::Black);
+        // 100s elapsed live; limit is 600
+        assert_eq!(check_for_time_flag(&mut s, &board, 100), None);
+        assert_eq!(s.timeflagged_player, None);
+    }
+
+    #[test]
+    fn test_live_flag_check_sets_flag_when_exceeded() {
+        let mut s = GameTimeState::new_initial_game_time_state(60);
+        process_move_timestamp_for_game_time(&mut s, PieceColor::White, 0);
+        let board = make_test_board_state(PieceColor::Black);
+
+        let result = check_for_time_flag(&mut s, &board, 61);
+        assert_eq!(result, Some(PieceColor::Black));
+        assert_eq!(s.timeflagged_player, Some(PieceColor::Black));
+    }
+
+    #[test]
+    fn test_live_flag_check_does_not_advance_cumulative() {
+        let mut s = GameTimeState::new_initial_game_time_state(60);
+        process_move_timestamp_for_game_time(&mut s, PieceColor::White, 0);
+        let board = make_test_board_state(PieceColor::Black);
+
+        check_for_time_flag(&mut s, &board, 30);
+        // Cumulative should still be zero; only a normal-move event commits.
+        assert_eq!(s.black_cumulative_seconds, 0);
+    }
+
+    #[test]
+    fn test_live_flag_check_before_first_move_returns_none() {
+        let mut s = new_ten_minute_game_time();
+        let board = make_test_board_state(PieceColor::White);
+        assert_eq!(check_for_time_flag(&mut s, &board, 1_000), None);
+        assert_eq!(s.timeflagged_player, None);
+    }
+
+    // ── Remaining-time query ────────────────────────────────────────────────
+
+    #[test]
+    fn test_remaining_full_before_game_start() {
+        let s = new_ten_minute_game_time();
+        let board = make_test_board_state(PieceColor::White);
+        assert_eq!(
+            compute_player_time_remaining_seconds(&s, &board, PieceColor::White, 1_000),
+            600
+        );
+        assert_eq!(
+            compute_player_time_remaining_seconds(&s, &board, PieceColor::Black, 1_000),
+            600
+        );
+    }
+
+    #[test]
+    fn test_remaining_includes_live_elapsed_for_player_on_clock() {
+        let mut s = new_ten_minute_game_time();
+        process_move_timestamp_for_game_time(&mut s, PieceColor::White, 1_000);
+        let board = make_test_board_state(PieceColor::Black);
+
+        let black_rem = compute_player_time_remaining_seconds(&s, &board, PieceColor::Black, 1_050);
+        assert_eq!(black_rem, 600 - 50);
+
+        let white_rem = compute_player_time_remaining_seconds(&s, &board, PieceColor::White, 1_050);
+        assert_eq!(white_rem, 600);
+    }
+
+    #[test]
+    fn test_remaining_floors_at_zero() {
+        let mut s = GameTimeState::new_initial_game_time_state(60);
+        process_move_timestamp_for_game_time(&mut s, PieceColor::White, 1_000);
+        let board = make_test_board_state(PieceColor::Black);
+
+        let rem = compute_player_time_remaining_seconds(&s, &board, PieceColor::Black, 10_000);
+        assert_eq!(rem, 0);
+    }
+
+    #[test]
+    fn test_remaining_after_mix_of_moves() {
+        let mut s = new_ten_minute_game_time();
+        process_move_timestamp_for_game_time(&mut s, PieceColor::White, 0); // first
+        process_move_timestamp_for_game_time(&mut s, PieceColor::Black, 30); // black used 30
+        process_move_timestamp_for_game_time(&mut s, PieceColor::White, 50); // white used 20
+        // Now Black is on the clock again
+        let board = make_test_board_state(PieceColor::Black);
+
+        let black_rem = compute_player_time_remaining_seconds(&s, &board, PieceColor::Black, 80);
+        assert_eq!(black_rem, 600 - 30 - 30); // 30 stored + 30 live
+
+        let white_rem = compute_player_time_remaining_seconds(&s, &board, PieceColor::White, 80);
+        assert_eq!(white_rem, 600 - 20);
+    }
+
+    // ── Total elapsed query ─────────────────────────────────────────────────
+
+    #[test]
+    fn test_total_elapsed_zero_before_game_starts() {
+        let s = new_ten_minute_game_time();
+        assert_eq!(compute_total_elapsed_seconds_since_game_start(&s, 9_999), 0);
+    }
+
+    #[test]
+    fn test_total_elapsed_since_game_start() {
+        let mut s = new_ten_minute_game_time();
+        process_move_timestamp_for_game_time(&mut s, PieceColor::White, 1_000);
+        assert_eq!(
+            compute_total_elapsed_seconds_since_game_start(&s, 1_300),
+            300
+        );
+    }
+
+    // ── HMS formatting ──────────────────────────────────────────────────────
+
+    #[test]
+    fn test_format_zero() {
+        let mut buf = [0u8; 8];
+        let n = format_seconds_as_hms_into_buffer(0, &mut buf).expect("ok");
+        assert_eq!(&buf[..n], b"0:00:00");
+    }
+
+    #[test]
+    fn test_format_one_second() {
+        let mut buf = [0u8; 8];
+        let n = format_seconds_as_hms_into_buffer(1, &mut buf).expect("ok");
+        assert_eq!(&buf[..n], b"0:00:01");
+    }
+
+    #[test]
+    fn test_format_seventy_five() {
+        let mut buf = [0u8; 8];
+        let n = format_seconds_as_hms_into_buffer(75, &mut buf).expect("ok");
+        assert_eq!(&buf[..n], b"0:01:15");
+    }
+
+    #[test]
+    fn test_format_ten_minutes() {
+        let mut buf = [0u8; 8];
+        let n = format_seconds_as_hms_into_buffer(600, &mut buf).expect("ok");
+        assert_eq!(&buf[..n], b"0:10:00");
+    }
+
+    #[test]
+    fn test_format_one_hour_two_three() {
+        let mut buf = [0u8; 8];
+        let n = format_seconds_as_hms_into_buffer(3_723, &mut buf).expect("ok");
+        assert_eq!(&buf[..n], b"1:02:03");
+    }
+
+    #[test]
+    fn test_format_ten_hours_needs_eight_bytes() {
+        let mut buf = [0u8; 8];
+        let n = format_seconds_as_hms_into_buffer(36_000, &mut buf).expect("ok");
+        assert_eq!(&buf[..n], b"10:00:00");
+    }
+
+    #[test]
+    fn test_format_buffer_too_small_errors() {
+        let mut buf = [0u8; 6];
+        let result = format_seconds_as_hms_into_buffer(75, &mut buf);
+        assert_eq!(result, Err(MoveValidationError::InternalIndexOutOfBounds));
+    }
+
+    #[test]
+    fn test_format_ten_hours_into_seven_byte_buffer_errors() {
+        let mut buf = [0u8; 7];
+        let result = format_seconds_as_hms_into_buffer(36_000, &mut buf);
+        assert_eq!(result, Err(MoveValidationError::InternalIndexOutOfBounds));
+    }
+}
