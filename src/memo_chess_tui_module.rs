@@ -6289,3 +6289,604 @@ mod tests_memo_file_readers {
         assert_copy::<MemoMoveReadError>();
     }
 }
+
+// ============================================================================
+// SECTION 42: Config-Line Parser — Constants
+// ============================================================================
+
+/// Maximum bytes of the *value* portion of one config-line text_message.
+///
+/// ## Sizing Rationale
+///
+/// The longest legitimate value is a player name, bounded by
+/// `MAX_USERNAME_BYTES` (16). Numeric values (`player_time`,
+/// `refresh_rate`, `n_move_rule`) fit in a few digits. Literal values
+/// (`off`, `yes`, `no`) are at most 3 bytes. So 16 bytes is the exact
+/// natural ceiling.
+pub const MAX_CONFIG_VALUE_BYTES: usize = 16;
+
+/// Maximum bytes of the *key* portion of one config-line text_message.
+///
+/// ## Sizing Rationale
+///
+/// The longest recognized key is `refresh_rate` (12 bytes). 16 bytes
+/// gives small headroom while keeping the buffer tiny.
+pub const MAX_CONFIG_KEY_BYTES: usize = 16;
+
+// ============================================================================
+// SECTION 43: Config-Line Parser — Recognized Keys
+// ============================================================================
+
+/// One recognized configuration key, as it appears on the wire.
+///
+/// ## Project Context
+///
+/// Players write config memos containing `text_message = "key:value"`
+/// where `key` is one of the strings below. The bootstrap layer
+/// iterates the memo directory, reads each `text_message`, and uses
+/// `parse_config_line_text_message` to map the wire-format string to
+/// one of these variants.
+///
+/// The mapping from variant to wire-format string is defined by
+/// `recognized_config_key_as_bytes`. The reverse mapping is performed
+/// by `recognized_config_key_from_bytes`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecognizedConfigKey {
+    /// Wire format: `plays_white`. Value is a player name.
+    PlaysWhite,
+    /// Wire format: `plays_black`. Value is a player name.
+    PlaysBlack,
+    /// Wire format: `player_time`. Value is an integer number of
+    /// minutes (converted to seconds by the config applier, not by the
+    /// parser).
+    PlayerTimeMinutes,
+    /// Wire format: `refresh_rate`. Value is an integer number of seconds.
+    RefreshRateSeconds,
+    /// Wire format: `n_move_rule`. Value is either an integer (e.g. `50`)
+    /// or the literal `off`.
+    NMoveRule,
+    /// Wire format: `3_time_rep`. Value is `yes` or `no`.
+    ThreeTimeRepetition,
+}
+
+/// Return the wire-format byte string for a recognized key.
+///
+/// This is the single source of truth for the wire-format strings.
+/// All other code that needs the wire string must call this function
+/// rather than embedding the string literal.
+pub const fn recognized_config_key_as_bytes(key: RecognizedConfigKey) -> &'static [u8] {
+    match key {
+        RecognizedConfigKey::PlaysWhite => b"plays_white",
+        RecognizedConfigKey::PlaysBlack => b"plays_black",
+        RecognizedConfigKey::PlayerTimeMinutes => b"player_time",
+        RecognizedConfigKey::RefreshRateSeconds => b"refresh_rate",
+        RecognizedConfigKey::NMoveRule => b"n_move_rule",
+        RecognizedConfigKey::ThreeTimeRepetition => b"3_time_rep",
+    }
+}
+
+/// Match a stripped key byte slice against the recognized-key table.
+///
+/// Exact byte comparison; case-sensitive; no whitespace tolerance
+/// (the caller is responsible for stripping outer whitespace before
+/// calling).
+///
+/// Returns `Some(variant)` on exact match, `None` otherwise.
+fn recognized_config_key_from_bytes(stripped_key_bytes: &[u8]) -> Option<RecognizedConfigKey> {
+    // Bounded loop over the small fixed table of recognized keys.
+    let recognized_keys: [RecognizedConfigKey; 6] = [
+        RecognizedConfigKey::PlaysWhite,
+        RecognizedConfigKey::PlaysBlack,
+        RecognizedConfigKey::PlayerTimeMinutes,
+        RecognizedConfigKey::RefreshRateSeconds,
+        RecognizedConfigKey::NMoveRule,
+        RecognizedConfigKey::ThreeTimeRepetition,
+    ];
+    let mut index: usize = 0;
+    while index < recognized_keys.len() {
+        let candidate = recognized_keys[index];
+        if recognized_config_key_as_bytes(candidate) == stripped_key_bytes {
+            return Some(candidate);
+        }
+        index += 1;
+    }
+    None
+}
+
+// ============================================================================
+// SECTION 44: Config-Line Parser — Parsed Result and Errors
+// ============================================================================
+
+/// The parsed result of one config-line `text_message`.
+///
+/// The value is stored as raw bytes; semantic interpretation
+/// (decimal parse for numbers, yes/no parse for booleans, `off`
+/// detection for `n_move_rule`) is the responsibility of the config
+/// applier, not the parser.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ParsedConfigLine {
+    /// Which configuration key this line refers to.
+    pub recognized_key: RecognizedConfigKey,
+    /// Raw value bytes (after stripping outer whitespace).
+    /// Meaningful bytes occupy `value_buffer[..value_length]`.
+    pub value_buffer: [u8; MAX_CONFIG_VALUE_BYTES],
+    /// Number of meaningful bytes in `value_buffer`.
+    /// In range `1..=MAX_CONFIG_VALUE_BYTES`.
+    pub value_length: u8,
+}
+
+impl ParsedConfigLine {
+    /// Borrow the meaningful prefix of `value_buffer` as a slice.
+    pub fn value_as_bytes(&self) -> &[u8] {
+        let length_as_usize = self.value_length as usize;
+        let safe_length = if length_as_usize > MAX_CONFIG_VALUE_BYTES {
+            MAX_CONFIG_VALUE_BYTES
+        } else {
+            length_as_usize
+        };
+        &self.value_buffer[..safe_length]
+    }
+}
+
+/// Failure modes of `parse_config_line_text_message`.
+///
+/// All variants are unit variants per project policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConfigLineParseError {
+    /// The input contained no `:` separator.
+    NoColonSeparator,
+    /// The input contained more than one `:` separator.
+    MultipleColonSeparators,
+    /// The key half (before `:`) was empty after whitespace stripping.
+    EmptyKey,
+    /// The value half (after `:`) was empty after whitespace stripping.
+    EmptyValue,
+    /// The key did not match any recognized configuration key.
+    UnrecognizedKey,
+    /// The key half exceeded `MAX_CONFIG_KEY_BYTES` after stripping.
+    /// (Defensive: any unrecognized key also fails the match above, so
+    /// this variant is reached only when the caller's input is so
+    /// oversized that the key buffer would not even hold it.)
+    KeyExceedsBuffer,
+    /// The value half exceeded `MAX_CONFIG_VALUE_BYTES` after stripping.
+    ValueExceedsBuffer,
+    /// The value half contained internal whitespace.
+    /// None of the recognized values legitimately contain whitespace.
+    ValueContainsInternalWhitespace,
+}
+
+// ============================================================================
+// SECTION 45: Config-Line Parser — Internal Helpers
+// ============================================================================
+
+/// True if `byte_value` is an ASCII whitespace byte recognized for
+/// stripping purposes: space, tab, carriage return, line feed.
+const fn is_ascii_whitespace_for_config(byte_value: u8) -> bool {
+    matches!(byte_value, b' ' | b'\t' | b'\r' | b'\n')
+}
+
+/// Return a sub-slice of `input_bytes` with leading and trailing ASCII
+/// whitespace removed. The returned slice may be empty if the input was
+/// all whitespace.
+fn strip_ascii_whitespace_from_both_ends(input_bytes: &[u8]) -> &[u8] {
+    let mut start_index: usize = 0;
+    let mut end_index: usize = input_bytes.len();
+    while start_index < end_index && is_ascii_whitespace_for_config(input_bytes[start_index]) {
+        start_index += 1;
+    }
+    while end_index > start_index && is_ascii_whitespace_for_config(input_bytes[end_index - 1]) {
+        end_index -= 1;
+    }
+    &input_bytes[start_index..end_index]
+}
+
+/// Return `true` if any byte in `input_bytes` is an ASCII whitespace
+/// byte. Used to reject values that contain internal whitespace.
+fn slice_contains_ascii_whitespace(input_bytes: &[u8]) -> bool {
+    let mut index: usize = 0;
+    while index < input_bytes.len() {
+        if is_ascii_whitespace_for_config(input_bytes[index]) {
+            return true;
+        }
+        index += 1;
+    }
+    false
+}
+
+/// Count the number of `:` bytes in `input_bytes`.
+fn count_colon_bytes(input_bytes: &[u8]) -> usize {
+    let mut count: usize = 0;
+    let mut index: usize = 0;
+    while index < input_bytes.len() {
+        if input_bytes[index] == b':' {
+            count += 1;
+        }
+        index += 1;
+    }
+    count
+}
+
+/// Return the index of the first `:` byte in `input_bytes`, if any.
+fn find_first_colon_index(input_bytes: &[u8]) -> Option<usize> {
+    let mut index: usize = 0;
+    while index < input_bytes.len() {
+        if input_bytes[index] == b':' {
+            return Some(index);
+        }
+        index += 1;
+    }
+    None
+}
+
+// ============================================================================
+// SECTION 46: Config-Line Parser — Main Function
+// ============================================================================
+
+/// Parse one config-line `text_message` byte slice into a
+/// `ParsedConfigLine`.
+///
+/// ## Project Context
+///
+/// The bootstrap layer reads `text_message` from each memo file via
+/// `read_memo_config_file`. The returned bytes are passed here. On
+/// success, the bootstrap layer hands the result to the config-applier
+/// (next milestone), which combines it with any prior partial config to
+/// produce a `MemochessGameConfig` once all keys have been seen.
+///
+/// ## Expected Wire Format
+///
+/// Exactly: `key:value`
+///
+/// Where:
+/// - `key` is one of the recognized keys defined by
+///   `RecognizedConfigKey`.
+/// - `value` is a non-empty, internal-whitespace-free byte sequence
+///   no longer than `MAX_CONFIG_VALUE_BYTES`.
+/// - Whitespace surrounding either half is stripped before matching.
+/// - The `:` separator must appear exactly once.
+///
+/// ## Semantic Interpretation of Values
+///
+/// This function does NOT validate the *semantic* content of the value
+/// (e.g. whether `player_time:notanumber` is a valid integer). It only
+/// validates the *syntactic* shape. Semantic validation is the
+/// responsibility of the config applier, which has access to the
+/// `MAX_TIME_LIMIT_PER_PLAYER_SECONDS`, `MAX_REFRESH_RATE_SECONDS`, and
+/// similar bounds.
+///
+/// ## Memory & Panic Policy
+///
+/// No heap. No panics. Stack buffers only. Bounded loops throughout.
+pub fn parse_config_line_text_message(
+    text_message_bytes: &[u8],
+) -> Result<ParsedConfigLine, ConfigLineParseError> {
+    // Step 1: locate the colon and reject multi-colon inputs.
+    let colon_count = count_colon_bytes(text_message_bytes);
+    if colon_count == 0 {
+        return Err(ConfigLineParseError::NoColonSeparator);
+    }
+    if colon_count > 1 {
+        return Err(ConfigLineParseError::MultipleColonSeparators);
+    }
+    let colon_index = match find_first_colon_index(text_message_bytes) {
+        Some(index_value) => index_value,
+        None => {
+            // Defensive: colon_count == 1 guarantees find returns Some.
+            // Unreachable in practice.
+            return Err(ConfigLineParseError::NoColonSeparator);
+        }
+    };
+
+    // Step 2: split into two halves.
+    let key_half_raw = &text_message_bytes[..colon_index];
+    let value_half_raw = &text_message_bytes[(colon_index + 1)..];
+
+    // Step 3: strip whitespace from each half.
+    let key_stripped = strip_ascii_whitespace_from_both_ends(key_half_raw);
+    let value_stripped = strip_ascii_whitespace_from_both_ends(value_half_raw);
+
+    // Step 4: validate non-empty.
+    if key_stripped.is_empty() {
+        return Err(ConfigLineParseError::EmptyKey);
+    }
+    if value_stripped.is_empty() {
+        return Err(ConfigLineParseError::EmptyValue);
+    }
+
+    // Step 5: validate key length.
+    if key_stripped.len() > MAX_CONFIG_KEY_BYTES {
+        return Err(ConfigLineParseError::KeyExceedsBuffer);
+    }
+
+    // Step 6: validate value length.
+    if value_stripped.len() > MAX_CONFIG_VALUE_BYTES {
+        return Err(ConfigLineParseError::ValueExceedsBuffer);
+    }
+
+    // Step 7: reject internal whitespace in value.
+    if slice_contains_ascii_whitespace(value_stripped) {
+        return Err(ConfigLineParseError::ValueContainsInternalWhitespace);
+    }
+
+    // Step 8: match key against recognized table.
+    let recognized_key = match recognized_config_key_from_bytes(key_stripped) {
+        Some(key_variant) => key_variant,
+        None => return Err(ConfigLineParseError::UnrecognizedKey),
+    };
+
+    // Step 9: copy value bytes into fixed-size output buffer.
+    let mut value_buffer = [0u8; MAX_CONFIG_VALUE_BYTES];
+    value_buffer[..value_stripped.len()].copy_from_slice(value_stripped);
+
+    // Defensive narrowing: length check above guarantees this fits in u8.
+    let value_length_u8: u8 = if value_stripped.len() <= MAX_CONFIG_VALUE_BYTES {
+        value_stripped.len() as u8
+    } else {
+        return Err(ConfigLineParseError::ValueExceedsBuffer);
+    };
+
+    Ok(ParsedConfigLine {
+        recognized_key,
+        value_buffer,
+        value_length: value_length_u8,
+    })
+}
+
+// ============================================================================
+// SECTION 47: Config-Line Parser — Cargo Tests
+// ============================================================================
+
+#[cfg(test)]
+mod tests_config_line_parser {
+    use super::*;
+
+    // ── Happy-path tests ──────────────────────────────────────────────
+
+    #[test]
+    fn parses_plays_white_with_simple_name() {
+        let parsed = parse_config_line_text_message(b"plays_white:alice")
+            .expect("test: valid config line must parse");
+        assert_eq!(parsed.recognized_key, RecognizedConfigKey::PlaysWhite);
+        assert_eq!(parsed.value_as_bytes(), b"alice");
+    }
+
+    #[test]
+    fn parses_plays_black_with_simple_name() {
+        let parsed = parse_config_line_text_message(b"plays_black:bob")
+            .expect("test: valid config line must parse");
+        assert_eq!(parsed.recognized_key, RecognizedConfigKey::PlaysBlack);
+        assert_eq!(parsed.value_as_bytes(), b"bob");
+    }
+
+    #[test]
+    fn parses_player_time_with_integer() {
+        let parsed = parse_config_line_text_message(b"player_time:10")
+            .expect("test: valid config line must parse");
+        assert_eq!(
+            parsed.recognized_key,
+            RecognizedConfigKey::PlayerTimeMinutes
+        );
+        assert_eq!(parsed.value_as_bytes(), b"10");
+    }
+
+    #[test]
+    fn parses_refresh_rate_with_integer() {
+        let parsed = parse_config_line_text_message(b"refresh_rate:5")
+            .expect("test: valid config line must parse");
+        assert_eq!(
+            parsed.recognized_key,
+            RecognizedConfigKey::RefreshRateSeconds
+        );
+        assert_eq!(parsed.value_as_bytes(), b"5");
+    }
+
+    #[test]
+    fn parses_n_move_rule_with_integer() {
+        let parsed = parse_config_line_text_message(b"n_move_rule:50")
+            .expect("test: valid config line must parse");
+        assert_eq!(parsed.recognized_key, RecognizedConfigKey::NMoveRule);
+        assert_eq!(parsed.value_as_bytes(), b"50");
+    }
+
+    #[test]
+    fn parses_n_move_rule_with_off() {
+        let parsed = parse_config_line_text_message(b"n_move_rule:off")
+            .expect("test: valid config line must parse");
+        assert_eq!(parsed.recognized_key, RecognizedConfigKey::NMoveRule);
+        assert_eq!(parsed.value_as_bytes(), b"off");
+    }
+
+    #[test]
+    fn parses_three_time_rep_with_yes() {
+        let parsed = parse_config_line_text_message(b"3_time_rep:yes")
+            .expect("test: valid config line must parse");
+        assert_eq!(
+            parsed.recognized_key,
+            RecognizedConfigKey::ThreeTimeRepetition
+        );
+        assert_eq!(parsed.value_as_bytes(), b"yes");
+    }
+
+    #[test]
+    fn parses_three_time_rep_with_no() {
+        let parsed = parse_config_line_text_message(b"3_time_rep:no")
+            .expect("test: valid config line must parse");
+        assert_eq!(
+            parsed.recognized_key,
+            RecognizedConfigKey::ThreeTimeRepetition
+        );
+        assert_eq!(parsed.value_as_bytes(), b"no");
+    }
+
+    // ── Whitespace handling tests ────────────────────────────────────
+
+    #[test]
+    fn strips_whitespace_around_key() {
+        let parsed = parse_config_line_text_message(b"  plays_white:alice")
+            .expect("test: leading whitespace in key must be stripped");
+        assert_eq!(parsed.recognized_key, RecognizedConfigKey::PlaysWhite);
+        assert_eq!(parsed.value_as_bytes(), b"alice");
+    }
+
+    #[test]
+    fn strips_whitespace_around_value() {
+        let parsed = parse_config_line_text_message(b"plays_white:  alice  ")
+            .expect("test: surrounding whitespace in value must be stripped");
+        assert_eq!(parsed.value_as_bytes(), b"alice");
+    }
+
+    #[test]
+    fn strips_whitespace_around_both_halves() {
+        let parsed = parse_config_line_text_message(b" plays_white : alice ")
+            .expect("test: whitespace on both halves must be stripped");
+        assert_eq!(parsed.recognized_key, RecognizedConfigKey::PlaysWhite);
+        assert_eq!(parsed.value_as_bytes(), b"alice");
+    }
+
+    #[test]
+    fn strips_tabs_and_newlines_as_whitespace() {
+        let parsed = parse_config_line_text_message(b"\tplays_white\t:\nalice\r\n")
+            .expect("test: tabs and newlines count as whitespace");
+        assert_eq!(parsed.value_as_bytes(), b"alice");
+    }
+
+    // ── Rejection tests ──────────────────────────────────────────────
+
+    #[test]
+    fn rejects_input_with_no_colon() {
+        let result = parse_config_line_text_message(b"plays_white_alice");
+        assert_eq!(result, Err(ConfigLineParseError::NoColonSeparator));
+    }
+
+    #[test]
+    fn rejects_input_with_multiple_colons() {
+        let result = parse_config_line_text_message(b"plays_white:alice:bob");
+        assert_eq!(result, Err(ConfigLineParseError::MultipleColonSeparators));
+    }
+
+    #[test]
+    fn rejects_empty_key() {
+        let result = parse_config_line_text_message(b":alice");
+        assert_eq!(result, Err(ConfigLineParseError::EmptyKey));
+    }
+
+    #[test]
+    fn rejects_whitespace_only_key() {
+        let result = parse_config_line_text_message(b"   :alice");
+        assert_eq!(result, Err(ConfigLineParseError::EmptyKey));
+    }
+
+    #[test]
+    fn rejects_empty_value() {
+        let result = parse_config_line_text_message(b"plays_white:");
+        assert_eq!(result, Err(ConfigLineParseError::EmptyValue));
+    }
+
+    #[test]
+    fn rejects_whitespace_only_value() {
+        let result = parse_config_line_text_message(b"plays_white:   ");
+        assert_eq!(result, Err(ConfigLineParseError::EmptyValue));
+    }
+
+    #[test]
+    fn rejects_unrecognized_key() {
+        let result = parse_config_line_text_message(b"unknown_key:value");
+        assert_eq!(result, Err(ConfigLineParseError::UnrecognizedKey));
+    }
+
+    #[test]
+    fn rejects_value_with_internal_whitespace() {
+        let result = parse_config_line_text_message(b"plays_white:alice smith");
+        assert_eq!(
+            result,
+            Err(ConfigLineParseError::ValueContainsInternalWhitespace)
+        );
+    }
+
+    #[test]
+    fn rejects_value_exceeding_buffer() {
+        // 17 bytes, one over MAX_CONFIG_VALUE_BYTES.
+        let result = parse_config_line_text_message(b"plays_white:aaaaaaaaaaaaaaaaa");
+        assert_eq!(result, Err(ConfigLineParseError::ValueExceedsBuffer));
+    }
+
+    #[test]
+    fn rejects_case_mismatched_key() {
+        // Case-sensitive: "Plays_White" must not match "plays_white".
+        let result = parse_config_line_text_message(b"Plays_White:alice");
+        assert_eq!(result, Err(ConfigLineParseError::UnrecognizedKey));
+    }
+
+    #[test]
+    fn rejects_partial_key_prefix() {
+        let result = parse_config_line_text_message(b"plays:alice");
+        assert_eq!(result, Err(ConfigLineParseError::UnrecognizedKey));
+    }
+
+    #[test]
+    fn rejects_key_with_extra_suffix() {
+        let result = parse_config_line_text_message(b"plays_white_extra:alice");
+        assert_eq!(result, Err(ConfigLineParseError::UnrecognizedKey));
+    }
+
+    // ── Boundary tests ───────────────────────────────────────────────
+
+    #[test]
+    fn accepts_value_at_exact_buffer_boundary() {
+        // Exactly MAX_CONFIG_VALUE_BYTES = 16 bytes.
+        let parsed = parse_config_line_text_message(b"plays_white:aaaaaaaaaaaaaaaa")
+            .expect("test: exactly 16-byte value must be accepted");
+        assert_eq!(parsed.value_length, 16);
+        assert_eq!(parsed.value_as_bytes(), b"aaaaaaaaaaaaaaaa");
+    }
+
+    #[test]
+    fn accepts_single_byte_value() {
+        let parsed = parse_config_line_text_message(b"refresh_rate:1")
+            .expect("test: single-byte value must be accepted");
+        assert_eq!(parsed.value_length, 1);
+        assert_eq!(parsed.value_as_bytes(), b"1");
+    }
+
+    // ── Copy semantics ────────────────────────────────────────────────
+
+    #[test]
+    fn parsed_config_line_is_copy() {
+        fn assert_copy<T: Copy>() {}
+        assert_copy::<ParsedConfigLine>();
+        assert_copy::<RecognizedConfigKey>();
+        assert_copy::<ConfigLineParseError>();
+    }
+
+    // ── Wire-format consistency ──────────────────────────────────────
+
+    #[test]
+    fn wire_format_strings_are_stable() {
+        // Pin the wire-format strings. Any change to these is a wire-
+        // format breaking change and must be deliberate.
+        assert_eq!(
+            recognized_config_key_as_bytes(RecognizedConfigKey::PlaysWhite),
+            b"plays_white"
+        );
+        assert_eq!(
+            recognized_config_key_as_bytes(RecognizedConfigKey::PlaysBlack),
+            b"plays_black"
+        );
+        assert_eq!(
+            recognized_config_key_as_bytes(RecognizedConfigKey::PlayerTimeMinutes),
+            b"player_time"
+        );
+        assert_eq!(
+            recognized_config_key_as_bytes(RecognizedConfigKey::RefreshRateSeconds),
+            b"refresh_rate"
+        );
+        assert_eq!(
+            recognized_config_key_as_bytes(RecognizedConfigKey::NMoveRule),
+            b"n_move_rule"
+        );
+        assert_eq!(
+            recognized_config_key_as_bytes(RecognizedConfigKey::ThreeTimeRepetition),
+            b"3_time_rep"
+        );
+    }
+}
