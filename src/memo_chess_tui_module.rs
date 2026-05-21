@@ -6825,8 +6825,17 @@ mod tests_config_line_parser {
 
     #[test]
     fn rejects_key_with_extra_suffix() {
-        let result = parse_config_line_text_message(b"plays_white_extra:alice");
+        // "plays_whiteX" is 12 bytes (within MAX_CONFIG_KEY_BYTES = 16),
+        // and does not match any recognized key.
+        let result = parse_config_line_text_message(b"plays_whiteX:alice");
         assert_eq!(result, Err(ConfigLineParseError::UnrecognizedKey));
+    }
+
+    #[test]
+    fn rejects_key_exceeding_buffer() {
+        // "plays_white_extra" is 17 bytes, one over MAX_CONFIG_KEY_BYTES = 16.
+        let result = parse_config_line_text_message(b"plays_white_extra:alice");
+        assert_eq!(result, Err(ConfigLineParseError::KeyExceedsBuffer));
     }
 
     // ── Boundary tests ───────────────────────────────────────────────
