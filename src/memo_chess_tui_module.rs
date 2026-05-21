@@ -6553,13 +6553,13 @@ mod tests_config_line_parser {
         assert_eq!(parsed.value_as_bytes(), b"50");
     }
 
-    #[test]
-    fn parses_n_move_rule_with_off() {
-        let parsed = parse_config_line_text_message(b"n_move_rule:off")
-            .expect("test: valid config line must parse");
-        assert_eq!(parsed.recognized_key, RecognizedConfigKey::NMoveRule);
-        assert_eq!(parsed.value_as_bytes(), b"off");
-    }
+    // #[test]
+    // fn parses_n_move_rule_with_off() {
+    //     let parsed = parse_config_line_text_message(b"n_move_rule:off")
+    //         .expect("test: valid config line must parse");
+    //     assert_eq!(parsed.recognized_key, RecognizedConfigKey::NMoveRule);
+    //     assert_eq!(parsed.value_as_bytes(), b"off");
+    // }
 
     #[test]
     fn parses_three_time_rep_with_yes() {
@@ -6774,7 +6774,7 @@ mod tests_config_line_parser {
 // `parse_config_line_text_message` (Section 46) decomposes a config-line
 // `text_message` into a recognized key plus a raw value byte slice. The
 // raw value is not yet typed: `player_time:10` produces the value bytes
-// `b"10"`; `n_move_rule:off` produces `b"off"`; `plays_white:alice`
+// `b"10"`; `n_move_rule:50` produces `b"50"`; `plays_white:alice`
 // produces `b"alice"`.
 //
 // This section converts those raw value bytes into typed semantic
@@ -6922,35 +6922,84 @@ pub fn parse_decimal_u8_value(value_bytes: &[u8]) -> Option<u8> {
     Some(accumulator)
 }
 
+// /// Parse an `n_move_rule` value into the form stored on `MemochessGameConfig`.
+// ///
+// /// ## Accepted Input
+// ///
+// /// - Exactly the three bytes `b"off"` (case-sensitive — the config-line
+// ///   parser does not lowercase). Produces `Some(None)`.
+// /// - An ASCII-decimal integer that fits in `u16`. Produces
+// ///   `Some(Some(value))`. The returned value is NOT range-checked
+// ///   against `MIN_N_MOVE_RULE_VALUE`/`MAX_N_MOVE_RULE_VALUE` here; that
+// ///   check belongs to `try_construct_memochess_game_config`. This
+// ///   parser's job is shape-validity only.
+// ///
+// /// ## Returns
+// ///
+// /// - `Some(None)`: the rule is explicitly disabled.
+// /// - `Some(Some(n))`: the rule is set to `n` half-moves.
+// /// - `None`: input was neither `b"off"` nor a well-formed `u16` decimal.
+// ///
+// /// ## Memory & Panic Policy
+// ///
+// /// No heap. No panics. Bounded loop.
+// pub fn parse_n_move_rule_value(value_bytes: &[u8]) -> Option<Option<u16>> {
+//     // Literal "off" branch.
+//     if value_bytes == b"off" {
+//         return Some(None);
+//     }
+
+//     // Decimal-integer branch. Inline rather than calling a u16 variant
+//     // (none exists yet) and to keep the overflow check explicit.
+//     if value_bytes.is_empty() {
+//         return None;
+//     }
+
+//     let mut accumulator: u16 = 0;
+//     let mut byte_index: usize = 0;
+//     while byte_index < value_bytes.len() {
+//         let current_byte = value_bytes[byte_index];
+//         if current_byte < b'0' || current_byte > b'9' {
+//             return None;
+//         }
+//         let digit_value: u16 = (current_byte - b'0') as u16;
+
+//         let multiplied = match accumulator.checked_mul(10) {
+//             Some(value) => value,
+//             None => return None,
+//         };
+//         let added = match multiplied.checked_add(digit_value) {
+//             Some(value) => value,
+//             None => return None,
+//         };
+//         accumulator = added;
+
+//         byte_index += 1;
+//     }
+
+//     Some(Some(accumulator))
+// }
+
 /// Parse an `n_move_rule` value into the form stored on `MemochessGameConfig`.
 ///
 /// ## Accepted Input
 ///
-/// - Exactly the three bytes `b"off"` (case-sensitive — the config-line
-///   parser does not lowercase). Produces `Some(None)`.
-/// - An ASCII-decimal integer that fits in `u16`. Produces
-///   `Some(Some(value))`. The returned value is NOT range-checked
-///   against `MIN_N_MOVE_RULE_VALUE`/`MAX_N_MOVE_RULE_VALUE` here; that
-///   check belongs to `try_construct_memochess_game_config`. This
-///   parser's job is shape-validity only.
+/// An ASCII-decimal integer that fits in `u16`. The returned value is
+/// NOT range-checked against `MIN_N_MOVE_RULE_VALUE` /
+/// `MAX_N_MOVE_RULE_VALUE` here; that check belongs to
+/// `try_construct_memochess_game_config`. This parser's job is
+/// shape-validity only.
 ///
 /// ## Returns
 ///
-/// - `Some(None)`: the rule is explicitly disabled.
-/// - `Some(Some(n))`: the rule is set to `n` half-moves.
-/// - `None`: input was neither `b"off"` nor a well-formed `u16` decimal.
+/// - `Some(n)`: successfully parsed `u16` value.
+/// - `None`: input was empty, contained a non-digit byte, or
+///   overflowed `u16`.
 ///
 /// ## Memory & Panic Policy
 ///
 /// No heap. No panics. Bounded loop.
-pub fn parse_n_move_rule_value(value_bytes: &[u8]) -> Option<Option<u16>> {
-    // Literal "off" branch.
-    if value_bytes == b"off" {
-        return Some(None);
-    }
-
-    // Decimal-integer branch. Inline rather than calling a u16 variant
-    // (none exists yet) and to keep the overflow check explicit.
+pub fn parse_n_move_rule_value(value_bytes: &[u8]) -> Option<u16> {
     if value_bytes.is_empty() {
         return None;
     }
@@ -6977,7 +7026,7 @@ pub fn parse_n_move_rule_value(value_bytes: &[u8]) -> Option<Option<u16>> {
         byte_index += 1;
     }
 
-    Some(Some(accumulator))
+    Some(accumulator)
 }
 
 // ============================================================================
@@ -7150,11 +7199,6 @@ mod config_value_semantic_parser_tests {
     // ── parse_n_move_rule_value ───────────────────────────────────────
 
     #[test]
-    fn parse_n_move_rule_accepts_off() {
-        assert_eq!(parse_n_move_rule_value(b"off"), Some(None));
-    }
-
-    #[test]
     fn parse_n_move_rule_rejects_uppercase_off() {
         // The config-line parser does not lowercase. "Off" is not "off".
         assert_eq!(parse_n_move_rule_value(b"Off"), None);
@@ -7168,24 +7212,22 @@ mod config_value_semantic_parser_tests {
 
     #[test]
     fn parse_n_move_rule_accepts_fifty() {
-        assert_eq!(parse_n_move_rule_value(b"50"), Some(Some(50)));
+        assert_eq!(parse_n_move_rule_value(b"50"), Some(50));
     }
 
     #[test]
     fn parse_n_move_rule_accepts_seventy_five() {
-        assert_eq!(parse_n_move_rule_value(b"75"), Some(Some(75)));
+        assert_eq!(parse_n_move_rule_value(b"75"), Some(75));
     }
 
     #[test]
     fn parse_n_move_rule_accepts_zero() {
-        // Shape-valid even though the constructor will reject it as
-        // below MIN_N_MOVE_RULE_VALUE.
-        assert_eq!(parse_n_move_rule_value(b"0"), Some(Some(0)));
+        assert_eq!(parse_n_move_rule_value(b"0"), Some(0));
     }
 
     #[test]
     fn parse_n_move_rule_accepts_u16_maximum() {
-        assert_eq!(parse_n_move_rule_value(b"65535"), Some(Some(u16::MAX)));
+        assert_eq!(parse_n_move_rule_value(b"65535"), Some(u16::MAX));
     }
 
     #[test]
