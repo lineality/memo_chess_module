@@ -1377,6 +1377,587 @@ mod tests_part_1_data_types_and_initial_state {
 // SECTION Extra: Game-Engine: Move Making & Validation
 // ============================================================================
 
+// ----------------------------------------------------------------------------
+// Public: the per-tick function
+// ----------------------------------------------------------------------------
+
+/// Perform one tick of the dungeon-master game loop.
+///
+/// ## Project Context
+///
+/// Called by the outer wrapper (Section 62, to be implemented) once
+/// per refresh cycle. Pure with respect to caller state in the sense
+/// that all internal failures map to `TickOutcome` variants rather
+/// than panics or aborts. Takes the current Unix timestamp as a
+/// parameter so the caller can sample the clock once and have all
+/// internal time computations agree on "now."
+///
+/// ## Arguments
+///
+/// - `current_state`: the dungeon-master state at the start of the
+///   tick. Immutable; the function returns a new state.
+/// - `current_unix_timestamp`: wall-clock "now" in Unix seconds.
+///
+/// ## Returns
+///
+/// A `TickResult` containing the new state and a `TickOutcome`
+/// describing what happened. See `TickOutcome` for the meanings of
+/// the variants.
+///
+/// ## Internal sequence
+///
+/// 1. Early return with `NoChange` if the game has already ended
+///    (the wrapper should not be calling the tick in this state,
+///    but defensive check costs nothing).
+/// 2. Refresh the chrono-index against the live memo directory.
+///    On failure, return `ChronoIndexUnreadable` with state unchanged.
+/// 3. Read the new total file count. Bound the scan upper limit at
+///    `MAX_GAME_FILES_FOR_BOOTSTRAP_SCAN` (reusing the bootstrap
+///    constant — the bound applies equally here).
+/// 4. If `last_known_chrono_hash_through_n` is `Some`, verify the
+///    sequence has not been retroactively reordered by calling
+///    `check_chronosort_hash_to_n` over the previously-known range.
+///    On detected reorder, return `ChronoSequenceReordered` with
+///    state unchanged.
+/// 5. Live time-flag check via `check_for_time_flag`. If the player
+///    on the clock has flagged, update `board.game_status` and
+///    return `TimeFlagged`.
+/// 6. Identify whose turn it is and the appropriate cursor.
+/// 7. Scan the chrono range for that player's next candidate file.
+/// 8. Apply whichever outcome was found:
+///      - No candidate: advance cursor to upper bound; return
+///        `NoChange`.
+///      - Move candidate: resolve and apply; on success return
+///        `MoveApplied`; on illegal-move return `NoChange` (cursor
+///        still advances).
+///      - Resignation: end game; return `PlayerResigned`.
+/// 9. Refresh the chrono-sort hash for next-tick anomaly detection.
+/// 10. Return the new state.
+///
+/// ## Memory & Panic Policy
+///
+/// No panics. The chrono-index module performs its own bounded
+/// allocations; none scale per-tick. All other I/O is via no-heap
+/// readers.
+pub fn run_one_dungeon_master_tick(
+    current_state: &DungeonMasterState,
+    current_unix_timestamp: u64,
+) -> TickResult {
+    // ----- Step 1: early return if game has already ended -----
+    if current_state.board.game_status != GameStatus::StillPlaying {
+        return TickResult {
+            new_state: *current_state,
+            outcome: TickOutcome::NoChange,
+        };
+    }
+
+    // Resolve path bytes from config into &Path values for the
+    // chrono-index module. These paths were already validated by
+    // bootstrap; UTF-8 conversion below is a defensive fallthrough.
+    let memo_toml_files_path_bytes: &[u8] = current_state
+        .config
+        .memo_toml_files_directory_path_as_bytes();
+    let chrono_sort_temp_path_bytes: &[u8] = current_state
+        .config
+        .chrono_sort_temp_directory_path_as_bytes();
+
+    let memo_toml_files_path_str: &str = match core::str::from_utf8(memo_toml_files_path_bytes) {
+        Ok(value) => value,
+        Err(_) => {
+            // Path stored in config is non-UTF-8. This should not
+            // happen given bootstrap validation, but the defensive
+            // path returns ChronoIndexUnreadable so the wrapper
+            // retries (and the situation likely persists, but the
+            // tick does not panic).
+            return TickResult {
+                new_state: *current_state,
+                outcome: TickOutcome::ChronoIndexUnreadable,
+            };
+        }
+    };
+    let chrono_sort_temp_path_str: &str = match core::str::from_utf8(chrono_sort_temp_path_bytes) {
+        Ok(value) => value,
+        Err(_) => {
+            return TickResult {
+                new_state: *current_state,
+                outcome: TickOutcome::ChronoIndexUnreadable,
+            };
+        }
+    };
+    let memo_toml_files_path: &Path = Path::new(memo_toml_files_path_str);
+    let chrono_sort_temp_path: &Path = Path::new(chrono_sort_temp_path_str);
+
+    // ----- Step 2: refresh the chrono-index -----
+    let update_result = create_or_update_chrono_index(chrono_sort_temp_path, memo_toml_files_path);
+    let total_committed_file_count: u64 = match update_result {
+        Ok(update_summary) => update_summary.final_file_count,
+        Err(_) => {
+            return TickResult {
+                new_state: *current_state,
+                outcome: TickOutcome::ChronoIndexUnreadable,
+            };
+        }
+    };
+
+    // ----- Step 3: bound the scan upper limit -----
+    let scan_upper_bound: u64 = if total_committed_file_count > MAX_GAME_FILES_FOR_BOOTSTRAP_SCAN {
+        MAX_GAME_FILES_FOR_BOOTSTRAP_SCAN
+    } else {
+        total_committed_file_count
+    };
+
+    // ----- Step 4: chrono-sort hash anomaly check -----
+    if let Some(previously_known_hash) = current_state.last_known_chrono_hash_through_n {
+        if current_state.last_known_file_count > 0 {
+            let last_indexed_position_zero_based: u64 = current_state.last_known_file_count - 1;
+            let hash_check_result = check_chronosort_hash_to_n(
+                chrono_sort_temp_path,
+                last_indexed_position_zero_based,
+                previously_known_hash,
+            );
+            match hash_check_result {
+                Ok(true) => {
+                    // Sequence intact; continue.
+                }
+                Ok(false) => {
+                    // Retroactive reorder detected; wrapper decides
+                    // recovery. State unchanged.
+                    return TickResult {
+                        new_state: *current_state,
+                        outcome: TickOutcome::ChronoSequenceReordered,
+                    };
+                }
+                Err(_) => {
+                    // Defensive: treat hash-check I/O failure as a
+                    // reorder signal (the wrapper handles both the
+                    // same way: rebuild from initial state).
+                    return TickResult {
+                        new_state: *current_state,
+                        outcome: TickOutcome::ChronoSequenceReordered,
+                    };
+                }
+            }
+        }
+    }
+
+    // ----- Step 5: live time-flag check -----
+    let mut working_state: DungeonMasterState = *current_state;
+    let flag_check_result = check_for_time_flag(
+        &mut working_state.game_time_state,
+        &working_state.board,
+        current_unix_timestamp,
+    );
+    if flag_check_result.is_some() {
+        working_state.board =
+            apply_timeflag_to_game_status(working_state.board, working_state.game_time_state);
+        // Even though no move was processed this tick, refresh the
+        // last_known fields if the file count grew. Skipping for
+        // simplicity: a terminated game does not need next-tick
+        // anomaly tracking.
+        return TickResult {
+            new_state: working_state,
+            outcome: TickOutcome::TimeFlagged,
+        };
+    }
+
+    // ----- Step 6: identify whose turn it is -----
+    let side_to_move: PieceColor = working_state.board.side_to_move;
+    let cursor_for_side_to_move: u64 = match side_to_move {
+        PieceColor::White => working_state.white_next_file_chronoindex_to_check,
+        PieceColor::Black => working_state.black_next_file_chronoindex_to_check,
+    };
+
+    // ----- Step 7: scan for the next candidate -----
+    let scan_outcome = scan_chrono_range_for_player_move(
+        chrono_sort_temp_path,
+        cursor_for_side_to_move,
+        scan_upper_bound,
+        side_to_move,
+        &working_state.config,
+    );
+
+    // ----- Step 8: act on the scan outcome -----
+    let outcome_label: TickOutcome = match scan_outcome {
+        ScanLoopOutcome::NoCandidateFound { advanced_cursor_to } => {
+            // Advance the cursor to the upper bound and return.
+            match side_to_move {
+                PieceColor::White => {
+                    working_state.white_next_file_chronoindex_to_check = advanced_cursor_to;
+                }
+                PieceColor::Black => {
+                    working_state.black_next_file_chronoindex_to_check = advanced_cursor_to;
+                }
+            }
+            TickOutcome::NoChange
+        }
+
+        ScanLoopOutcome::MoveCandidate {
+            parsed_notation,
+            move_unix_timestamp,
+            found_at_position,
+        } => {
+            // Advance the cursor past this position regardless of
+            // whether the move turns out to be legal. This is the
+            // forward-progress rule.
+            let next_position_after: u64 = found_at_position.saturating_add(1);
+            match side_to_move {
+                PieceColor::White => {
+                    working_state.white_next_file_chronoindex_to_check = next_position_after;
+                }
+                PieceColor::Black => {
+                    working_state.black_next_file_chronoindex_to_check = next_position_after;
+                }
+            }
+
+            // Try to resolve the parsed notation to a legal chess
+            // move in the current board state.
+            let resolve_result =
+                resolve_parsed_move_to_legal_chess_move(&working_state.board, &parsed_notation);
+            let resolved_move = match resolve_result {
+                Ok(chess_move_value) => chess_move_value,
+                Err(_) => {
+                    // Illegal move; the player will have to write
+                    // another memo. Cursor already advanced. No move
+                    // applied, no time charged.
+                    return TickResult {
+                        new_state: working_state,
+                        outcome: TickOutcome::NoChange,
+                    };
+                }
+            };
+
+            // Apply the move to the board.
+            let apply_result = apply_chess_move_to_state(&working_state.board, &resolved_move);
+            let new_board = match apply_result {
+                Ok(new_board_value) => new_board_value,
+                Err(_) => {
+                    // Apply rejected the move (defensive: should not
+                    // happen if resolve succeeded). Cursor already
+                    // advanced.
+                    return TickResult {
+                        new_state: working_state,
+                        outcome: TickOutcome::NoChange,
+                    };
+                }
+            };
+
+            // Charge time to the player who just moved. The
+            // GameTimeState API expects the clock-owner color
+            // (side_to_move BEFORE the move was applied), which is
+            // exactly `side_to_move` here.
+            process_move_timestamp_for_game_time(
+                &mut working_state.game_time_state,
+                side_to_move,
+                move_unix_timestamp,
+            );
+
+            // Install the new board.
+            working_state.board = new_board;
+
+            // If the time-charge caused a flag, propagate to
+            // game_status.
+            working_state.board =
+                apply_timeflag_to_game_status(working_state.board, working_state.game_time_state);
+
+            // If the timeflag was the proximate end, surface as
+            // TimeFlagged rather than MoveApplied.
+            if working_state.game_time_state.timeflagged_player.is_some() {
+                TickOutcome::TimeFlagged
+            } else {
+                TickOutcome::MoveApplied
+            }
+        }
+
+        ScanLoopOutcome::ResignationCommand {
+            command_unix_timestamp,
+            found_at_position,
+        } => {
+            // Advance the cursor past the resignation file.
+            let next_position_after: u64 = found_at_position.saturating_add(1);
+            match side_to_move {
+                PieceColor::White => {
+                    working_state.white_next_file_chronoindex_to_check = next_position_after;
+                }
+                PieceColor::Black => {
+                    working_state.black_next_file_chronoindex_to_check = next_position_after;
+                }
+            }
+
+            // Charge thinking time up to the resignation moment to
+            // the resigning player.
+            process_non_move_command_timestamp_for_game_time(
+                &mut working_state.game_time_state,
+                &working_state.board,
+                command_unix_timestamp,
+            );
+
+            // Update game status: the OPPONENT of the resigning
+            // player wins.
+            let mut updated_board = working_state.board;
+            updated_board.game_status = match side_to_move {
+                PieceColor::White => GameStatus::WhiteResigned,
+                PieceColor::Black => GameStatus::BlackResigned,
+            };
+            working_state.board = updated_board;
+
+            TickOutcome::PlayerResigned
+        }
+    };
+
+    // ----- Step 9: refresh the chrono-sort hash for next-tick check -----
+    // Only refresh if the game is still in progress and we have
+    // committed positions to hash.
+    if working_state.board.game_status == GameStatus::StillPlaying && total_committed_file_count > 0
+    {
+        let last_indexed_position_zero_based: u64 = total_committed_file_count - 1;
+        let hash_compute_result =
+            chrono_sort_hash_to_n(chrono_sort_temp_path, last_indexed_position_zero_based);
+        match hash_compute_result {
+            Ok(new_hash) => {
+                working_state.last_known_chrono_hash_through_n = Some(new_hash);
+                working_state.last_known_file_count = total_committed_file_count;
+            }
+            Err(_) => {
+                // Hash refresh failed; leave the previously-known
+                // hash and file count in place. Next tick will
+                // attempt the refresh again.
+            }
+        }
+    }
+
+    // ----- Step 10: return -----
+    TickResult {
+        new_state: working_state,
+        outcome: outcome_label,
+    }
+}
+
+// ============================================================================
+// SECTION 61: Per-Tick Function — Cargo Tests
+// ============================================================================
+
+#[cfg(test)]
+mod run_one_dungeon_master_tick_tests {
+    use super::*;
+    use std::fs;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    /// Counter used to give each test a unique temp-directory name
+    /// so parallel test execution does not collide.
+    static UNIQUE_TEST_DIRECTORY_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    /// Create a fresh trio of empty directories under the system
+    /// temp root, one for memos, one for chrono-index temp, and one
+    /// for logs. Returns `(memo_dir, chrono_dir, log_dir)`.
+    fn make_fresh_test_directories(test_label: &str) -> (PathBuf, PathBuf, PathBuf) {
+        let unique_suffix = UNIQUE_TEST_DIRECTORY_COUNTER.fetch_add(1, Ordering::SeqCst);
+        let process_id = std::process::id();
+        let base_name = format!(
+            "memo_chess_tick_test_{}_{}_{}",
+            test_label, process_id, unique_suffix
+        );
+        let base_path = std::env::temp_dir().join(&base_name);
+
+        let memo_dir = base_path.join("memos");
+        let chrono_dir = base_path.join("chrono");
+        let log_dir = base_path.join("logs");
+
+        for dir in &[&memo_dir, &chrono_dir, &log_dir] {
+            fs::create_dir_all(dir).expect("test setup: create_dir_all failed");
+        }
+        (memo_dir, chrono_dir, log_dir)
+    }
+
+    /// Build a valid `MemochessGameConfig` using the three test
+    /// directory paths.
+    fn build_test_tick_config(
+        memo_dir: &Path,
+        chrono_dir: &Path,
+        log_dir: &Path,
+    ) -> MemochessGameConfig {
+        let memo_dir_str = memo_dir.to_str().expect("test memo path must be UTF-8");
+        let chrono_dir_str = chrono_dir.to_str().expect("test chrono path must be UTF-8");
+        let log_dir_str = log_dir.to_str().expect("test log path must be UTF-8");
+
+        let result = MemochessGameConfig::try_construct_memochess_game_config(
+            memo_dir_str.as_bytes(),
+            chrono_dir_str.as_bytes(),
+            log_dir_str.as_bytes(),
+            b"tester",
+            b"alice",
+            b"bob",
+            600u32,
+            10u8,
+            50u16,
+            1_000_000_000,
+        );
+        match result {
+            Ok(config) => config,
+            Err(e) => panic!("test setup: config construction failed: {:?}", e),
+        }
+    }
+
+    /// Write a memo TOML file into `memo_dir` with the given
+    /// filename, owner, text_message, and timestamp.
+    fn write_memo_file(
+        memo_dir: &Path,
+        filename: &str,
+        owner: &str,
+        text_message: &str,
+        updated_at_unix_timestamp: u64,
+    ) {
+        let contents = format!(
+            "owner = \"{}\"\ntext_message = \"{}\"\nupdated_at_timestamp = \"{}\"\n",
+            owner, text_message, updated_at_unix_timestamp
+        );
+        let file_path = memo_dir.join(filename);
+        fs::write(&file_path, contents).expect("test setup: write memo file failed");
+    }
+
+    #[test]
+    fn empty_directory_yields_no_change() {
+        let (memo_dir, chrono_dir, log_dir) = make_fresh_test_directories("empty_directory");
+        let config = build_test_tick_config(&memo_dir, &chrono_dir, &log_dir);
+        let initial_state = create_initial_dungeon_master_state(config);
+
+        let current_unix_timestamp: u64 = 1_700_000_000;
+        let tick_result = run_one_dungeon_master_tick(&initial_state, current_unix_timestamp);
+
+        assert_eq!(tick_result.outcome, TickOutcome::NoChange);
+        assert_eq!(tick_result.new_state.board.side_to_move, PieceColor::White);
+        assert_eq!(
+            tick_result.new_state.board.game_status,
+            GameStatus::StillPlaying
+        );
+        assert_eq!(
+            tick_result.new_state.white_next_file_chronoindex_to_check,
+            0
+        );
+        assert_eq!(
+            tick_result.new_state.black_next_file_chronoindex_to_check,
+            0
+        );
+    }
+
+    #[test]
+    fn valid_white_opening_move_is_applied() {
+        let (memo_dir, chrono_dir, log_dir) = make_fresh_test_directories("white_opening");
+        let config = build_test_tick_config(&memo_dir, &chrono_dir, &log_dir);
+        let initial_state = create_initial_dungeon_master_state(config);
+
+        write_memo_file(&memo_dir, "00001.toml", "alice", "e4", 1_700_000_100);
+
+        let current_unix_timestamp: u64 = 1_700_000_200;
+        let tick_result = run_one_dungeon_master_tick(&initial_state, current_unix_timestamp);
+
+        assert_eq!(tick_result.outcome, TickOutcome::MoveApplied);
+        assert_eq!(tick_result.new_state.board.side_to_move, PieceColor::Black);
+        assert_eq!(
+            tick_result.new_state.board.game_status,
+            GameStatus::StillPlaying
+        );
+        // e4 means the pawn is now on e4 (index 28) and e2 (index 12) is empty.
+        assert!(
+            tick_result.new_state.board.board_squares[12].is_none(),
+            "e2 should be empty"
+        );
+        match tick_result.new_state.board.board_squares[28] {
+            Some(piece) => {
+                assert_eq!(piece.piece_color, PieceColor::White);
+                assert_eq!(piece.piece_kind, PieceKind::Pawn);
+            }
+            None => panic!("e4 should hold a white pawn"),
+        }
+        assert_eq!(
+            tick_result.new_state.white_next_file_chronoindex_to_check,
+            1
+        );
+    }
+
+    #[test]
+    fn file_owned_by_off_turn_player_is_ignored() {
+        let (memo_dir, chrono_dir, log_dir) = make_fresh_test_directories("off_turn");
+        let config = build_test_tick_config(&memo_dir, &chrono_dir, &log_dir);
+        let initial_state = create_initial_dungeon_master_state(config);
+
+        // It is White's turn at the start. Write a file from Black.
+        write_memo_file(&memo_dir, "00001.toml", "bob", "e5", 1_700_000_100);
+
+        let current_unix_timestamp: u64 = 1_700_000_200;
+        let tick_result = run_one_dungeon_master_tick(&initial_state, current_unix_timestamp);
+
+        assert_eq!(tick_result.outcome, TickOutcome::NoChange);
+        assert_eq!(tick_result.new_state.board.side_to_move, PieceColor::White);
+        // White's cursor advanced past the file because we examined it
+        // and found it was not White's file. The forward-progress rule
+        // ensures the cursor moves.
+        assert_eq!(
+            tick_result.new_state.white_next_file_chronoindex_to_check,
+            1
+        );
+        // Black's cursor stayed at 0 because we are not scanning for Black.
+        assert_eq!(
+            tick_result.new_state.black_next_file_chronoindex_to_check,
+            0
+        );
+    }
+
+    #[test]
+    fn illegal_move_advances_cursor_without_applying() {
+        let (memo_dir, chrono_dir, log_dir) = make_fresh_test_directories("illegal_move");
+        let config = build_test_tick_config(&memo_dir, &chrono_dir, &log_dir);
+        let initial_state = create_initial_dungeon_master_state(config);
+
+        // Write a move that parses syntactically but is illegal in the
+        // starting position: "e5" cannot be played by White on move 1
+        // (the e-pawn cannot move two squares forward to e5, only to e4).
+        write_memo_file(&memo_dir, "00001.toml", "alice", "e5", 1_700_000_100);
+
+        let current_unix_timestamp: u64 = 1_700_000_200;
+        let tick_result = run_one_dungeon_master_tick(&initial_state, current_unix_timestamp);
+
+        assert_eq!(tick_result.outcome, TickOutcome::NoChange);
+        assert_eq!(tick_result.new_state.board.side_to_move, PieceColor::White);
+        // Cursor still advances past the bad file (forward-progress rule).
+        assert_eq!(
+            tick_result.new_state.white_next_file_chronoindex_to_check,
+            1
+        );
+        // No time charged.
+        assert_eq!(
+            tick_result
+                .new_state
+                .game_time_state
+                .white_cumulative_seconds,
+            0
+        );
+    }
+
+    #[test]
+    fn resignation_ends_the_game() {
+        let (memo_dir, chrono_dir, log_dir) = make_fresh_test_directories("resignation");
+        let config = build_test_tick_config(&memo_dir, &chrono_dir, &log_dir);
+        let initial_state = create_initial_dungeon_master_state(config);
+
+        // White (whose turn it is at the start) resigns immediately.
+        write_memo_file(&memo_dir, "00001.toml", "alice", "resign", 1_700_000_100);
+
+        let current_unix_timestamp: u64 = 1_700_000_200;
+        let tick_result = run_one_dungeon_master_tick(&initial_state, current_unix_timestamp);
+
+        assert_eq!(tick_result.outcome, TickOutcome::PlayerResigned);
+        assert_eq!(
+            tick_result.new_state.board.game_status,
+            GameStatus::WhiteResigned,
+        );
+        assert_eq!(
+            tick_result.new_state.white_next_file_chronoindex_to_check,
+            1
+        );
+    }
+}
+
 /// Returns `true` if any piece of `attacker_color` could (pseudo-legally,
 /// ignoring whether such a move would expose the attacker's own king
 /// to check) move to or capture on `target_square_index` in the given
@@ -9737,10 +10318,18 @@ impl MemoConfigFileContents {
 /// updated_at_timestamp = "1778532301"
 /// ```
 ///
-/// The timestamp must be a **quoted string** containing only ASCII
-/// decimal digits. Bare-integer TOML form (`updated_at_timestamp = 1778532301`)
-/// is NOT accepted by this reader, because the underlying single-field
-/// primitive extracts string values only.
+/// The timestamp may be either a quoted string or an unquoted bare
+/// integer, as both forms are handled by the underlying single-field
+/// reader's unquoted-value path:
+///
+/// ```toml
+/// updated_at_timestamp = "1778532301"   # quoted string: accepted
+/// updated_at_timestamp = 1778532301     # bare integer: also accepted
+/// ```
+///
+/// In both cases the value bytes are the ASCII decimal digits of the
+/// timestamp, which `parse_decimal_u64_from_ascii_bytes` then converts
+/// to a `u64`.
 ///
 /// ## Storage
 ///
@@ -10480,6 +11069,26 @@ mod tests_memo_file_readers {
         let fixture = FixtureFile::create("move_text_too_long", &toml_contents);
         let result = read_memo_move_file(fixture.path_as_str());
         assert_eq!(result, Ok(None));
+    }
+
+    #[test]
+    fn move_reader_accepts_bare_integer_timestamp() {
+        // Real memo files use bare integers, not quoted strings:
+        //   updated_at_timestamp = 1778890192
+        // The underlying TOML primitive's unquoted-value path handles this.
+        let fixture = FixtureFile::create(
+            "move_bare_integer_timestamp",
+            "owner = \"alice\"\n\
+             text_message = \"e4\"\n\
+             updated_at_timestamp = 1778890192\n",
+        );
+        let result = read_memo_move_file(fixture.path_as_str());
+        let contents = result
+            .expect("test: read must succeed")
+            .expect("test: bare integer timestamp must be accepted");
+        assert_eq!(contents.owner_as_bytes(), b"alice");
+        assert_eq!(contents.text_message_as_bytes(), b"e4");
+        assert_eq!(contents.updated_at_unix_timestamp, 1_778_890_192);
     }
 
     #[test]
@@ -20837,6 +21446,149 @@ pub fn run_one_bootstrap_scan_pass(
     }
 }
 
+// /// Process one chrono-index position during a bootstrap scan pass.
+// ///
+// /// Extracted as its own function for clarity; the per-position logic
+// /// has four sequential failure points each of which must be handled
+// /// without halting the outer loop.
+// ///
+// /// ## Failure handling per step
+// ///
+// /// Each step that fails either:
+// ///   - emits a skip event and returns (genuine failure), or
+// ///   - returns silently (routine "no config here" case).
+// ///
+// /// On the success path, the function calls
+// /// `apply_parsed_config_line_to_partial_config` and returns.
+// ///
+// /// ## Memory & Panic Policy
+// ///
+// /// No heap-growing scratch. One `[u8; MAX_FULL_PATH_LEN]` stack
+// /// buffer for path bytes. All Section-39 / Section-46 helpers are
+// /// no-heap.
+// fn process_one_chrono_position_during_bootstrap(
+//     chrono_sort_temp_directory_path: &Path,
+//     chrono_position: u64,
+//     logging_directory_path: &Path,
+//     bootstrap_run_unix_timestamp: u64,
+//     partial_config: &mut PartialBootstrapConfig,
+// ) {
+//     // ----- Step a: resolve absolute path bytes -----
+//     let mut absolute_path_buffer: [u8; MAX_FULL_PATH_LEN] = [0; MAX_FULL_PATH_LEN];
+//     let lookup_result = lookup_abs_file_path_at_mtime_chronological_index(
+//         chrono_sort_temp_directory_path,
+//         chrono_position,
+//         &mut absolute_path_buffer,
+//     );
+//     let lookup_outcome = match lookup_result {
+//         Ok(option_value) => option_value,
+//         Err(_) => {
+//             emit_bootstrap_skip_event(
+//                 BootstrapSkipReason::FileIoFailure,
+//                 chrono_position,
+//                 logging_directory_path,
+//                 bootstrap_run_unix_timestamp,
+//             );
+//             return;
+//         }
+//     };
+//     let lookup_payload = match lookup_outcome {
+//         Some(payload_value) => payload_value,
+//         None => {
+//             // Position past file_count. Should not happen because the
+//             // caller bounded the loop on count_committed_files, but the
+//             // chrono-index could have been concurrently modified between
+//             // count and lookup. Treat as silent; the next pass refreshes.
+//             return;
+//         }
+//     };
+//     let path_byte_slice = &absolute_path_buffer[..lookup_payload.path_byte_length];
+
+//     // ----- Step b: UTF-8 validate the path bytes -----
+//     let absolute_path_str = match core::str::from_utf8(path_byte_slice) {
+//         Ok(string_value) => string_value,
+//         Err(_) => {
+//             emit_bootstrap_skip_event(
+//                 BootstrapSkipReason::PathNotUtf8,
+//                 chrono_position,
+//                 logging_directory_path,
+//                 bootstrap_run_unix_timestamp,
+//             );
+//             return;
+//         }
+//     };
+
+//     // ----- Step c: read memo config file -----
+//     let read_result = read_memo_config_file(absolute_path_str);
+//     let memo_contents_option = match read_result {
+//         Ok(option_value) => option_value,
+//         Err(_) => {
+//             emit_bootstrap_skip_event(
+//                 BootstrapSkipReason::FileIoFailure,
+//                 chrono_position,
+//                 logging_directory_path,
+//                 bootstrap_run_unix_timestamp,
+//             );
+//             return;
+//         }
+//     };
+//     let memo_contents = match memo_contents_option {
+//         Some(contents_value) => contents_value,
+//         None => {
+//             // File simply has no text_message field. Routine; not logged.
+//             return;
+//         }
+//     };
+
+//     // ----- Step d: parse the text_message as a config line -----
+//     let text_message_bytes = memo_contents.text_message_as_bytes();
+//     let parse_result = parse_config_line_text_message(text_message_bytes);
+//     let parsed_line = match parse_result {
+//         Ok(parsed_value) => parsed_value,
+//         Err(parse_error) => {
+//             // Categorize: NoColonSeparator is silent (most likely a
+//             // move-notation memo); all other parse errors warrant a
+//             // skip event because they indicate a malformed config
+//             // attempt (colon present but otherwise wrong).
+//             match parse_error {
+//                 ConfigLineParseError::NoColonSeparator => {
+//                     // Silent.
+//                     return;
+//                 }
+//                 _ => {
+//                     emit_bootstrap_skip_event(
+//                         BootstrapSkipReason::ConfigLineMalformed,
+//                         chrono_position,
+//                         logging_directory_path,
+//                         bootstrap_run_unix_timestamp,
+//                     );
+//                     return;
+//                 }
+//             }
+//         }
+//     };
+
+//     // ----- Step e: apply parsed line to the partial config -----
+//     let apply_outcome = apply_parsed_config_line_to_partial_config(&parsed_line, partial_config);
+//     match apply_outcome {
+//         ApplyConfigLineOutcome::FieldNewlySet => {
+//             // Success path. Not logged; the next prompt-printing
+//             // cycle will visibly reflect the new field.
+//         }
+//         ApplyConfigLineOutcome::FieldAlreadySet => {
+//             // Routine: first-wins discarded this memo.
+//         }
+//         ApplyConfigLineOutcome::ValueSemanticInvalid => {
+//             emit_bootstrap_skip_event(
+//                 BootstrapSkipReason::ConfigValueSemanticInvalid,
+//                 chrono_position,
+//                 logging_directory_path,
+//                 bootstrap_run_unix_timestamp,
+//             );
+//         }
+//     }
+// }
+
 /// Process one chrono-index position during a bootstrap scan pass.
 ///
 /// Extracted as its own function for clarity; the per-position logic
@@ -20864,6 +21616,13 @@ fn process_one_chrono_position_during_bootstrap(
     bootstrap_run_unix_timestamp: u64,
     partial_config: &mut PartialBootstrapConfig,
 ) {
+    #[cfg(debug_assertions)]
+    eprintln!(
+        "[BOOTSTRAP DBG] enter process_one_chrono_position_during_bootstrap \
+         chrono_position={} chrono_dir={:?}",
+        chrono_position, chrono_sort_temp_directory_path
+    );
+
     // ----- Step a: resolve absolute path bytes -----
     let mut absolute_path_buffer: [u8; MAX_FULL_PATH_LEN] = [0; MAX_FULL_PATH_LEN];
     let lookup_result = lookup_abs_file_path_at_mtime_chronological_index(
@@ -20873,7 +21632,13 @@ fn process_one_chrono_position_during_bootstrap(
     );
     let lookup_outcome = match lookup_result {
         Ok(option_value) => option_value,
-        Err(_) => {
+        Err(io_error) => {
+            #[cfg(debug_assertions)]
+            eprintln!(
+                "[BOOTSTRAP DBG] step-a lookup_abs_file_path_at_mtime_chronological_index \
+                 returned Err at chrono_position={}: {:?}",
+                chrono_position, io_error
+            );
             emit_bootstrap_skip_event(
                 BootstrapSkipReason::FileIoFailure,
                 chrono_position,
@@ -20886,19 +21651,33 @@ fn process_one_chrono_position_during_bootstrap(
     let lookup_payload = match lookup_outcome {
         Some(payload_value) => payload_value,
         None => {
-            // Position past file_count. Should not happen because the
-            // caller bounded the loop on count_committed_files, but the
-            // chrono-index could have been concurrently modified between
-            // count and lookup. Treat as silent; the next pass refreshes.
+            #[cfg(debug_assertions)]
+            eprintln!(
+                "[BOOTSTRAP DBG] step-a chrono_position={} past end of index (None); \
+                 silent skip",
+                chrono_position
+            );
             return;
         }
     };
     let path_byte_slice = &absolute_path_buffer[..lookup_payload.path_byte_length];
 
+    #[cfg(debug_assertions)]
+    eprintln!(
+        "[BOOTSTRAP DBG] step-a resolved path_byte_length={} path_lossy={:?}",
+        lookup_payload.path_byte_length,
+        core::str::from_utf8(path_byte_slice).unwrap_or("<non-utf8>")
+    );
+
     // ----- Step b: UTF-8 validate the path bytes -----
     let absolute_path_str = match core::str::from_utf8(path_byte_slice) {
         Ok(string_value) => string_value,
-        Err(_) => {
+        Err(utf8_error) => {
+            #[cfg(debug_assertions)]
+            eprintln!(
+                "[BOOTSTRAP DBG] step-b path not valid UTF-8 at chrono_position={}: {:?}",
+                chrono_position, utf8_error
+            );
             emit_bootstrap_skip_event(
                 BootstrapSkipReason::PathNotUtf8,
                 chrono_position,
@@ -20913,7 +21692,13 @@ fn process_one_chrono_position_during_bootstrap(
     let read_result = read_memo_config_file(absolute_path_str);
     let memo_contents_option = match read_result {
         Ok(option_value) => option_value,
-        Err(_) => {
+        Err(read_error) => {
+            #[cfg(debug_assertions)]
+            eprintln!(
+                "[BOOTSTRAP DBG] step-c read_memo_config_file returned Err \
+                 for path={:?}: {:?}",
+                absolute_path_str, read_error
+            );
             emit_bootstrap_skip_event(
                 BootstrapSkipReason::FileIoFailure,
                 chrono_position,
@@ -20926,45 +21711,69 @@ fn process_one_chrono_position_during_bootstrap(
     let memo_contents = match memo_contents_option {
         Some(contents_value) => contents_value,
         None => {
-            // File simply has no text_message field. Routine; not logged.
+            #[cfg(debug_assertions)]
+            eprintln!(
+                "[BOOTSTRAP DBG] step-c path={:?} has no text_message field; silent skip",
+                absolute_path_str
+            );
             return;
         }
     };
 
     // ----- Step d: parse the text_message as a config line -----
     let text_message_bytes = memo_contents.text_message_as_bytes();
+
+    #[cfg(debug_assertions)]
+    eprintln!(
+        "[BOOTSTRAP DBG] step-d text_message_len={} text_message_lossy={:?}",
+        text_message_bytes.len(),
+        core::str::from_utf8(text_message_bytes).unwrap_or("<non-utf8>")
+    );
+
     let parse_result = parse_config_line_text_message(text_message_bytes);
     let parsed_line = match parse_result {
         Ok(parsed_value) => parsed_value,
-        Err(parse_error) => {
-            // Categorize: NoColonSeparator is silent (most likely a
-            // move-notation memo); all other parse errors warrant a
-            // skip event because they indicate a malformed config
-            // attempt (colon present but otherwise wrong).
-            match parse_error {
-                ConfigLineParseError::NoColonSeparator => {
-                    // Silent.
-                    return;
-                }
-                _ => {
-                    emit_bootstrap_skip_event(
-                        BootstrapSkipReason::ConfigLineMalformed,
-                        chrono_position,
-                        logging_directory_path,
-                        bootstrap_run_unix_timestamp,
-                    );
-                    return;
-                }
+        Err(parse_error) => match parse_error {
+            ConfigLineParseError::NoColonSeparator => {
+                #[cfg(debug_assertions)]
+                eprintln!(
+                    "[BOOTSTRAP DBG] step-d no colon separator (probable move-notation \
+                         memo); silent skip"
+                );
+                return;
             }
-        }
+            other_parse_error => {
+                #[cfg(debug_assertions)]
+                eprintln!(
+                    "[BOOTSTRAP DBG] step-d parse error at chrono_position={}: {:?}",
+                    chrono_position, other_parse_error
+                );
+                emit_bootstrap_skip_event(
+                    BootstrapSkipReason::ConfigLineMalformed,
+                    chrono_position,
+                    logging_directory_path,
+                    bootstrap_run_unix_timestamp,
+                );
+                return;
+            }
+        },
     };
+
+    #[cfg(debug_assertions)]
+    eprintln!("[BOOTSTRAP DBG] step-d parsed_line={:?}", parsed_line);
 
     // ----- Step e: apply parsed line to the partial config -----
     let apply_outcome = apply_parsed_config_line_to_partial_config(&parsed_line, partial_config);
+
+    #[cfg(debug_assertions)]
+    eprintln!(
+        "[BOOTSTRAP DBG] step-e apply_outcome={:?} at chrono_position={}",
+        apply_outcome, chrono_position
+    );
+
     match apply_outcome {
         ApplyConfigLineOutcome::FieldNewlySet => {
-            // Success path. Not logged; the next prompt-printing
-            // cycle will visibly reflect the new field.
+            // Success path. Not logged in production.
         }
         ApplyConfigLineOutcome::FieldAlreadySet => {
             // Routine: first-wins discarded this memo.
@@ -23630,585 +24439,265 @@ mod section_63_game_log_writer_tests {
     }
 }
 
-/// testing
+// ============================================================================
+// SECTION 64: Outer Wrapper — run_memochess_dungeon_master_loop
+// ============================================================================
+//
+// ## Project Context
+//
+// This is the top-level game-loop wrapper. It is called once by
+// `main.rs` (or any other caller) after `q_and_a_setup_bootstrap`
+// has produced a finalized `MemochessGameConfig` and
+// `create_initial_dungeon_master_state` has produced the initial
+// `DungeonMasterState`.
+//
+// The wrapper drives the per-tick cycle:
+//
+//   1. Sample the current Unix timestamp.
+//   2. Call `run_one_dungeon_master_tick` to advance the state.
+//   3. Handle the tick outcome:
+//        - NoChange / MoveApplied / PlayerResigned / TimeFlagged:
+//          accept the new state.
+//        - ChronoSequenceReordered: discard the state and reset to
+//          the initial state. The next iteration's tick will start
+//          replaying from chrono position 0.
+//        - ChronoIndexUnreadable: keep the existing state; retry
+//          next tick.
+//   4. Write the new state to terminal + log via the double-publish
+//      closure.
+//   5. If the game has ended, exit the loop and return.
+//   6. Sleep `refresh_rate_seconds` and repeat.
+//
+// ## End-of-game detection
+//
+// The loop terminates when `state.board.game_status` is anything
+// other than `GameStatus::StillPlaying` after a tick. The final
+// state is written one more time so the user sees the end-of-game
+// `Status:` line, then the wrapper returns.
+//
+// The wrapper does not poll for further memos after the game ends.
+// If a player writes a memo after checkmate, that memo is ignored
+// until the next process invocation re-bootstraps.
+//
+// ## Replay recovery (visible to user)
+//
+// On `TickOutcome::ChronoSequenceReordered`, the wrapper resets the
+// state via `create_initial_dungeon_master_state(state.config)` and
+// continues the main loop. The next tick will read chrono position 0,
+// the tick after that position 1, and so on, with each replayed
+// move being rendered and appended to the log at the configured
+// `refresh_rate_seconds` cadence. This is by project design: the
+// user sees the recovery happening, and the log records the full
+// replay history.
+//
+// ## Initial render before loop entry
+//
+// Before entering the main loop, the wrapper writes the initial
+// state once so the user sees the starting board immediately rather
+// than waiting `refresh_rate_seconds` for the first tick.
+//
+// ## Memory & Panic Policy
+//
+// No heap allocation by the wrapper itself (per-tick stack copies
+// of `DungeonMasterState` are bounded and small). Components called
+// by the wrapper have their own documented memory policies.
+//
+// No panics. Every component called by the wrapper has best-effort
+// or `Result`-returning semantics; any failure is surfaced through
+// `TickOutcome` and handled by the loop without halting.
+//
+// ## No cargo tests in this section
+//
+// The wrapper is a loop with sleep and stdout side effects. Unit
+// testing it deterministically would require dependency injection
+// of the sleep function and a mock of `run_one_dungeon_master_tick`,
+// which is infrastructure disproportionate to the value. Correctness
+// comes from the correctness of the wrapper's components (each
+// individually tested) plus integration testing via the demo
+// `main.rs`.
 
 // ----------------------------------------------------------------------------
-// Public: the per-tick function
+// Internal helper: build the absolute log directory path (best effort)
 // ----------------------------------------------------------------------------
 
-/// Perform one tick of the dungeon-master game loop.
+/// Convert the `memo_chess_log_directory_path_as_bytes()` from the
+/// game config into a `&Path` for use in log appends.
 ///
-/// ## Project Context
-///
-/// Called by the outer wrapper (Section 62, to be implemented) once
-/// per refresh cycle. Pure with respect to caller state in the sense
-/// that all internal failures map to `TickOutcome` variants rather
-/// than panics or aborts. Takes the current Unix timestamp as a
-/// parameter so the caller can sample the clock once and have all
-/// internal time computations agree on "now."
-///
-/// ## Arguments
-///
-/// - `current_state`: the dungeon-master state at the start of the
-///   tick. Immutable; the function returns a new state.
-/// - `current_unix_timestamp`: wall-clock "now" in Unix seconds.
-///
-/// ## Returns
-///
-/// A `TickResult` containing the new state and a `TickOutcome`
-/// describing what happened. See `TickOutcome` for the meanings of
-/// the variants.
-///
-/// ## Internal sequence
-///
-/// 1. Early return with `NoChange` if the game has already ended
-///    (the wrapper should not be calling the tick in this state,
-///    but defensive check costs nothing).
-/// 2. Refresh the chrono-index against the live memo directory.
-///    On failure, return `ChronoIndexUnreadable` with state unchanged.
-/// 3. Read the new total file count. Bound the scan upper limit at
-///    `MAX_GAME_FILES_FOR_BOOTSTRAP_SCAN` (reusing the bootstrap
-///    constant — the bound applies equally here).
-/// 4. If `last_known_chrono_hash_through_n` is `Some`, verify the
-///    sequence has not been retroactively reordered by calling
-///    `check_chronosort_hash_to_n` over the previously-known range.
-///    On detected reorder, return `ChronoSequenceReordered` with
-///    state unchanged.
-/// 5. Live time-flag check via `check_for_time_flag`. If the player
-///    on the clock has flagged, update `board.game_status` and
-///    return `TimeFlagged`.
-/// 6. Identify whose turn it is and the appropriate cursor.
-/// 7. Scan the chrono range for that player's next candidate file.
-/// 8. Apply whichever outcome was found:
-///      - No candidate: advance cursor to upper bound; return
-///        `NoChange`.
-///      - Move candidate: resolve and apply; on success return
-///        `MoveApplied`; on illegal-move return `NoChange` (cursor
-///        still advances).
-///      - Resignation: end game; return `PlayerResigned`.
-/// 9. Refresh the chrono-sort hash for next-tick anomaly detection.
-/// 10. Return the new state.
-///
-/// ## Memory & Panic Policy
-///
-/// No panics. The chrono-index module performs its own bounded
-/// allocations; none scale per-tick. All other I/O is via no-heap
-/// readers.
-pub fn run_one_dungeon_master_tick(
-    current_state: &DungeonMasterState,
-    current_unix_timestamp: u64,
-) -> TickResult {
-    // ----- Step 1: early return if game has already ended -----
-    if current_state.board.game_status != GameStatus::StillPlaying {
-        return TickResult {
-            new_state: *current_state,
-            outcome: TickOutcome::NoChange,
-        };
-    }
-
-    // Resolve path bytes from config into &Path values for the
-    // chrono-index module. These paths were already validated by
-    // bootstrap; UTF-8 conversion below is a defensive fallthrough.
-    let memo_toml_files_path_bytes: &[u8] = current_state
-        .config
-        .memo_toml_files_directory_path_as_bytes();
-    let chrono_sort_temp_path_bytes: &[u8] = current_state
-        .config
-        .chrono_sort_temp_directory_path_as_bytes();
-
-    let memo_toml_files_path_str: &str = match core::str::from_utf8(memo_toml_files_path_bytes) {
-        Ok(value) => value,
-        Err(_) => {
-            // Path stored in config is non-UTF-8. This should not
-            // happen given bootstrap validation, but the defensive
-            // path returns ChronoIndexUnreadable so the wrapper
-            // retries (and the situation likely persists, but the
-            // tick does not panic).
-            return TickResult {
-                new_state: *current_state,
-                outcome: TickOutcome::ChronoIndexUnreadable,
-            };
-        }
-    };
-    let chrono_sort_temp_path_str: &str = match core::str::from_utf8(chrono_sort_temp_path_bytes) {
-        Ok(value) => value,
-        Err(_) => {
-            return TickResult {
-                new_state: *current_state,
-                outcome: TickOutcome::ChronoIndexUnreadable,
-            };
-        }
-    };
-    let memo_toml_files_path: &Path = Path::new(memo_toml_files_path_str);
-    let chrono_sort_temp_path: &Path = Path::new(chrono_sort_temp_path_str);
-
-    // ----- Step 2: refresh the chrono-index -----
-    let update_result = create_or_update_chrono_index(chrono_sort_temp_path, memo_toml_files_path);
-    let total_committed_file_count: u64 = match update_result {
-        Ok(update_summary) => update_summary.final_file_count,
-        Err(_) => {
-            return TickResult {
-                new_state: *current_state,
-                outcome: TickOutcome::ChronoIndexUnreadable,
-            };
-        }
-    };
-
-    // ----- Step 3: bound the scan upper limit -----
-    let scan_upper_bound: u64 = if total_committed_file_count > MAX_GAME_FILES_FOR_BOOTSTRAP_SCAN {
-        MAX_GAME_FILES_FOR_BOOTSTRAP_SCAN
-    } else {
-        total_committed_file_count
-    };
-
-    // ----- Step 4: chrono-sort hash anomaly check -----
-    if let Some(previously_known_hash) = current_state.last_known_chrono_hash_through_n {
-        if current_state.last_known_file_count > 0 {
-            let last_indexed_position_zero_based: u64 = current_state.last_known_file_count - 1;
-            let hash_check_result = check_chronosort_hash_to_n(
-                chrono_sort_temp_path,
-                last_indexed_position_zero_based,
-                previously_known_hash,
-            );
-            match hash_check_result {
-                Ok(true) => {
-                    // Sequence intact; continue.
-                }
-                Ok(false) => {
-                    // Retroactive reorder detected; wrapper decides
-                    // recovery. State unchanged.
-                    return TickResult {
-                        new_state: *current_state,
-                        outcome: TickOutcome::ChronoSequenceReordered,
-                    };
-                }
-                Err(_) => {
-                    // Defensive: treat hash-check I/O failure as a
-                    // reorder signal (the wrapper handles both the
-                    // same way: rebuild from initial state).
-                    return TickResult {
-                        new_state: *current_state,
-                        outcome: TickOutcome::ChronoSequenceReordered,
-                    };
-                }
-            }
-        }
-    }
-
-    // ----- Step 5: live time-flag check -----
-    let mut working_state: DungeonMasterState = *current_state;
-    let flag_check_result = check_for_time_flag(
-        &mut working_state.game_time_state,
-        &working_state.board,
-        current_unix_timestamp,
-    );
-    if flag_check_result.is_some() {
-        working_state.board =
-            apply_timeflag_to_game_status(working_state.board, working_state.game_time_state);
-        // Even though no move was processed this tick, refresh the
-        // last_known fields if the file count grew. Skipping for
-        // simplicity: a terminated game does not need next-tick
-        // anomaly tracking.
-        return TickResult {
-            new_state: working_state,
-            outcome: TickOutcome::TimeFlagged,
-        };
-    }
-
-    // ----- Step 6: identify whose turn it is -----
-    let side_to_move: PieceColor = working_state.board.side_to_move;
-    let cursor_for_side_to_move: u64 = match side_to_move {
-        PieceColor::White => working_state.white_next_file_chronoindex_to_check,
-        PieceColor::Black => working_state.black_next_file_chronoindex_to_check,
-    };
-
-    // ----- Step 7: scan for the next candidate -----
-    let scan_outcome = scan_chrono_range_for_player_move(
-        chrono_sort_temp_path,
-        cursor_for_side_to_move,
-        scan_upper_bound,
-        side_to_move,
-        &working_state.config,
-    );
-
-    // ----- Step 8: act on the scan outcome -----
-    let outcome_label: TickOutcome = match scan_outcome {
-        ScanLoopOutcome::NoCandidateFound { advanced_cursor_to } => {
-            // Advance the cursor to the upper bound and return.
-            match side_to_move {
-                PieceColor::White => {
-                    working_state.white_next_file_chronoindex_to_check = advanced_cursor_to;
-                }
-                PieceColor::Black => {
-                    working_state.black_next_file_chronoindex_to_check = advanced_cursor_to;
-                }
-            }
-            TickOutcome::NoChange
-        }
-
-        ScanLoopOutcome::MoveCandidate {
-            parsed_notation,
-            move_unix_timestamp,
-            found_at_position,
-        } => {
-            // Advance the cursor past this position regardless of
-            // whether the move turns out to be legal. This is the
-            // forward-progress rule.
-            let next_position_after: u64 = found_at_position.saturating_add(1);
-            match side_to_move {
-                PieceColor::White => {
-                    working_state.white_next_file_chronoindex_to_check = next_position_after;
-                }
-                PieceColor::Black => {
-                    working_state.black_next_file_chronoindex_to_check = next_position_after;
-                }
-            }
-
-            // Try to resolve the parsed notation to a legal chess
-            // move in the current board state.
-            let resolve_result =
-                resolve_parsed_move_to_legal_chess_move(&working_state.board, &parsed_notation);
-            let resolved_move = match resolve_result {
-                Ok(chess_move_value) => chess_move_value,
-                Err(_) => {
-                    // Illegal move; the player will have to write
-                    // another memo. Cursor already advanced. No move
-                    // applied, no time charged.
-                    return TickResult {
-                        new_state: working_state,
-                        outcome: TickOutcome::NoChange,
-                    };
-                }
-            };
-
-            // Apply the move to the board.
-            let apply_result = apply_chess_move_to_state(&working_state.board, &resolved_move);
-            let new_board = match apply_result {
-                Ok(new_board_value) => new_board_value,
-                Err(_) => {
-                    // Apply rejected the move (defensive: should not
-                    // happen if resolve succeeded). Cursor already
-                    // advanced.
-                    return TickResult {
-                        new_state: working_state,
-                        outcome: TickOutcome::NoChange,
-                    };
-                }
-            };
-
-            // Charge time to the player who just moved. The
-            // GameTimeState API expects the clock-owner color
-            // (side_to_move BEFORE the move was applied), which is
-            // exactly `side_to_move` here.
-            process_move_timestamp_for_game_time(
-                &mut working_state.game_time_state,
-                side_to_move,
-                move_unix_timestamp,
-            );
-
-            // Install the new board.
-            working_state.board = new_board;
-
-            // If the time-charge caused a flag, propagate to
-            // game_status.
-            working_state.board =
-                apply_timeflag_to_game_status(working_state.board, working_state.game_time_state);
-
-            // If the timeflag was the proximate end, surface as
-            // TimeFlagged rather than MoveApplied.
-            if working_state.game_time_state.timeflagged_player.is_some() {
-                TickOutcome::TimeFlagged
-            } else {
-                TickOutcome::MoveApplied
-            }
-        }
-
-        ScanLoopOutcome::ResignationCommand {
-            command_unix_timestamp,
-            found_at_position,
-        } => {
-            // Advance the cursor past the resignation file.
-            let next_position_after: u64 = found_at_position.saturating_add(1);
-            match side_to_move {
-                PieceColor::White => {
-                    working_state.white_next_file_chronoindex_to_check = next_position_after;
-                }
-                PieceColor::Black => {
-                    working_state.black_next_file_chronoindex_to_check = next_position_after;
-                }
-            }
-
-            // Charge thinking time up to the resignation moment to
-            // the resigning player.
-            process_non_move_command_timestamp_for_game_time(
-                &mut working_state.game_time_state,
-                &working_state.board,
-                command_unix_timestamp,
-            );
-
-            // Update game status: the OPPONENT of the resigning
-            // player wins.
-            let mut updated_board = working_state.board;
-            updated_board.game_status = match side_to_move {
-                PieceColor::White => GameStatus::WhiteResigned,
-                PieceColor::Black => GameStatus::BlackResigned,
-            };
-            working_state.board = updated_board;
-
-            TickOutcome::PlayerResigned
-        }
-    };
-
-    // ----- Step 9: refresh the chrono-sort hash for next-tick check -----
-    // Only refresh if the game is still in progress and we have
-    // committed positions to hash.
-    if working_state.board.game_status == GameStatus::StillPlaying && total_committed_file_count > 0
-    {
-        let last_indexed_position_zero_based: u64 = total_committed_file_count - 1;
-        let hash_compute_result =
-            chrono_sort_hash_to_n(chrono_sort_temp_path, last_indexed_position_zero_based);
-        match hash_compute_result {
-            Ok(new_hash) => {
-                working_state.last_known_chrono_hash_through_n = Some(new_hash);
-                working_state.last_known_file_count = total_committed_file_count;
-            }
-            Err(_) => {
-                // Hash refresh failed; leave the previously-known
-                // hash and file count in place. Next tick will
-                // attempt the refresh again.
-            }
-        }
-    }
-
-    // ----- Step 10: return -----
-    TickResult {
-        new_state: working_state,
-        outcome: outcome_label,
+/// On non-UTF-8 path bytes (which the bootstrap rejected at config
+/// construction time and so should not occur here), returns an
+/// empty `&Path` so the log-append helper's directory-missing path
+/// degrades to a no-op silently. The terminal half of the
+/// double-publish continues to work in that degraded mode.
+fn read_log_directory_path_str_from_config(config: &MemochessGameConfig) -> &str {
+    match core::str::from_utf8(config.memo_chess_log_directory_path_as_bytes()) {
+        Ok(path_str) => path_str,
+        Err(_) => "",
     }
 }
 
-// ============================================================================
-// SECTION 61: Per-Tick Function — Cargo Tests
-// ============================================================================
+// ----------------------------------------------------------------------------
+// Internal helper: write one full state frame to terminal AND log
+// ----------------------------------------------------------------------------
 
-#[cfg(test)]
-mod run_one_dungeon_master_tick_tests {
-    use super::*;
-    use std::fs;
-    use std::path::PathBuf;
-    use std::sync::atomic::{AtomicU64, Ordering};
+/// Compose and emit one full state frame to both destinations.
+///
+/// This wraps `write_dungeon_master_state_to_tui_and_log` with the
+/// double-publish closure: each emitted content line is sent to the
+/// terminal via Buffy and appended to the game-log file.
+///
+/// ## Failure modes
+///
+/// Both halves of the double-publish are best-effort. Terminal
+/// failures (closed stdout, etc.) are silently dropped by Buffy.
+/// Log failures (path issue, disk full) are silently dropped by
+/// `append_one_line_to_game_log_file_best_effort`. The game
+/// continues in either case.
+///
+/// ## Memory & Panic Policy
+///
+/// No heap allocation inside this helper itself. The closure
+/// captures references to stack-resident path values and the
+/// bootstrap timestamp. The log-append helper performs one bounded
+/// `PathBuf::join` per content line; this is per-call, not per-tick,
+/// and is freed before the next line is emitted.
+fn write_one_full_frame_to_terminal_and_log(
+    state: &DungeonMasterState,
+    current_unix_timestamp_seconds: u64,
+) {
+    let log_directory_path_str = read_log_directory_path_str_from_config(&state.config);
+    let log_directory_path = std::path::Path::new(log_directory_path_str);
+    let bootstrap_run_timestamp_seconds = state.config.bootstrap_run_unix_timestamp_seconds();
 
-    /// Counter used to give each test a unique temp-directory name
-    /// so parallel test execution does not collide.
-    static UNIQUE_TEST_DIRECTORY_COUNTER: AtomicU64 = AtomicU64::new(0);
-
-    /// Create a fresh trio of empty directories under the system
-    /// temp root, one for memos, one for chrono-index temp, and one
-    /// for logs. Returns `(memo_dir, chrono_dir, log_dir)`.
-    fn make_fresh_test_directories(test_label: &str) -> (PathBuf, PathBuf, PathBuf) {
-        let unique_suffix = UNIQUE_TEST_DIRECTORY_COUNTER.fetch_add(1, Ordering::SeqCst);
-        let process_id = std::process::id();
-        let base_name = format!(
-            "memo_chess_tick_test_{}_{}_{}",
-            test_label, process_id, unique_suffix
+    let mut emit_line_closure = |line_bytes: &[u8]| {
+        // Terminal half:
+        write_one_line_to_terminal_via_buffy_best_effort(line_bytes);
+        // Log-file half:
+        append_one_line_to_game_log_file_best_effort(
+            log_directory_path,
+            bootstrap_run_timestamp_seconds,
+            line_bytes,
         );
-        let base_path = std::env::temp_dir().join(&base_name);
+    };
 
-        let memo_dir = base_path.join("memos");
-        let chrono_dir = base_path.join("chrono");
-        let log_dir = base_path.join("logs");
+    write_dungeon_master_state_to_tui_and_log(
+        state,
+        current_unix_timestamp_seconds,
+        &mut emit_line_closure,
+    );
+}
 
-        for dir in &[&memo_dir, &chrono_dir, &log_dir] {
-            fs::create_dir_all(dir).expect("test setup: create_dir_all failed");
-        }
-        (memo_dir, chrono_dir, log_dir)
-    }
+// ----------------------------------------------------------------------------
+// Public entry point: the wrapper loop
+// ----------------------------------------------------------------------------
 
-    /// Build a valid `MemochessGameConfig` using the three test
-    /// directory paths.
-    fn build_test_tick_config(
-        memo_dir: &Path,
-        chrono_dir: &Path,
-        log_dir: &Path,
-    ) -> MemochessGameConfig {
-        let memo_dir_str = memo_dir.to_str().expect("test memo path must be UTF-8");
-        let chrono_dir_str = chrono_dir.to_str().expect("test chrono path must be UTF-8");
-        let log_dir_str = log_dir.to_str().expect("test log path must be UTF-8");
+/// Run the dungeon-master game loop until the game ends, returning
+/// the final `DungeonMasterState`.
+///
+/// ## Project Context
+///
+/// Called by `main.rs` (or any other top-level driver) after
+/// bootstrap has finished and an initial state has been constructed.
+/// Drives the per-tick cycle until `board.game_status` becomes
+/// decisive (anything other than `GameStatus::StillPlaying`).
+///
+/// ## Replay recovery
+///
+/// On `TickOutcome::ChronoSequenceReordered`, the state is reset via
+/// `create_initial_dungeon_master_state(state.config)` and the loop
+/// continues. Each subsequent tick replays one chronological
+/// position. The user sees the replay happen at the configured
+/// `refresh_rate_seconds` cadence and the log captures the full
+/// replay history. This is by project design.
+///
+/// ## Arguments
+///
+/// - `initial_state`: the starting `DungeonMasterState`, typically
+///   produced by `create_initial_dungeon_master_state` immediately
+///   after bootstrap.
+///
+/// ## Returns
+///
+/// The final `DungeonMasterState` when the game has ended. The
+/// caller may inspect `final_state.board.game_status` to determine
+/// the outcome.
+///
+/// ## Memory & Panic Policy
+///
+/// Heap: one `PathBuf::join` per content line per tick (bounded,
+/// freed before the next line), allocated inside
+/// `append_one_line_to_game_log_file_best_effort`. No heap touch
+/// scales with game length.
+///
+/// Panic: none. Every called function is best-effort or returns
+/// `Result`; no `unwrap`/`expect`/`assert!` in this function or any
+/// it calls (in production code paths).
+pub fn run_memochess_dungeon_master_loop(initial_state: DungeonMasterState) -> DungeonMasterState {
+    let mut current_state: DungeonMasterState = initial_state;
 
-        let result = MemochessGameConfig::try_construct_memochess_game_config(
-            memo_dir_str.as_bytes(),
-            chrono_dir_str.as_bytes(),
-            log_dir_str.as_bytes(),
-            b"tester",
-            b"alice",
-            b"bob",
-            600u32,
-            10u8,
-            50u16,
-            1_000_000_000,
-        );
-        match result {
-            Ok(config) => config,
-            Err(e) => panic!("test setup: config construction failed: {:?}", e),
-        }
-    }
+    // Initial render before loop entry, so the user sees the starting
+    // board immediately rather than waiting `refresh_rate_seconds`
+    // for the first tick.
+    let initial_unix_timestamp_seconds = read_current_unix_timestamp_seconds_best_effort();
+    write_one_full_frame_to_terminal_and_log(&current_state, initial_unix_timestamp_seconds);
 
-    /// Write a memo TOML file into `memo_dir` with the given
-    /// filename, owner, text_message, and timestamp.
-    fn write_memo_file(
-        memo_dir: &Path,
-        filename: &str,
-        owner: &str,
-        text_message: &str,
-        updated_at_unix_timestamp: u64,
-    ) {
-        let contents = format!(
-            "owner = \"{}\"\ntext_message = \"{}\"\nupdated_at_timestamp = \"{}\"\n",
-            owner, text_message, updated_at_unix_timestamp
-        );
-        let file_path = memo_dir.join(filename);
-        fs::write(&file_path, contents).expect("test setup: write memo file failed");
-    }
+    // Main loop. Bounded only by the game ending (one of the
+    // decisive `GameStatus` variants). Per NASA P10 rule 2 this is
+    // an "always-loop" — the termination is event-driven (game ends)
+    // rather than counter-driven. The failsafe is that every tick
+    // outcome that could keep the loop running forever (e.g.,
+    // `ChronoIndexUnreadable`) sleeps the configured refresh
+    // interval, so the loop cannot busy-spin even under sustained
+    // I/O failure.
+    loop {
+        // 1. Sleep before each subsequent tick, including before the
+        //    very first tick after the initial render. This gives
+        //    the user `refresh_rate_seconds` to look at the rendered
+        //    board before the first poll cycle.
+        let refresh_rate_seconds_u64: u64 = current_state.config.refresh_rate_seconds as u64;
+        std::thread::sleep(std::time::Duration::from_secs(refresh_rate_seconds_u64));
 
-    #[test]
-    fn empty_directory_yields_no_change() {
-        let (memo_dir, chrono_dir, log_dir) = make_fresh_test_directories("empty_directory");
-        let config = build_test_tick_config(&memo_dir, &chrono_dir, &log_dir);
-        let initial_state = create_initial_dungeon_master_state(config);
+        // 2. Sample current Unix timestamp once per tick. Passed to
+        //    both the tick function (for live time-flag detection)
+        //    and the renderer (for live clock display).
+        let current_unix_timestamp_seconds = read_current_unix_timestamp_seconds_best_effort();
 
-        let current_unix_timestamp: u64 = 1_700_000_000;
-        let tick_result = run_one_dungeon_master_tick(&initial_state, current_unix_timestamp);
+        // 3. Advance the state by one tick.
+        let tick_result: TickResult =
+            run_one_dungeon_master_tick(&current_state, current_unix_timestamp_seconds);
 
-        assert_eq!(tick_result.outcome, TickOutcome::NoChange);
-        assert_eq!(tick_result.new_state.board.side_to_move, PieceColor::White);
-        assert_eq!(
-            tick_result.new_state.board.game_status,
-            GameStatus::StillPlaying
-        );
-        assert_eq!(
-            tick_result.new_state.white_next_file_chronoindex_to_check,
-            0
-        );
-        assert_eq!(
-            tick_result.new_state.black_next_file_chronoindex_to_check,
-            0
-        );
-    }
-
-    #[test]
-    fn valid_white_opening_move_is_applied() {
-        let (memo_dir, chrono_dir, log_dir) = make_fresh_test_directories("white_opening");
-        let config = build_test_tick_config(&memo_dir, &chrono_dir, &log_dir);
-        let initial_state = create_initial_dungeon_master_state(config);
-
-        write_memo_file(&memo_dir, "00001.toml", "alice", "e4", 1_700_000_100);
-
-        let current_unix_timestamp: u64 = 1_700_000_200;
-        let tick_result = run_one_dungeon_master_tick(&initial_state, current_unix_timestamp);
-
-        assert_eq!(tick_result.outcome, TickOutcome::MoveApplied);
-        assert_eq!(tick_result.new_state.board.side_to_move, PieceColor::Black);
-        assert_eq!(
-            tick_result.new_state.board.game_status,
-            GameStatus::StillPlaying
-        );
-        // e4 means the pawn is now on e4 (index 28) and e2 (index 12) is empty.
-        assert!(
-            tick_result.new_state.board.board_squares[12].is_none(),
-            "e2 should be empty"
-        );
-        match tick_result.new_state.board.board_squares[28] {
-            Some(piece) => {
-                assert_eq!(piece.piece_color, PieceColor::White);
-                assert_eq!(piece.piece_kind, PieceKind::Pawn);
+        // 4. Handle the tick outcome.
+        match tick_result.outcome {
+            TickOutcome::NoChange
+            | TickOutcome::MoveApplied
+            | TickOutcome::PlayerResigned
+            | TickOutcome::TimeFlagged => {
+                // Normal outcomes: accept the new state.
+                current_state = tick_result.new_state;
             }
-            None => panic!("e4 should hold a white pawn"),
+            TickOutcome::ChronoSequenceReordered => {
+                // Recovery: discard the current state and start over
+                // from the initial state. The next iteration's tick
+                // will read chrono position 0 and replay forward.
+                // Keep the original config (it is unchanged by gameplay).
+                current_state = create_initial_dungeon_master_state(current_state.config);
+            }
+            TickOutcome::ChronoIndexUnreadable => {
+                // Defensive: the chrono-index could not be read this
+                // tick. Keep the existing state (tick_result.new_state
+                // is the unchanged input state in this case). Retry
+                // next tick.
+                current_state = tick_result.new_state;
+            }
         }
-        assert_eq!(
-            tick_result.new_state.white_next_file_chronoindex_to_check,
-            1
-        );
-    }
 
-    #[test]
-    fn file_owned_by_off_turn_player_is_ignored() {
-        let (memo_dir, chrono_dir, log_dir) = make_fresh_test_directories("off_turn");
-        let config = build_test_tick_config(&memo_dir, &chrono_dir, &log_dir);
-        let initial_state = create_initial_dungeon_master_state(config);
+        // 5. Write the state to terminal + log.
+        write_one_full_frame_to_terminal_and_log(&current_state, current_unix_timestamp_seconds);
 
-        // It is White's turn at the start. Write a file from Black.
-        write_memo_file(&memo_dir, "00001.toml", "bob", "e5", 1_700_000_100);
-
-        let current_unix_timestamp: u64 = 1_700_000_200;
-        let tick_result = run_one_dungeon_master_tick(&initial_state, current_unix_timestamp);
-
-        assert_eq!(tick_result.outcome, TickOutcome::NoChange);
-        assert_eq!(tick_result.new_state.board.side_to_move, PieceColor::White);
-        // White's cursor advanced past the file because we examined it
-        // and found it was not White's file. The forward-progress rule
-        // ensures the cursor moves.
-        assert_eq!(
-            tick_result.new_state.white_next_file_chronoindex_to_check,
-            1
-        );
-        // Black's cursor stayed at 0 because we are not scanning for Black.
-        assert_eq!(
-            tick_result.new_state.black_next_file_chronoindex_to_check,
-            0
-        );
-    }
-
-    #[test]
-    fn illegal_move_advances_cursor_without_applying() {
-        let (memo_dir, chrono_dir, log_dir) = make_fresh_test_directories("illegal_move");
-        let config = build_test_tick_config(&memo_dir, &chrono_dir, &log_dir);
-        let initial_state = create_initial_dungeon_master_state(config);
-
-        // Write a move that parses syntactically but is illegal in the
-        // starting position: "e5" cannot be played by White on move 1
-        // (the e-pawn cannot move two squares forward to e5, only to e4).
-        write_memo_file(&memo_dir, "00001.toml", "alice", "e5", 1_700_000_100);
-
-        let current_unix_timestamp: u64 = 1_700_000_200;
-        let tick_result = run_one_dungeon_master_tick(&initial_state, current_unix_timestamp);
-
-        assert_eq!(tick_result.outcome, TickOutcome::NoChange);
-        assert_eq!(tick_result.new_state.board.side_to_move, PieceColor::White);
-        // Cursor still advances past the bad file (forward-progress rule).
-        assert_eq!(
-            tick_result.new_state.white_next_file_chronoindex_to_check,
-            1
-        );
-        // No time charged.
-        assert_eq!(
-            tick_result
-                .new_state
-                .game_time_state
-                .white_cumulative_seconds,
-            0
-        );
-    }
-
-    #[test]
-    fn resignation_ends_the_game() {
-        let (memo_dir, chrono_dir, log_dir) = make_fresh_test_directories("resignation");
-        let config = build_test_tick_config(&memo_dir, &chrono_dir, &log_dir);
-        let initial_state = create_initial_dungeon_master_state(config);
-
-        // White (whose turn it is at the start) resigns immediately.
-        write_memo_file(&memo_dir, "00001.toml", "alice", "resign", 1_700_000_100);
-
-        let current_unix_timestamp: u64 = 1_700_000_200;
-        let tick_result = run_one_dungeon_master_tick(&initial_state, current_unix_timestamp);
-
-        assert_eq!(tick_result.outcome, TickOutcome::PlayerResigned);
-        assert_eq!(
-            tick_result.new_state.board.game_status,
-            GameStatus::WhiteResigned,
-        );
-        assert_eq!(
-            tick_result.new_state.white_next_file_chronoindex_to_check,
-            1
-        );
+        // 6. End-of-game check. If the board reports anything other
+        //    than StillPlaying, the game is over. The final state has
+        //    just been rendered in step 5, so the user has seen it.
+        if current_state.board.game_status != GameStatus::StillPlaying {
+            return current_state;
+        }
     }
 }
