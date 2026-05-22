@@ -1,0 +1,1676 @@
+
+// /// Run the bootstrap Q&A loop, returning the assembled
+// /// `MemochessGameConfig` once all required values have been collected
+// /// from memo files in `game_files_directory_path`.
+// ///
+// /// ## Project Context
+// ///
+// /// This is the entry point for the bootstrap phase of memo_chess.
+// /// It is called once per process startup and runs until either the
+// /// configuration is complete (returns `Ok(MemochessGameConfig)`) or
+// /// a root input failed validation (returns `Err(...)`).
+// ///
+// /// The function does not return spuriously: every iteration is
+// /// driven by either the chrono-index reporting new files or the
+// /// 10-second refresh cycle elapsing. The user terminates the
+// /// bootstrap by closing the terminal.
+// ///
+// /// ## Arguments
+// ///
+// /// - `game_files_directory_path`: absolute path to the directory
+// ///   containing memo TOML files. Files are read in chronological
+// ///   order via the chrono-index. The directory may be empty at
+// ///   startup; the bootstrap will wait for memos to appear.
+// /// - `local_user_name_bytes`: name of the user running this TUI
+// ///   instance. Carried through into the returned
+// ///   `MemochessGameConfig`. May or may not match either player name.
+// /// - `chrono_sort_temp_directory_path`: working directory for the
+// ///   chrono-index. Must NOT be inside `game_files_directory_path`.
+// /// - `memochess_logging_directory_path`: directory in which the
+// ///   per-run error log file is appended. Created on demand if
+// ///   absent.
+// ///
+// /// ## Returns
+// ///
+// /// - `Ok(MemochessGameConfig)`: success, ready to hand to the game
+// ///   loop.
+// /// - `Err(MemochessBootstrapError::*)`: a root input failed
+// ///   validation; see variant docs.
+// ///
+// /// ## Memory & Panic Policy
+// ///
+// /// No panics. Heap touches: one `PartialBootstrapConfig` on the
+// /// stack; one `[u8; MAX_FULL_PATH_LEN]` per-position stack buffer
+// /// inside Section 58; one bounded `PathBuf::join` per skip-event
+// /// log append. None of these scale with directory size or with
+// /// loop-iteration count.
+// pub fn q_and_a_setup_bootstrap(
+//     game_files_directory_path: &Path,
+//     local_user_name_bytes: &[u8],
+//     chrono_sort_temp_directory_path: &Path,
+//     memochess_logging_directory_path: &Path,
+// ) -> Result<MemochessGameConfig, MemochessBootstrapError> {
+//     // ----- Root input validation -----
+//     validate_bootstrap_root_inputs(
+//         game_files_directory_path,
+//         local_user_name_bytes,
+//         chrono_sort_temp_directory_path,
+//         memochess_logging_directory_path,
+//     )?;
+
+//     // ----- One-time setup -----
+//     ensure_logging_directory_exists_best_effort(memochess_logging_directory_path);
+//     let bootstrap_run_unix_timestamp = read_current_unix_timestamp_seconds_best_effort();
+
+//     // The accumulator carried across iterations.
+//     let mut partial_config = PartialBootstrapConfig::new_empty_partial_bootstrap_config();
+
+//     // Resolve the game directory's path bytes once; needed by
+//     // build_memochess_config_if_complete on each finalization attempt.
+//     // We already validated UTF-8 above; unwrap-equivalent via match
+//     // with defensive fallback.
+//     let game_dir_path_str = match game_files_directory_path.to_str() {
+//         Some(string_value) => string_value,
+//         None => return Err(MemochessBootstrapError::GameFilesDirectoryPathInvalid),
+//     };
+//     let game_dir_path_bytes = game_dir_path_str.as_bytes();
+
+//     // ----- Main loop -----
+//     loop {
+//         // Step 1: attempt finalization if all required fields are set.
+//         if partial_config.all_required_fields_are_set() {
+//             let finalization_attempt = build_memochess_config_if_complete(
+//                 &partial_config,
+//                 game_dir_path_bytes,
+//                 local_user_name_bytes,
+//             );
+//             if let Some(finalized_config) = finalization_attempt {
+//                 return Ok(finalized_config);
+//             }
+//             // All fields set but constructor rejected the values.
+//             // Fall through to prompt rendering and another scan pass.
+//         }
+
+//         // Step 2: render the prompt for the first missing field, or
+//         // the configuration-rejected prompt if all fields are set
+//         // but finalization failed.
+//         render_first_missing_field_prompt(&partial_config);
+
+//         // Step 3: run one directory-scan pass.
+//         run_one_bootstrap_scan_pass(
+//             game_files_directory_path,
+//             chrono_sort_temp_directory_path,
+//             memochess_logging_directory_path,
+//             bootstrap_run_unix_timestamp,
+//             &mut partial_config,
+//         );
+
+//         // Step 4: sleep before the next iteration.
+//         // `sleep` does not return a Result; nothing to handle.
+//         sleep(Duration::from_secs(BOOTSTRAP_REFRESH_INTERVAL_SECONDS));
+//     }
+// }
+
+
+// /// All possible failure modes when constructing or validating a
+// /// `MemochessGameConfig`.
+// ///
+// /// ## Design Note
+// ///
+// /// Like `MoveValidationError`, every variant is a unit variant. The enum
+// /// carries no data so that error values produced here cannot leak user
+// /// input, file paths, or other diagnostic content into production logs.
+// /// Callers that want to log a failure use `{:?}` formatting on the variant
+// /// at the layer where logging policy lives — not inside this module.
+// #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+// pub enum MemochessGameConfigError {
+//     /// The supplied directory-path byte slice was longer than
+//     /// `MAX_DIRECTORY_PATH_BYTES`.
+//     DirectoryPathTooLong,
+//     /// The supplied directory-path byte slice was empty.
+//     DirectoryPathEmpty,
+//     /// The supplied local-user-name byte slice was longer than
+//     /// `MAX_USERNAME_BYTES`.
+//     LocalUserNameTooLong,
+//     /// The supplied local-user-name byte slice was empty.
+//     LocalUserNameEmpty,
+//     /// The supplied white-player-name byte slice was longer than
+//     /// `MAX_USERNAME_BYTES`.
+//     WhitePlayerNameTooLong,
+//     /// The supplied white-player-name byte slice was empty.
+//     WhitePlayerNameEmpty,
+//     /// The supplied black-player-name byte slice was longer than
+//     /// `MAX_USERNAME_BYTES`.
+//     BlackPlayerNameTooLong,
+//     /// The supplied black-player-name byte slice was empty.
+//     BlackPlayerNameEmpty,
+//     /// The supplied per-player time limit was below
+//     /// `MIN_TIME_LIMIT_PER_PLAYER_SECONDS`.
+//     TimeLimitPerPlayerBelowMinimum,
+//     /// The supplied refresh rate was outside the closed interval
+//     /// [`MIN_REFRESH_RATE_SECONDS`, `MAX_REFRESH_RATE_SECONDS`].
+//     RefreshRateOutOfRange,
+//     /// The supplied N-move-rule value (when `Some`) was outside the
+//     /// closed interval [`MIN_N_MOVE_RULE_VALUE`, `MAX_N_MOVE_RULE_VALUE`].
+//     NMoveRuleOutOfRange,
+//     /// The supplied white and black player names were byte-identical.
+//     /// A game cannot be played with a single player on both sides via
+//     /// this configuration mechanism.
+//     WhiteAndBlackPlayerNamesIdentical,
+// }
+
+// /// Configuration for one memo_chess game.
+// ///
+// /// ## Project Context
+// ///
+// /// This struct is the contract between the bootstrap layer
+// /// (`q_and_a_setup_bootstrap`, to be implemented) and the game-loop layer
+// /// (`DungeonMasterState`, to be implemented). The bootstrap layer
+// /// constructs and returns a fully-validated `MemochessGameConfig`; the
+// /// game-loop layer consumes it as input and never modifies it.
+// ///
+// /// Two of these values cannot be supplied via the TOML memo files
+// /// themselves because they bootstrap the TOML-reading process:
+// ///
+// /// - `directory_path` — where the memo files live.
+// /// - `local_user_name` — the identity of the user running this TUI
+// ///   instance (which may or may not be one of the players; spectators
+// ///   are supported).
+// ///
+// /// All other fields are sourced from TOML memo files written by users
+// /// during bootstrap and parsed by `q_and_a_setup_bootstrap`.
+// ///
+// /// ## Storage Strategy
+// ///
+// /// All strings are stored as fixed-size byte arrays paired with a
+// /// `u8` length field (since both `MAX_DIRECTORY_PATH_BYTES` ≤ 256 and
+// /// `MAX_USERNAME_BYTES` ≤ 16 fit in a `u8`-representable length, and
+// /// we use `u16` for the directory length to leave headroom).
+// ///
+// /// This pattern is consistent with the no-heap policy of the project.
+// /// `MemochessGameConfig` is `Copy`, so it can be passed by value to any
+// /// consumer without heap touches.
+// ///
+// /// ## Bytes vs. UTF-8
+// ///
+// /// Path and name bytes are stored as raw `u8` and are NOT validated as
+// /// UTF-8 at construction time. This is deliberate: filesystem paths are
+// /// byte strings on POSIX, and player names appear in user-controlled
+// /// TOML files. Layers that need to display these as text are responsible
+// /// for their own UTF-8 validation at the display boundary.
+// ///
+// /// ## Threefold-Repetition Fields
+// ///
+// /// The threefold-repetition rule fields are intentionally omitted from
+// /// MVP-1 (see the kept-but-commented lines in the struct body below).
+// /// The discussion in the project notes establishes that hash-based
+// /// threefold repetition is feasible but is deferred to a later
+// /// milestone. The commented lines remain as documentation of the future
+// /// shape; they are not active code.
+// #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+// pub struct MemochessGameConfig {
+//     /// Absolute path to the directory holding memo TOML files for this
+//     /// game. Bytes occupy `directory_path_buffer[..directory_path_length]`.
+//     pub directory_path_buffer: [u8; MAX_DIRECTORY_PATH_BYTES],
+//     /// Number of meaningful bytes in `directory_path_buffer`.
+//     /// In range `1..=MAX_DIRECTORY_PATH_BYTES`.
+//     pub directory_path_length: u16,
+
+//     /// Name of the user running this TUI instance.
+//     /// Bytes occupy `local_user_name_buffer[..local_user_name_length]`.
+//     pub local_user_name_buffer: [u8; MAX_USERNAME_BYTES],
+//     /// Number of meaningful bytes in `local_user_name_buffer`.
+//     /// In range `1..=MAX_USERNAME_BYTES`.
+//     pub local_user_name_length: u8,
+
+//     /// Name of the player playing White.
+//     pub white_player_name_buffer: [u8; MAX_USERNAME_BYTES],
+//     /// Number of meaningful bytes in `white_player_name_buffer`.
+//     pub white_player_name_length: u8,
+
+//     /// Name of the player playing Black.
+//     pub black_player_name_buffer: [u8; MAX_USERNAME_BYTES],
+//     /// Number of meaningful bytes in `black_player_name_buffer`.
+//     pub black_player_name_length: u8,
+
+//     /// Per-player thinking-time budget in seconds. When either player's
+//     /// cumulative thinking time reaches this value, that player flags.
+//     pub max_time_limit_per_player_seconds: u32,
+
+//     /// Refresh cadence of the game loop, in seconds. The loop wakes,
+//     /// scans for new files, updates state, and renders once per
+//     /// `refresh_rate_seconds`.
+//     pub refresh_rate_seconds: u8,
+
+//     /// Optional automatic-draw rule: if `Some(n)`, the game is drawn
+//     /// after `n` consecutive half-moves with no pawn move and no
+//     /// capture. `None` disables the rule. Common settings are 50 or 75.
+//     pub n_move_rule: u16,
+//     // -------------------------------------------------------------------
+//     // MVP-1: threefold-repetition is intentionally out of scope.
+//     // The shape below documents the future fields without enabling them.
+//     //
+//     // /// If true, the game enforces a soft threefold-repetition rule
+//     // /// (game is drawn when a position recurs three times). Implementation
+//     // /// will require hashed position history.
+//     // pub three_time_rep_rule: bool,
+//     //
+//     // /// If true, the game enforces a hard threefold-repetition rule
+//     // /// (automatic draw on detection, no negotiation). Implementation
+//     // /// will require hashed position history.
+//     // pub hard_3time_rep_rule: bool,
+//     // -------------------------------------------------------------------
+// }
+
+    // /// Construct a `MemochessGameConfig` from validated inputs.
+    // ///
+    // /// ## Project Context
+    // ///
+    // /// Called by `q_and_a_setup_bootstrap` once all required configuration
+    // /// values have been collected. May also be called by a test or by
+    // /// `main.rs` of a stand-alone demo with hard-coded values.
+    // ///
+    // /// All inputs are validated; any failure produces a unit-variant
+    // /// `MemochessGameConfigError`. On success, the returned struct is
+    // /// guaranteed to satisfy the invariants documented on each field.
+    // ///
+    // /// ## Arguments
+    // ///
+    // /// - `directory_path_bytes`: absolute path bytes. Must be non-empty
+    // ///   and no longer than `MAX_DIRECTORY_PATH_BYTES`.
+    // /// - `local_user_name_bytes`: local user name. Must be non-empty
+    // ///   and no longer than `MAX_USERNAME_BYTES`.
+    // /// - `white_player_name_bytes`: White player name. Must be non-empty
+    // ///   and no longer than `MAX_USERNAME_BYTES`.
+    // /// - `black_player_name_bytes`: Black player name. Must be non-empty,
+    // ///   no longer than `MAX_USERNAME_BYTES`, and not byte-equal to
+    // ///   the white name.
+    // /// - `max_time_limit_per_player_seconds`: per-player time budget.
+    // ///   Must be at least `MIN_TIME_LIMIT_PER_PLAYER_SECONDS`.
+    // /// - `refresh_rate_seconds`: game-loop tick interval. Must lie in
+    // ///   `[MIN_REFRESH_RATE_SECONDS, MAX_REFRESH_RATE_SECONDS]`.
+    // /// - `n_move_rule`: optional N-move rule. If `Some(n)`, `n` must
+    // ///   lie in `[MIN_N_MOVE_RULE_VALUE, MAX_N_MOVE_RULE_VALUE]`.
+    // ///
+    // /// ## Failure Modes
+    // ///
+    // /// Returns `Err` for any individual field that fails its bound check.
+    // /// Validations are performed in field order; only the first
+    // /// detected failure is reported.
+    // ///
+    // /// ## Memory & Panic Policy
+    // ///
+    // /// No heap. No panics. All buffer writes are bounds-checked
+    // /// by `copy_bytes_into_fixed_buffer`.
+    // pub fn try_construct_memochess_game_config(
+    //     directory_path_bytes: &[u8],
+    //     local_user_name_bytes: &[u8],
+    //     white_player_name_bytes: &[u8],
+    //     black_player_name_bytes: &[u8],
+    //     max_time_limit_per_player_seconds: u32,
+    //     refresh_rate_seconds: u8,
+    //     n_move_rule: u16,
+    // ) -> Result<MemochessGameConfig, MemochessGameConfigError> {
+    //     // ── Directory path ────────────────────────────────────────────
+    //     if directory_path_bytes.is_empty() {
+    //         return Err(MemochessGameConfigError::DirectoryPathEmpty);
+    //     }
+    //     if directory_path_bytes.len() > MAX_DIRECTORY_PATH_BYTES {
+    //         return Err(MemochessGameConfigError::DirectoryPathTooLong);
+    //     }
+
+    //     // ── Local user name ───────────────────────────────────────────
+    //     if local_user_name_bytes.is_empty() {
+    //         return Err(MemochessGameConfigError::LocalUserNameEmpty);
+    //     }
+    //     if local_user_name_bytes.len() > MAX_USERNAME_BYTES {
+    //         return Err(MemochessGameConfigError::LocalUserNameTooLong);
+    //     }
+
+    //     // ── White player name ─────────────────────────────────────────
+    //     if white_player_name_bytes.is_empty() {
+    //         return Err(MemochessGameConfigError::WhitePlayerNameEmpty);
+    //     }
+    //     if white_player_name_bytes.len() > MAX_USERNAME_BYTES {
+    //         return Err(MemochessGameConfigError::WhitePlayerNameTooLong);
+    //     }
+
+    //     // ── Black player name ─────────────────────────────────────────
+    //     if black_player_name_bytes.is_empty() {
+    //         return Err(MemochessGameConfigError::BlackPlayerNameEmpty);
+    //     }
+    //     if black_player_name_bytes.len() > MAX_USERNAME_BYTES {
+    //         return Err(MemochessGameConfigError::BlackPlayerNameTooLong);
+    //     }
+
+    //     // ── Distinct white and black names ────────────────────────────
+    //     if white_player_name_bytes == black_player_name_bytes {
+    //         return Err(MemochessGameConfigError::WhiteAndBlackPlayerNamesIdentical);
+    //     }
+
+    //     // ── Time limit ────────────────────────────────────────────────
+    //     if max_time_limit_per_player_seconds < MIN_TIME_LIMIT_PER_PLAYER_SECONDS {
+    //         return Err(MemochessGameConfigError::TimeLimitPerPlayerBelowMinimum);
+    //     }
+
+    //     // ── Refresh rate ──────────────────────────────────────────────
+    //     if refresh_rate_seconds < MIN_REFRESH_RATE_SECONDS
+    //         || refresh_rate_seconds > MAX_REFRESH_RATE_SECONDS
+    //     {
+    //         return Err(MemochessGameConfigError::RefreshRateOutOfRange);
+    //     }
+
+    //     // ── N-move rule ───────────────────────────────────────────────
+    //     if n_move_rule < MIN_N_MOVE_RULE_VALUE || n_move_rule > MAX_N_MOVE_RULE_VALUE {
+    //         return Err(MemochessGameConfigError::NMoveRuleOutOfRange);
+    //     }
+
+    //     // ── All checks passed; populate fixed-size buffers ────────────
+    //     let mut directory_path_buffer = [0u8; MAX_DIRECTORY_PATH_BYTES];
+    //     let directory_path_length =
+    //         copy_bytes_into_fixed_buffer(directory_path_bytes, &mut directory_path_buffer)?;
+
+    //     let mut local_user_name_buffer = [0u8; MAX_USERNAME_BYTES];
+    //     let local_user_name_length =
+    //         copy_bytes_into_fixed_buffer(local_user_name_bytes, &mut local_user_name_buffer)?;
+
+    //     let mut white_player_name_buffer = [0u8; MAX_USERNAME_BYTES];
+    //     let white_player_name_length =
+    //         copy_bytes_into_fixed_buffer(white_player_name_bytes, &mut white_player_name_buffer)?;
+
+    //     let mut black_player_name_buffer = [0u8; MAX_USERNAME_BYTES];
+    //     let black_player_name_length =
+    //         copy_bytes_into_fixed_buffer(black_player_name_bytes, &mut black_player_name_buffer)?;
+
+    //     // Defensive narrowing: the length checks above guarantee these
+    //     // fit in their target types, but we re-check via debug_assert
+    //     // and prod-safe handling to make the narrowing explicit.
+    //     let directory_path_length_u16: u16 = if directory_path_length <= MAX_DIRECTORY_PATH_BYTES {
+    //         directory_path_length as u16
+    //     } else {
+    //         // Unreachable in practice: bounds were checked above.
+    //         return Err(MemochessGameConfigError::DirectoryPathTooLong);
+    //     };
+
+    //     let local_user_name_length_u8: u8 = if local_user_name_length <= MAX_USERNAME_BYTES {
+    //         local_user_name_length as u8
+    //     } else {
+    //         return Err(MemochessGameConfigError::LocalUserNameTooLong);
+    //     };
+
+    //     let white_player_name_length_u8: u8 = if white_player_name_length <= MAX_USERNAME_BYTES {
+    //         white_player_name_length as u8
+    //     } else {
+    //         return Err(MemochessGameConfigError::WhitePlayerNameTooLong);
+    //     };
+
+    //     let black_player_name_length_u8: u8 = if black_player_name_length <= MAX_USERNAME_BYTES {
+    //         black_player_name_length as u8
+    //     } else {
+    //         return Err(MemochessGameConfigError::BlackPlayerNameTooLong);
+    //     };
+
+    //     Ok(MemochessGameConfig {
+    //         directory_path_buffer,
+    //         directory_path_length: directory_path_length_u16,
+    //         local_user_name_buffer,
+    //         local_user_name_length: local_user_name_length_u8,
+    //         white_player_name_buffer,
+    //         white_player_name_length: white_player_name_length_u8,
+    //         black_player_name_buffer,
+    //         black_player_name_length: black_player_name_length_u8,
+    //         max_time_limit_per_player_seconds,
+    //         refresh_rate_seconds,
+    //         n_move_rule,
+    //     })
+    // }
+
+    // /// Borrow the local-user-name bytes as a slice.
+    // pub fn local_user_name_as_bytes(&self) -> &[u8] {
+    //     let length_as_usize = self.local_user_name_length as usize;
+    //     let safe_length = if length_as_usize > MAX_USERNAME_BYTES {
+    //         MAX_USERNAME_BYTES
+    //     } else {
+    //         length_as_usize
+    //     };
+    //     &self.local_user_name_buffer[..safe_length]
+    // }
+
+    // /// Borrow the white-player-name bytes as a slice.
+    // pub fn white_player_name_as_bytes(&self) -> &[u8] {
+    //     let length_as_usize = self.white_player_name_length as usize;
+    //     let safe_length = if length_as_usize > MAX_USERNAME_BYTES {
+    //         MAX_USERNAME_BYTES
+    //     } else {
+    //         length_as_usize
+    //     };
+    //     &self.white_player_name_buffer[..safe_length]
+    // }
+
+    // /// Borrow the black-player-name bytes as a slice.
+    // pub fn black_player_name_as_bytes(&self) -> &[u8] {
+    //     let length_as_usize = self.black_player_name_length as usize;
+    //     let safe_length = if length_as_usize > MAX_USERNAME_BYTES {
+    //         MAX_USERNAME_BYTES
+    //     } else {
+    //         length_as_usize
+    //     };
+    //     &self.black_player_name_buffer[..safe_length]
+    // }
+
+
+// /// Parse an `n_move_rule` value into the form stored on `MemochessGameConfig`.
+// ///
+// /// ## Accepted Input
+// ///
+// /// - Exactly the three bytes `b"off"` (case-sensitive — the config-line
+// ///   parser does not lowercase). Produces `Some(None)`.
+// /// - An ASCII-decimal integer that fits in `u16`. Produces
+// ///   `Some(Some(value))`. The returned value is NOT range-checked
+// ///   against `MIN_N_MOVE_RULE_VALUE`/`MAX_N_MOVE_RULE_VALUE` here; that
+// ///   check belongs to `try_construct_memochess_game_config`. This
+// ///   parser's job is shape-validity only.
+// ///
+// /// ## Returns
+// ///
+// /// - `Some(None)`: the rule is explicitly disabled.
+// /// - `Some(Some(n))`: the rule is set to `n` half-moves.
+// /// - `None`: input was neither `b"off"` nor a well-formed `u16` decimal.
+// ///
+// /// ## Memory & Panic Policy
+// ///
+// /// No heap. No panics. Bounded loop.
+// pub fn parse_n_move_rule_value(value_bytes: &[u8]) -> Option<Option<u16>> {
+//     // Literal "off" branch.
+//     if value_bytes == b"off" {
+//         return Some(None);
+//     }
+
+//     // Decimal-integer branch. Inline rather than calling a u16 variant
+//     // (none exists yet) and to keep the overflow check explicit.
+//     if value_bytes.is_empty() {
+//         return None;
+//     }
+
+//     let mut accumulator: u16 = 0;
+//     let mut byte_index: usize = 0;
+//     while byte_index < value_bytes.len() {
+//         let current_byte = value_bytes[byte_index];
+//         if current_byte < b'0' || current_byte > b'9' {
+//             return None;
+//         }
+//         let digit_value: u16 = (current_byte - b'0') as u16;
+
+//         let multiplied = match accumulator.checked_mul(10) {
+//             Some(value) => value,
+//             None => return None,
+//         };
+//         let added = match multiplied.checked_add(digit_value) {
+//             Some(value) => value,
+//             None => return None,
+//         };
+//         accumulator = added;
+
+//         byte_index += 1;
+//     }
+
+//     Some(Some(accumulator))
+// }
+
+
+// ============================================================================
+// SECTION 53: Bootstrap Finalization — build_memochess_config_if_complete
+// ============================================================================
+//
+// ## Project Context
+//
+// Each iteration of the bootstrap loop calls this function after
+// updating the `PartialBootstrapConfig` with the latest scan results.
+// If all required fields are present and the final validation in
+// `try_construct_memochess_game_config` succeeds, the bootstrap exits
+// with the returned `MemochessGameConfig`. Otherwise, the loop sleeps
+// and scans again on the next refresh cycle.
+//
+// ## Why `Option` rather than `Result`
+//
+// At this layer there are exactly two outcomes the caller acts on:
+//
+//   - "config is finished" (return it and exit the loop), or
+//   - "config is not finished" (sleep and try again).
+//
+// "Not finished" subsumes both "a required field is missing" and "a
+// field has a value but final validation rejected it" — in either
+// case the bootstrap behavior is identical: keep looping, keep
+// prompting the user. There is no third action the caller would take
+// based on a structured error. `Option<MemochessGameConfig>` matches
+// that decision shape exactly.
+//
+// If diagnostic information about *which* field is missing or invalid
+// becomes useful (e.g., for a future debug build), that can be added
+// as a separate function without changing this one.
+
+// /// Attempt to finalize a `PartialBootstrapConfig` into a fully-validated
+// /// `MemochessGameConfig`.
+// ///
+// /// ## Arguments
+// ///
+// /// - `partial_config`: the accumulator built up by the bootstrap loop.
+// /// - `directory_path_bytes`: the absolute directory path supplied to
+// ///   `q_and_a_setup_bootstrap` (not collected via memo files).
+// /// - `local_user_name_bytes`: the local user name supplied to
+// ///   `q_and_a_setup_bootstrap` (not collected via memo files).
+// ///
+// /// ## Returns
+// ///
+// /// - `Some(MemochessGameConfig)`: all required partial fields are
+// ///   present, the minutes-to-seconds conversion did not overflow, and
+// ///   `try_construct_memochess_game_config` accepted every value.
+// /// - `None`: any of the above failed. The bootstrap loop continues.
+// ///
+// /// ## Finalization Steps
+// ///
+// /// 1. Read all four required `Option` fields from `partial_config`. If
+// ///    any is `None`, return `None`.
+// /// 2. Convert `player_time_minutes` to seconds via
+// ///    `convert_minutes_to_seconds_checked`. On overflow, return `None`.
+// /// 3. Extract the meaningful prefix of each name buffer.
+// /// 4. Call `try_construct_memochess_game_config` with all values.
+// ///    On any `Err(...)`, return `None`.
+// ///
+// /// ## Memory & Panic Policy
+// ///
+// /// No heap. No panics. The two `match` arms on `Result` from the
+// /// constructor discard the error variant deliberately: at this layer,
+// /// "rejected by constructor" is indistinguishable from "user has not
+// /// yet supplied a valid value" — both produce `None`.
+// pub fn build_memochess_config_if_complete(
+//     partial_config: &PartialBootstrapConfig,
+//     directory_path_bytes: &[u8],
+//     local_user_name_bytes: &[u8],
+// ) -> Option<MemochessGameConfig> {
+//     // ── Step 1: required fields must all be populated ───────────────
+//     let (white_name_buffer, white_name_length) = match partial_config.white_player_name {
+//         Some(pair) => pair,
+//         None => return None,
+//     };
+//     let (black_name_buffer, black_name_length) = match partial_config.black_player_name {
+//         Some(pair) => pair,
+//         None => return None,
+//     };
+//     let player_time_minutes = match partial_config.player_time_minutes {
+//         Some(value) => value,
+//         None => return None,
+//     };
+//     let refresh_rate_seconds = match partial_config.refresh_rate_seconds {
+//         Some(value) => value,
+//         None => return None,
+//     };
+
+//     // ── Step 2: minutes → seconds, with overflow check ──────────────
+//     let max_time_limit_per_player_seconds =
+//         match convert_minutes_to_seconds_checked(player_time_minutes) {
+//             Some(seconds_value) => seconds_value,
+//             None => return None,
+//         };
+
+//     // ── Step 3: take meaningful name slices ─────────────────────────
+//     let white_name_length_as_usize = white_name_length as usize;
+//     let black_name_length_as_usize = black_name_length as usize;
+
+//     // Defensive clamp: lengths cannot exceed MAX_USERNAME_BYTES via the
+//     // public API of `PartialBootstrapConfig`, but a clamp here keeps the
+//     // slice operation panic-free under any conceivable corruption.
+//     let safe_white_length = if white_name_length_as_usize > MAX_USERNAME_BYTES {
+//         MAX_USERNAME_BYTES
+//     } else {
+//         white_name_length_as_usize
+//     };
+//     let safe_black_length = if black_name_length_as_usize > MAX_USERNAME_BYTES {
+//         MAX_USERNAME_BYTES
+//     } else {
+//         black_name_length_as_usize
+//     };
+
+//     let white_name_bytes = &white_name_buffer[..safe_white_length];
+//     let black_name_bytes = &black_name_buffer[..safe_black_length];
+
+//     // ── Step 4: hand off to the constructor for final validation ────
+//     let construction_result = MemochessGameConfig::try_construct_memochess_game_config(
+//         directory_path_bytes,
+//         local_user_name_bytes,
+//         white_name_bytes,
+//         black_name_bytes,
+//         max_time_limit_per_player_seconds,
+//         refresh_rate_seconds,
+//         partial_config.n_move_rule.unwrap_or(50), // default to 50? (that would be fine)
+//     );
+
+//     match construction_result {
+//         Ok(finalized_config) => Some(finalized_config),
+//         Err(_) => None,
+//     }
+// }
+
+
+// /// Converts i64 to decimal string with sign in provided stack buffer
+// ///
+// /// Memory: should be all stack, no heap
+// fn format_i64_to_buffer<'a>(value: i64, buf: &'a mut [u8]) -> Option<&'a str> {
+//     if buf.is_empty() {
+//         return None;
+//     }
+
+//     if value == 0 {
+//         buf[0] = b'0';
+//         return std::str::from_utf8(&buf[..1]).ok();
+//     }
+
+//     let (is_negative, abs_value) = if value < 0 {
+//         (true, value.wrapping_abs() as u64)
+//     } else {
+//         (false, value as u64)
+//     };
+
+//     let mut temp = [0u8; 20];
+//     let mut pos = 0;
+//     let mut num = abs_value;
+
+//     while num > 0 {
+//         temp[pos] = b'0' + (num % 10) as u8;
+//         num /= 10;
+//         pos += 1;
+//     }
+
+//     let total_len = if is_negative { pos + 1 } else { pos };
+
+//     if total_len > buf.len() {
+//         return None;
+//     }
+
+//     let mut buf_pos = 0;
+
+//     if is_negative {
+//         buf[buf_pos] = b'-';
+//         buf_pos += 1;
+//     }
+
+//     for i in 0..pos {
+//         buf[buf_pos + i] = temp[pos - 1 - i];
+//     }
+
+//     std::str::from_utf8(&buf[..total_len]).ok()
+// }
+
+// /// Converts u8 to 2-digit uppercase hex in provided stack buffer
+// ///
+// /// Memory: should be all stack, no heap
+// fn format_u8_hex_to_buffer<'a>(value: u8, buf: &'a mut [u8]) -> Option<&'a str> {
+//     if buf.len() < 2 {
+//         return None;
+//     }
+
+//     let hex_chars = b"0123456789ABCDEF";
+//     buf[0] = hex_chars[(value >> 4) as usize];
+//     buf[1] = hex_chars[(value & 0x0F) as usize];
+
+//     std::str::from_utf8(&buf[..2]).ok()
+// }
+
+// /// Converts u16 to 4-digit uppercase hex in provided stack buffer
+// ///
+// /// Memory: should be all stack, no heap
+// fn format_u16_hex_to_buffer<'a>(value: u16, buf: &'a mut [u8]) -> Option<&'a str> {
+//     if buf.len() < 4 {
+//         return None;
+//     }
+
+//     let hex_chars = b"0123456789ABCDEF";
+//     buf[0] = hex_chars[((value >> 12) & 0x0F) as usize];
+//     buf[1] = hex_chars[((value >> 8) & 0x0F) as usize];
+//     buf[2] = hex_chars[((value >> 4) & 0x0F) as usize];
+//     buf[3] = hex_chars[(value & 0x0F) as usize];
+
+//     std::str::from_utf8(&buf[..4]).ok()
+// }
+
+// /// Converts u32 to 8-digit uppercase hex in provided stack buffer
+// ///
+// /// Memory: should be all stack, no heap
+// fn format_u32_hex_to_buffer<'a>(value: u32, buf: &'a mut [u8]) -> Option<&'a str> {
+//     if buf.len() < 8 {
+//         return None;
+//     }
+
+//     let hex_chars = b"0123456789ABCDEF";
+//     for i in 0..8 {
+//         let shift = 28 - (i * 4);
+//         buf[i] = hex_chars[((value >> shift) & 0x0F) as usize];
+//     }
+
+//     std::str::from_utf8(&buf[..8]).ok()
+// }
+
+
+// /// Writes formatted output to any writer.
+// ///
+// /// Memory: should be all stack, no heap
+// /// Same direct-write logic as buffy_print() but writes to provided writer.
+// ///
+// /// Writes formatted output to any writer (file, buffer, stream, stderr, etc.) with zero heap allocation.
+// ///
+// /// ## Project Context
+// /// Generic output function for writing formatted text to destinations other than stdout.
+// /// Used for file logging, buffer building, network streams, or stderr output while
+// /// maintaining zero heap allocation guarantee. This is the underlying mechanism that
+// /// `buffy_print()` uses internally with stdout.
+// ///
+// /// ## Memory: ZERO HEAP
+// /// All conversions use stack buffers. Output written directly to provided writer.
+// /// No String objects, no Vec allocations, no intermediate storage.
+// ///
+// /// ## Operation Flow
+// /// 1. Parse template string for {} placeholders
+// /// 2. For literal text: write directly to writer
+// /// 3. For placeholders: convert arg on stack, write result to writer
+// /// 4. Apply alignment/styling as specified
+// /// 5. Continue until template exhausted
+// ///
+// /// ## Safety & Error Handling
+// /// - No panic: Returns io::Error on write or format failure
+// /// - Bounded: Max 8 arguments (prevents stack overflow)
+// /// - Validates: All conversions checked, returns Err on failure
+// /// - Non-critical: Caller can handle error and continue
+// /// - Production-safe: No debug info leakage in error messages
+// ///
+// /// ## Parameters
+// /// - `writer`: Mutable reference to any type implementing `Write` trait
+// ///   (File, Vec<u8>, Stderr, TcpStream, BufWriter, etc.)
+// /// - `template`: Format string with {} or {:<N}/{:>N}/{:^N} placeholders
+// ///   - `{}` - default formatting
+// ///   - `{:<N}` - left-align in N characters
+// ///   - `{:>N}` - right-align in N characters
+// ///   - `{:^N}` - center-align in N characters
+// /// - `args`: Slice of BuffyFormatArg values (max 8 per call)
+// ///   - U8, U16, U32, U64, Usize - unsigned integers
+// ///   - I8, I16, I32, I64, Isize - signed integers
+// ///   - U8Hex, U16Hex, U32Hex - hexadecimal formatting
+// ///   - Str - string slices
+// ///   - Bool - true/false
+// ///   - Char - single characters
+// ///   - Path - file paths
+// ///   - Styled variants - include ANSI color codes
+// ///
+// /// ## Returns
+// /// - `Ok(())`: Successfully written to writer
+// /// - `Err(io::Error)`: Write failed, format error, or buffer too small
+// ///
+// /// ## When to Use vs `buffy_print()`
+// /// - Use `buffy_print()`: Writing to terminal/stdout (most common TUI case)
+// /// - Use `buffy_write_basic()`: Writing to files, buffers, stderr, or network streams
+// ///
+// /// ## Limitations
+// /// - Max 8 arguments per call (call multiple times if needed)
+// /// - Max 64 characters width for alignment
+// /// - Template placeholders must match arg count exactly
+// /// - Writer must have capacity for output (or return error)
+// ///
+// /// ## Examples
+// ///
+// /// ### File Logging
+// /// ```rust
+// /// use std::fs::File;
+// ///
+// /// let mut log = File::create("app.log")?;
+// /// buffy_write_basic(
+// ///     &mut log,
+// ///     "[{}] User {} logged in at {}\n",
+// ///     &[
+// ///         BuffyFormatArg::Str("INFO"),
+// ///         BuffyFormatArg::U32(1001),
+// ///         BuffyFormatArg::Str("2025-01-15"),
+// ///     ]
+// /// )?;
+// /// log.flush()?;
+// /// ```
+// ///
+// /// ### Error to Stderr
+// /// ```rust
+// /// use std::io::stderr;
+// ///
+// /// let mut err = stderr();
+// /// buffy_write_basic(
+// ///     &mut err,
+// ///     "ERROR: Failed to open file (code: {})\n",
+// ///     &[BuffyFormatArg::U32(404)]
+// /// )?;
+// /// ```
+// ///
+// /// ### Building String in Buffer
+// /// ```rust
+// /// let mut buffer = Vec::<u8>::new();
+// /// buffy_write_basic(
+// ///     &mut buffer,
+// ///     "Report: {} items processed, {} errors\n",
+// ///     &[
+// ///         BuffyFormatArg::U64(1000),
+// ///         BuffyFormatArg::U32(3),
+// ///     ]
+// /// )?;
+// /// let report = String::from_utf8(buffer)?;
+// /// ```
+// ///
+// /// ### Hex Dump to File
+// /// ```rust
+// /// let mut dump = File::create("memory.hex")?;
+// /// let bytes: [u8; 4] = [0xDE, 0xAD, 0xBE, 0xEF];
+// ///
+// /// buffy_write_basic(
+// ///     &mut dump,
+// ///     "0x{} 0x{} 0x{} 0x{}\n",
+// ///     &[
+// ///         BuffyFormatArg::U8Hex(bytes[0]),
+// ///         BuffyFormatArg::U8Hex(bytes[1]),
+// ///         BuffyFormatArg::U8Hex(bytes[2]),
+// ///         BuffyFormatArg::U8Hex(bytes[3]),
+// ///     ]
+// /// )?;
+// /// ```
+// ///
+// /// ### Styled Output to Stderr
+// /// ```rust
+// /// let mut err = stderr();
+// /// buffy_write_basic(
+// ///     &mut err,
+// ///     "{}: Operation failed\n",
+// ///     &[BuffyFormatArg::StrStyled(
+// ///         "CRITICAL",
+// ///         BuffyStyles {
+// ///             fg_color: Some("\x1b[31m"), // RED
+// ///             bold: true,
+// ///             ..Default::default()
+// ///         }
+// ///     )]
+// /// )?;
+// /// ```
+// ///
+// /// ### Aligned Table to File
+// /// ```rust
+// /// let mut table = File::create("report.txt")?;
+// ///
+// /// // Header
+// /// buffy_write_basic(
+// ///     &mut table,
+// ///     "{:<15} {:>10} {:>10}\n",
+// ///     &[
+// ///         BuffyFormatArg::Str("Item"),
+// ///         BuffyFormatArg::Str("Quantity"),
+// ///         BuffyFormatArg::Str("Price"),
+// ///     ]
+// /// )?;
+// ///
+// /// // Data row
+// /// buffy_write_basic(
+// ///     &mut table,
+// ///     "{:<15} {:>10} {:>10}\n",
+// ///     &[
+// ///         BuffyFormatArg::Str("Widget"),
+// ///         BuffyFormatArg::U32(42),
+// ///         BuffyFormatArg::U32(299),
+// ///     ]
+// /// )?;
+// /// ```
+// ///
+// /// ### Network Protocol Message
+// /// ```rust
+// /// use std::net::TcpStream;
+// ///
+// /// let mut stream = TcpStream::connect("127.0.0.1:8080")?;
+// /// buffy_write_basic(
+// ///     &mut stream,
+// ///     "MSG {} LEN {} DATA {}\r\n",
+// ///     &[
+// ///         BuffyFormatArg::U32(1001),
+// ///         BuffyFormatArg::U32(payload.len()),
+// ///         BuffyFormatArg::Str(payload),
+// ///     ]
+// /// )?;
+// /// stream.flush()?;
+// /// ```
+// ///
+// /// ## Error Handling Pattern
+// /// ```rust
+// /// match buffy_write_basic(&mut file, "Value: {}\n", &[BuffyFormatArg::U32(x)]) {
+// ///     Ok(()) => { /* continue */ },
+// ///     Err(e) => {
+// ///         // Log to stderr, don't panic production code
+// ///         let mut err = stderr();
+// ///         let _ = buffy_write_basic(
+// ///             &mut err,
+// ///             "Write failed (recovered)\n",
+// ///             &[]
+// ///         );
+// ///         // Continue with fallback behavior
+// ///     }
+// /// }
+// /// ```
+// pub fn buffy_write_basic<W: Write>(
+//     writer: &mut W,
+//     template: &str,
+//     args: &[BuffyFormatArg],
+// ) -> io::Result<()> {
+//     const MAX_ARGS: usize = 8;
+
+//     if args.len() > MAX_ARGS {
+//         return Err(io::Error::new(
+//             io::ErrorKind::InvalidInput,
+//             "Too many arguments (max 8)",
+//         ));
+//     }
+
+//     let mut arg_index = 0;
+//     let mut pos = 0;
+
+//     // Stack buffers for conversions
+//     let mut num_buf = [0u8; 20];
+//     let mut style_buf = [0u8; 64];
+//     let mut align_buf = [0u8; 128];
+
+//     while pos < template.len() {
+//         if let Some(brace_pos) = template[pos..].find('{') {
+//             let absolute_brace = pos + brace_pos;
+
+//             if brace_pos > 0 {
+//                 writer.write_all(template[pos..absolute_brace].as_bytes())?;
+//             }
+
+//             if let Some(close_pos) = template[absolute_brace..].find('}') {
+//                 let absolute_close = absolute_brace + close_pos;
+//                 let placeholder = &template[absolute_brace + 1..absolute_close];
+
+//                 let spec = match parse_format_spec(placeholder) {
+//                     Some(s) => s,
+//                     None => {
+//                         return Err(io::Error::new(
+//                             io::ErrorKind::InvalidInput,
+//                             "Invalid format specifier",
+//                         ));
+//                     }
+//                 };
+
+//                 if arg_index >= args.len() {
+//                     return Err(io::Error::new(
+//                         io::ErrorKind::InvalidInput,
+//                         "Not enough arguments for format string",
+//                     ));
+//                 }
+
+//                 // Convert argument (same logic as buffy_print)
+//                 let (value_str, has_style, style) = match &args[arg_index] {
+//                     BuffyFormatArg::Str(s) => (*s, false, BuffyStyles::default()),
+//                     // BuffyFormatArg::U8(n) => {
+//                     //     let s = format_u64_to_buffer(*n as u64, &mut num_buf).ok_or_else(|| {
+//                     //         io::Error::new(io::ErrorKind::Other, "Number conversion failed")
+//                     //     })?;
+//                     //     (s, false, BuffyStyles::default())
+//                     // }
+//                     BuffyFormatArg::U64(n) => {
+//                         let s = format_u64_to_buffer(*n, &mut num_buf).ok_or_else(|| {
+//                             io::Error::new(io::ErrorKind::Other, "Number conversion failed")
+//                         })?;
+//                         (s, false, BuffyStyles::default())
+//                     }
+//                     BuffyFormatArg::U8Hex(n) => {
+//                         let s = format_u8_hex_to_buffer(*n, &mut num_buf).ok_or_else(|| {
+//                             io::Error::new(io::ErrorKind::Other, "Hex conversion failed")
+//                         })?;
+//                         (s, false, BuffyStyles::default())
+//                     }
+//                     BuffyFormatArg::Bool(b) => (
+//                         if *b { "true" } else { "false" },
+//                         false,
+//                         BuffyStyles::default(),
+//                     ),
+//                     BuffyFormatArg::Char(c) => {
+//                         let mut char_buf = [0u8; 4];
+//                         let char_str = c.encode_utf8(&mut char_buf);
+//                         let len = char_str.len();
+//                         num_buf[..len].copy_from_slice(char_str.as_bytes());
+//                         let s = std::str::from_utf8(&num_buf[..len]).map_err(|_| {
+//                             io::Error::new(io::ErrorKind::Other, "Char conversion failed")
+//                         })?;
+//                         (s, false, BuffyStyles::default())
+//                     }
+
+//                     // Add other types as needed (same as buffy_print)
+//                     BuffyFormatArg::StrStyled(s, st) => (*s, true, *st),
+//                     BuffyFormatArg::U8HexStyled(n, st) => {
+//                         let s = format_u8_hex_to_buffer(*n, &mut num_buf).ok_or_else(|| {
+//                             io::Error::new(io::ErrorKind::Other, "Hex conversion failed")
+//                         })?;
+//                         (s, true, *st)
+//                     }
+
+//                     // Add remaining types as needed
+//                     _ => {
+//                         return Err(io::Error::new(
+//                             io::ErrorKind::Other,
+//                             "Unsupported argument type",
+//                         ));
+//                     }
+//                 };
+
+//                 if has_style {
+//                     let ansi = style_to_ansi(style, &mut style_buf).ok_or_else(|| {
+//                         io::Error::new(io::ErrorKind::Other, "BuffyStyles conversion failed")
+//                     })?;
+//                     writer.write_all(ansi.as_bytes())?;
+//                 }
+
+//                 let aligned = apply_alignment(value_str, spec, &mut align_buf)
+//                     .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "Alignment failed"))?;
+//                 writer.write_all(aligned.as_bytes())?;
+
+//                 if has_style {
+//                     writer.write_all(b"\x1b[0m")?;
+//                 }
+
+//                 arg_index += 1;
+//                 pos = absolute_close + 1;
+//             } else {
+//                 return Err(io::Error::new(
+//                     io::ErrorKind::InvalidInput,
+//                     "Unclosed brace in format string",
+//                 ));
+//             }
+//         } else {
+//             writer.write_all(template[pos..].as_bytes())?;
+//             break;
+//         }
+//     }
+
+//     Ok(())
+// }
+
+// /// Repeats a character N times, writing directly to writer.
+// ///
+// /// ## Project Context
+// /// Helper for drawing horizontal lines, borders, and padding in TUI.
+// /// Avoids String::repeat() which allocates heap.
+// ///
+// /// Memory: should be all stack, no heap
+// /// Uses 64-byte stack buffer, writes in chunks if repeat count exceeds buffer.
+// ///
+// /// ## Parameters
+// /// - writer: Output destination
+// /// - ch: Character to repeat (any UTF-8 character)
+// /// - count: Number of repetitions
+// ///
+// /// ## Returns
+// /// - Ok(()): Successfully written
+// /// - Err(io::Error): Write failed
+// ///
+// /// ## Examples
+// /// ```rust
+// /// // Horizontal line
+// /// buffy_repeat(&mut stdout, '=', 70)?;
+// /// buffy_println("", &[])?;
+// ///
+// /// // Padding
+// /// buffy_repeat(&mut stdout, ' ', 4)?;
+// /// buffy_print("Indented text", &[])?;
+// /// ```
+// pub fn buffy_repeat<W: Write>(writer: &mut W, ch: char, count: usize) -> io::Result<()> {
+//     if count == 0 {
+//         return Ok(());
+//     }
+
+//     // Encode character to UTF-8 on stack
+//     let mut char_buf = [0u8; 4];
+//     let char_str = ch.encode_utf8(&mut char_buf);
+//     let char_len = char_str.len();
+
+//     // Use 64-byte stack buffer for batching
+//     let mut buf = [0u8; 64];
+//     let chars_per_batch = buf.len() / char_len;
+
+//     if chars_per_batch == 0 {
+//         return Err(io::Error::new(
+//             io::ErrorKind::InvalidInput,
+//             "Character too large for buffer",
+//         ));
+//     }
+
+//     // Fill buffer with character pattern
+//     let mut buf_pos = 0;
+//     for _ in 0..chars_per_batch {
+//         if buf_pos + char_len <= buf.len() {
+//             buf[buf_pos..buf_pos + char_len].copy_from_slice(&char_buf[..char_len]);
+//             buf_pos += char_len;
+//         }
+//     }
+//     let batch_size = buf_pos;
+
+//     // Write full batches
+//     let full_batches = count / chars_per_batch;
+//     for _ in 0..full_batches {
+//         writer.write_all(&buf[..batch_size])?;
+//     }
+
+//     // Write remaining characters
+//     let remaining = count % chars_per_batch;
+//     for _ in 0..remaining {
+//         writer.write_all(&char_buf[..char_len])?;
+//     }
+
+//     Ok(())
+// }
+
+// /// Writes a single styled text chunk directly to writer.
+// ///
+// /// Memory: should be all stack, no heap
+// /// Writes ANSI codes (if any), text, and reset directly.
+// pub fn buffy_write_styled<W: Write>(
+//     writer: &mut W,
+//     text: &str,
+//     style: Option<BuffyStyles>,
+// ) -> io::Result<()> {
+//     if let Some(s) = style {
+//         let mut style_buf = [0u8; 64];
+//         if let Some(ansi) = style_to_ansi(s, &mut style_buf) {
+//             writer.write_all(ansi.as_bytes())?;
+//         }
+//     }
+
+//     writer.write_all(text.as_bytes())?;
+
+//     if style.is_some() {
+//         writer.write_all(b"\x1b[0m")?;
+//     }
+
+//     Ok(())
+// }
+
+    // /// Build a minimal valid `MemochessGameConfig` for use in the tests
+    // /// below. Fixed, reasonable values; not exhaustively varied because
+    // /// these tests are about the constructor's behavior, not about
+    // /// `MemochessGameConfig::try_construct_memochess_game_config`.
+    // fn build_test_config() -> MemochessGameConfig {
+    //     let directory_path_bytes: &[u8] = b"/tmp/memo_chess_test_directory";
+    //     let local_user_name_bytes: &[u8] = b"tester";
+    //     let white_player_name_bytes: &[u8] = b"alice";
+    //     let black_player_name_bytes: &[u8] = b"bob";
+    //     let max_time_limit_per_player_seconds: u32 = 600;
+    //     let refresh_rate_seconds: u8 = 10;
+    //     let n_move_rule: u16 = 50;
+
+    //     let constructed_config_result = MemochessGameConfig::try_construct_memochess_game_config(
+    //         directory_path_bytes,
+    //         local_user_name_bytes,
+    //         white_player_name_bytes,
+    //         black_player_name_bytes,
+    //         max_time_limit_per_player_seconds,
+    //         refresh_rate_seconds,
+    //         n_move_rule,
+    //     );
+
+    //     match constructed_config_result {
+    //         Ok(config_value) => config_value,
+    //         Err(_) => {
+    //             panic!(
+    //                 "test setup failure: build_test_config could not construct a valid MemochessGameConfig"
+    //             );
+    //         }
+    //     }
+    // }
+
+
+// ============================================================================
+// SECTION 61: Per-Tick Game-Loop Function (run_one_dungeon_master_tick)
+// ============================================================================
+//
+// ## Project Context
+//
+// This is the heart of the dungeon-master process. It is called once
+// per refresh cycle (every `refresh_rate_seconds`) by the outer wrapper
+// (Section 62, to be implemented). Each call:
+//
+//   1. Refreshes the chrono-index against the live game directory.
+//   2. Detects chronological-order anomalies via the chrono-sort hash.
+//   3. Performs a live time-flag check for the player on the clock.
+//   4. Scans for one new move from the player whose turn it currently
+//      is, advancing the per-player cursor past any irrelevant files.
+//   5. If a candidate file is found:
+//        a. Resolves any move against the current board.
+//        b. Applies the move (or processes the resignation command).
+//        c. Updates game_time_state per the move timestamp.
+//   6. Refreshes the chrono-sort hash for next-tick anomaly detection.
+//   7. Returns the new state plus a `TickOutcome` summarizing what
+//      happened.
+//
+// ## Forward-progress guarantee
+//
+// Every per-file condition — missing file, I/O error, non-UTF-8 path,
+// missing fields, wrong owner, unparseable text, illegal move — maps
+// to "advance the cursor past this position and try the next." No
+// per-file condition can stop the scan or cause the same position to
+// be re-examined indefinitely. The only failure mode that returns
+// without advancing is a failure of the chrono-index module itself
+// (e.g., the temp directory becomes unreadable), which the wrapper
+// retries on the next tick.
+//
+// ## What this section deliberately does NOT do
+//
+// - It does not sleep; the wrapper controls cadence.
+// - It does not render the TUI; rendering is a separate section.
+// - It does not append to the game log; logging is a separate section.
+// - It does not perform chrono-anomaly recovery; on detected reorder
+//   it returns `TickOutcome::ChronoSequenceReordered` and lets the
+//   wrapper decide.
+// - It does not handle draw-by-agreement; only resignation is
+//   recognized for MVP-1.
+// - It does not consume pre-moves out of turn; pre-moves wait in the
+//   chrono-index until it is that player's turn to move.
+// - It does not log per-file skip events; the silent-skip-and-continue
+//   policy applies for MVP-1.
+//
+// ## Immutable-return-new pattern
+//
+// Like `apply_chess_move_to_state` and the other state transitions
+// in this module, the tick function takes `&DungeonMasterState` and
+// returns a new owned `DungeonMasterState`. If anything inside the
+// tick fails, the caller's state is provably untouched by the type
+// system.
+
+/// Outcome of one tick of the dungeon-master game loop.
+///
+/// Communicates to the wrapper what happened during the tick so it
+/// can decide whether to continue looping, render an update, or
+/// trigger recovery. Unit variants only, per project no-data-in-output
+/// policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TickOutcome {
+    /// Nothing relevant changed this tick: no new move was applied,
+    /// no resignation, no flag, no chrono anomaly. The wrapper
+    /// typically just re-renders the live clock and sleeps.
+    NoChange,
+
+    /// A valid move was successfully resolved and applied to the
+    /// board. The new state's `board` and `game_time_state` reflect
+    /// the move. The wrapper should re-render the board.
+    MoveApplied,
+
+    /// A resignation memo from the player whose turn it is was
+    /// consumed. The new state's `board.game_status` is `WhiteWon`
+    /// or `BlackWon` accordingly. The wrapper should render the
+    /// final state and stop looping.
+    PlayerResigned,
+
+    /// The live time-flag check observed that the player on the
+    /// clock has exceeded their time budget. The new state's
+    /// `game_time_state.timeflagged_player` is `Some(...)` and
+    /// `board.game_status` reflects the opponent's win. The wrapper
+    /// should render the final state and stop looping.
+    TimeFlagged,
+
+    /// The chrono-sort hash check detected a retroactive reordering
+    /// of already-processed chrono positions. The new state is
+    /// unchanged from the input state; the wrapper decides how to
+    /// recover.
+    ChronoSequenceReordered,
+
+    /// The chrono-index could not be updated or read this tick due
+    /// to an I/O fault at the chrono-index module level. The new
+    /// state is unchanged from the input state; the wrapper retries
+    /// next tick.
+    ChronoIndexUnreadable,
+}
+
+/// Result of one tick of the dungeon-master game loop.
+///
+/// Returned by `run_one_dungeon_master_tick`. The struct form (rather
+/// than a tuple) makes call sites self-documenting:
+/// `tick_result.new_state` and `tick_result.outcome` are unambiguous
+/// at every use site.
+#[derive(Debug, Clone, Copy)]
+pub struct TickResult {
+    /// The new dungeon-master state after the tick. May be byte-identical
+    /// to the input state if `outcome` is `NoChange`,
+    /// `ChronoSequenceReordered`, or `ChronoIndexUnreadable`.
+    pub new_state: DungeonMasterState,
+
+    /// What happened during this tick.
+    pub outcome: TickOutcome,
+}
+
+// ----------------------------------------------------------------------------
+// Internal: per-position classification result
+// ----------------------------------------------------------------------------
+
+/// Classification of one chrono-index position during a per-player
+/// scan. Every per-file failure maps to `SkipAndContinue` so the
+/// scanner makes forward progress; the only two stop-the-scan outcomes
+/// are a successful move-candidate and a successful resignation.
+#[derive(Debug, Clone, Copy)]
+enum ScanPositionClassification {
+    /// The file at this position is irrelevant to the current scan
+    /// (any per-file failure: wrong owner, malformed content, I/O
+    /// error, non-UTF-8 path, unparseable text). The caller advances
+    /// the cursor past this position and tries the next.
+    SkipAndContinue,
+
+    /// The file at this position contains parseable move notation
+    /// owned by the target player. The scan stops; the caller will
+    /// attempt to resolve and apply the move.
+    FoundMoveCandidate {
+        parsed_notation: ParsedMoveNotation,
+        move_unix_timestamp: u64,
+    },
+
+    /// The file at this position contains a resignation command
+    /// owned by the target player. The scan stops; the caller will
+    /// end the game.
+    FoundResignationCommand { command_unix_timestamp: u64 },
+}
+
+/// Examine one chrono-index position and classify what is found.
+///
+/// Per the forward-progress guarantee, every per-file failure
+/// (lookup failure, non-UTF-8 path, read failure, missing fields,
+/// wrong owner, unparseable text, unrecognized command) maps to
+/// `SkipAndContinue`. The caller is expected to advance the cursor
+/// past any `SkipAndContinue` position before trying the next.
+///
+/// ## Arguments
+///
+/// - `chrono_temp_directory_path`: path to the chrono-index temp root.
+/// - `chrono_position`: which chrono-index position to examine.
+/// - `for_player_color`: the color whose move we are looking for.
+/// - `config`: the game configuration (provides the player names).
+///
+/// ## Memory & Panic Policy
+///
+/// No heap-growing scratch. One stack-allocated
+/// `[u8; MAX_FULL_PATH_LEN]` path buffer.
+fn classify_chrono_position_for_player(
+    chrono_temp_directory_path: &Path,
+    chrono_position: u64,
+    for_player_color: PieceColor,
+    config: &MemochessGameConfig,
+) -> ScanPositionClassification {
+    // Step 1: resolve the absolute path from the chrono-index.
+    let mut path_byte_buffer: [u8; MAX_FULL_PATH_LEN] = [0u8; MAX_FULL_PATH_LEN];
+    let lookup_result = lookup_abs_file_path_at_mtime_chronological_index(
+        chrono_temp_directory_path,
+        chrono_position,
+        &mut path_byte_buffer,
+    );
+    let path_byte_length: usize = match lookup_result {
+        Ok(Some(lookup_summary)) => lookup_summary.path_byte_length,
+        Ok(None) => return ScanPositionClassification::SkipAndContinue,
+        Err(_) => return ScanPositionClassification::SkipAndContinue,
+    };
+
+    // Step 2: convert the path bytes to &str. The underlying readers
+    // accept &str only; non-UTF-8 paths are skippable.
+    let absolute_file_path_str: &str =
+        match core::str::from_utf8(&path_byte_buffer[..path_byte_length]) {
+            Ok(valid_str) => valid_str,
+            Err(_) => return ScanPositionClassification::SkipAndContinue,
+        };
+
+    // Step 3: read the memo file.
+    let move_file_contents = match read_memo_move_file(absolute_file_path_str) {
+        Ok(Some(contents)) => contents,
+        Ok(None) => return ScanPositionClassification::SkipAndContinue,
+        Err(_) => return ScanPositionClassification::SkipAndContinue,
+    };
+
+    // Step 4: compare owner against the target player name.
+    let target_player_name_bytes: &[u8] = match for_player_color {
+        PieceColor::White => config.white_player_name_as_bytes(),
+        PieceColor::Black => config.black_player_name_as_bytes(),
+    };
+    if move_file_contents.owner_as_bytes() != target_player_name_bytes {
+        return ScanPositionClassification::SkipAndContinue;
+    }
+
+    // Step 5: interpret the text_message. First check for non-move
+    // commands (draw / resign). For MVP-1 only resignation is acted
+    // on; draw offers are skipped silently.
+    let text_message_bytes: &[u8] = move_file_contents.text_message_as_bytes();
+
+    match parse_non_move_player_command(text_message_bytes) {
+        Some(NonMovePlayerCommand::Resign) => {
+            return ScanPositionClassification::FoundResignationCommand {
+                command_unix_timestamp: move_file_contents.updated_at_unix_timestamp,
+            };
+        }
+        Some(NonMovePlayerCommand::Draw) => {
+            return ScanPositionClassification::SkipAndContinue;
+        }
+        None => {
+            // Fall through to move parsing.
+        }
+    }
+
+    // Step 6: parse as chess notation.
+    let parsed_notation = match parse_move_notation(text_message_bytes) {
+        Ok(parsed) => parsed,
+        Err(_) => return ScanPositionClassification::SkipAndContinue,
+    };
+
+    ScanPositionClassification::FoundMoveCandidate {
+        parsed_notation: parsed_notation,
+        move_unix_timestamp: move_file_contents.updated_at_unix_timestamp,
+    }
+}
+
+// ----------------------------------------------------------------------------
+// Internal: per-player scan
+// ----------------------------------------------------------------------------
+
+/// Outcome of one per-player scan over a chrono-index range.
+#[derive(Debug, Clone, Copy)]
+enum ScanLoopOutcome {
+    /// The scan exhausted the range without finding a candidate.
+    /// All examined positions have been advanced past.
+    NoCandidateFound { advanced_cursor_to: u64 },
+
+    /// The scan found a move candidate at a specific position. The
+    /// cursor should be advanced to (position + 1) when (and only
+    /// when) the move is successfully applied; if the move proves
+    /// illegal, the cursor advances anyway (per the forward-progress
+    /// rule).
+    MoveCandidate {
+        parsed_notation: ParsedMoveNotation,
+        move_unix_timestamp: u64,
+        found_at_position: u64,
+    },
+
+    /// The scan found a resignation command at a specific position.
+    /// The cursor should be advanced to (position + 1).
+    ResignationCommand {
+        command_unix_timestamp: u64,
+        found_at_position: u64,
+    },
+}
+
+/// Scan the chrono-index range `[scan_start_position, scan_upper_bound)`
+/// for the next candidate file owned by `for_player_color`.
+///
+/// Returns the first stop-the-scan outcome found, or
+/// `NoCandidateFound` if the range is exhausted without one. The
+/// returned `advanced_cursor_to` value (in `NoCandidateFound`) tells
+/// the caller where to put the cursor: at `scan_upper_bound` if the
+/// whole range was traversed.
+fn scan_chrono_range_for_player_move(
+    chrono_temp_directory_path: &Path,
+    scan_start_position: u64,
+    scan_upper_bound: u64,
+    for_player_color: PieceColor,
+    config: &MemochessGameConfig,
+) -> ScanLoopOutcome {
+    // Bounded loop: at most `scan_upper_bound - scan_start_position`
+    // iterations. Per NASA P10 rule 2, the bound is explicit.
+    let mut current_position: u64 = scan_start_position;
+    while current_position < scan_upper_bound {
+        let classification = classify_chrono_position_for_player(
+            chrono_temp_directory_path,
+            current_position,
+            for_player_color,
+            config,
+        );
+
+        match classification {
+            ScanPositionClassification::SkipAndContinue => {
+                current_position = current_position.saturating_add(1);
+                continue;
+            }
+            ScanPositionClassification::FoundMoveCandidate {
+                parsed_notation,
+                move_unix_timestamp,
+            } => {
+                return ScanLoopOutcome::MoveCandidate {
+                    parsed_notation: parsed_notation,
+                    move_unix_timestamp: move_unix_timestamp,
+                    found_at_position: current_position,
+                };
+            }
+            ScanPositionClassification::FoundResignationCommand {
+                command_unix_timestamp,
+            } => {
+                return ScanLoopOutcome::ResignationCommand {
+                    command_unix_timestamp: command_unix_timestamp,
+                    found_at_position: current_position,
+                };
+            }
+        }
+    }
+
+    ScanLoopOutcome::NoCandidateFound {
+        advanced_cursor_to: current_position,
+    }
+}
+
+// ----------------------------------------------------------------------------
+// Internal: post-move game-status update
+// ----------------------------------------------------------------------------
+
+/// Update `board.game_status` to reflect a clock flag, if one has
+/// just occurred.
+///
+/// `apply_chess_move_to_state` sets `game_status` based on checkmate
+/// and stalemate detection. It does not know about time. After a
+/// move is applied OR after the live flag check observes a flag, we
+/// must check whether `game_time_state.timeflagged_player` is `Some(...)`
+/// and update `board.game_status` accordingly. This helper performs
+/// that single check.
+///
+/// If `game_status` already reflects a finished game (checkmate or
+/// stalemate produced by the chess engine), this helper leaves it
+/// alone — the existing reason for game-end takes precedence over a
+/// simultaneous flag.
+fn apply_timeflag_to_game_status(board: BoardState, game_time: GameTimeState) -> BoardState {
+    // If the game is already over by chess-engine reasons, leave it.
+    if board.game_status != GameStatus::Playing {
+        return board;
+    }
+    match game_time.timeflagged_player {
+        Some(PieceColor::White) => {
+            // White flagged; Black wins.
+            let mut updated_board = board;
+            updated_board.game_status = GameStatus::BlackWon;
+            updated_board
+        }
+        Some(PieceColor::Black) => {
+            // Black flagged; White wins.
+            let mut updated_board = board;
+            updated_board.game_status = GameStatus::WhiteWon;
+            updated_board
+        }
+        None => board,
+    }
+}
+
+// ----------------------------------------------------------------------------
+// Public: the per-tick function
+// ----------------------------------------------------------------------------
+
+// /// Perform one tick of the dungeon-master game loop.
+// ///
+// /// ## Project Context
+// ///
+// /// Called by the outer wrapper (Section 62) once per refresh cycle.
+// /// Pure with respect to the file system in the sense that all I/O
+// /// failures map to outcomes rather than panics or aborts. Takes the
+// /// current Unix timestamp as a parameter so the caller can sample
+// /// the clock once and have all internal time computations agree on
+// /// "now."
+// ///
+// /// ## Arguments
+// ///
+// /// - `current_state`: the dungeon-master state at the start of the
+// ///   tick. Immutable; the function returns a new state.
+// /// - `current_unix_timestamp`: wall-clock "now" in Unix seconds.
+// ///
+// /// ## Returns
+// ///
+// /// A `TickResult` containing the new state and a `TickOutcome`
+// /// describing what happened. See `TickOutcome` for the meanings of
+// /// the variants.
+// ///
+// /// ## Memory & Panic Policy
+// ///
+// /// No panics. The chrono-index module performs its own bounded
+// /// allocations (documented in that module); none scale per-tick.
+// /// All other I/O is via no-heap readers.
+// pub fn run_one_dungeon_master_tick(
+//     current_state: &DungeonMasterState,
+//     current_unix_timestamp: u64,
+// ) -> TickResult {
+//     let mut next_state: DungeonMasterState = *current_state;
+
+//     // ----------------------------------------------------------------
+//     // Step 1: refresh the chrono-index against the live directory.
+//     // ----------------------------------------------------------------
+//     let chrono_temp_directory_path: &Path = Path::new(
+//         match core::str::from_utf8(next_state.config.directory_path_as_bytes()) {
+//             Ok(_) => "",
+//             Err(_) => "",
+//         },
+//     );
+//     // The above is a placeholder; the chrono-index temp root is a
+//     // separate parameter at the wrapper layer. For this section, we
+//     // require the wrapper to keep the chrono temp directory path
+//     // alongside the dungeon-master state. To minimize coupling at
+//     // this stage, we obtain the chrono temp directory by convention:
+//     // it is the parent of the game directory's `chrono_index`
+//     // subdirectory. However, per the agreed scope, the tick function
+//     // here uses the *game directory itself* as the chrono temp
+//     // directory's containing path argument required by
+//     // `create_or_update_chrono_index`'s second argument (the watched
+//     // directory), and a separate temp root must be passed in.
+//     //
+//     // For Section 61 we add a small parameter: the chrono temp root.
+//     // See the function below.
+
+//     // Because of the parameter that was just identified as missing,
+//     // this section's tick function takes an additional argument.
+//     // Re-export the function below with the correct signature.
+
+//     // (This block exists only to make the dependency explicit. The
+//     // real implementation follows in `run_one_dungeon_master_tick_full`.)
+//     let _ = chrono_temp_directory_path;
+
+//     // Fall through to the full-signature function.
+//     run_one_dungeon_master_tick_full(
+//         current_state,
+//         current_unix_timestamp,
+//         // Wrapper convention: temp root provided alongside state.
+//         // For this section we cannot continue without it; the caller
+//         // (wrapper, Section 62) will supply it. The single-argument
+//         // form above is a placeholder for API ergonomics; in practice
+//         // the caller invokes `run_one_dungeon_master_tick_full`.
+//         Path::new(""),
+//     )
+// }
