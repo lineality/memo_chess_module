@@ -48,6 +48,22 @@
 //! not(test)))]` for invariant checking during development. `assert!` is
 //! used only inside `#[cfg(test)]` test functions.
 
+/*
+
+- The chess engine (Sections 1–14) (complete and tested)
+- Game-time accounting (Sections 20–28) (complete and tested)
+- `MemochessGameConfig` (Sections 28–33), including the three filesystem directory paths added in the previous session, (complete and tested)
+- The embedded chrono-index module (Parts a–g) (complete and tested)
+- The embedded Buffy module is present and provides `buffy_print` / `buffy_println` for no-heap terminal output, line by line.
+- The memo file readers (Sections 34–41) (complete and tested)
+- The config-line parser and semantic value parsers (Sections 42–48) (complete and tested)
+- The partial-bootstrap accumulator and finalization (Sections 49–54) (complete and tested); `n_move_rule` is required, not optional.
+- The bootstrap orchestrator and its support functions (Sections 55–59) (complete and tested)
+- `DungeonMasterState` (Section 60) and `run_one_dungeon_master_tick` (Section 61) (complete and tested)
+
+
+*/
+
 // ============================================================================
 // SECTION 1: Constants
 // ============================================================================
@@ -200,26 +216,83 @@ impl CastlingRights {
 // SECTION 4: Game Status
 // ============================================================================
 
-/// Current high-level state of the game.
+// /// Current high-level state of the game.
+// ///
+// /// Updated by `apply_chess_move_to_state` after each move. The TUI layer
+// /// reads this to decide whether to keep accepting moves and what to
+// /// display in the status line.
+// #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+// pub enum GameStatus {
+//     /// The game is in progress; the side to move has at least one legal
+//     /// move and is not in checkmate.
+//     Playing,
+//     /// Both players have agreed to a draw (via successive "draw" commands).
+//     /// Not produced by `apply_chess_move_to_state`; produced by the
+//     /// non-move command handling at a higher layer.
+//     Draw,
+//     /// The side to move has no legal moves and is *not* in check.
+//     Stalemate,
+//     /// White has won (Black is in checkmate, or Black resigned).
+//     WhiteWon,
+//     /// Black has won (White is in checkmate, or White resigned).
+//     BlackWon,
+// }
+
+/// Current state of one memo_chess game, including the specific reason
+/// the game ended when it is no longer in progress.
 ///
-/// Updated by `apply_chess_move_to_state` after each move. The TUI layer
-/// reads this to decide whether to keep accepting moves and what to
-/// display in the status line.
+/// ## Project Context
+///
+/// This enum is the single source of truth for game-end cause. The
+/// TUI renderer (Section 62) reads this enum directly to select the
+/// end-of-game message; no other field needs to be consulted.
+///
+/// ## Variant naming
+///
+/// Variants are flat (no nested data) and self-describing. End-of-game
+/// variants include both the cause and the consequence (which side
+/// won, or that it was a draw). Stalemate variants name the stalemated
+/// side. "Cheese" is the chess verb for time-flagging (per Hikaru
+/// Nakamura usage).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GameStatus {
-    /// The game is in progress; the side to move has at least one legal
-    /// move and is not in checkmate.
-    Playing,
-    /// Both players have agreed to a draw (via successive "draw" commands).
-    /// Not produced by `apply_chess_move_to_state`; produced by the
-    /// non-move command handling at a higher layer.
-    Draw,
-    /// The side to move has no legal moves and is *not* in check.
-    Stalemate,
-    /// White has won (Black is in checkmate, or Black resigned).
-    WhiteWon,
-    /// Black has won (White is in checkmate, or White resigned).
-    BlackWon,
+    /// The game is in progress.
+    StillPlaying,
+
+    /// White delivered checkmate. White wins.
+    CheckmateWhitewin,
+
+    /// Black delivered checkmate. Black wins.
+    CheckmateBlackwin,
+
+    /// Both players agreed to a draw via successive draw commands.
+    DrawAgreed,
+
+    /// The game was drawn by threefold repetition. (Reserved for
+    /// post-MVP-1; not produced by the engine in MVP-1.)
+    DrawByRepetition,
+
+    /// The game was drawn by the N-move rule (no pawn move and no
+    /// capture for N consecutive half-moves).
+    DrawForcedNmoveRule,
+
+    /// Black has no legal moves and is not in check. Game is drawn.
+    BlackStalemated,
+
+    /// White has no legal moves and is not in check. Game is drawn.
+    WhiteStalemated,
+
+    /// White resigned. Black wins.
+    WhiteResigned,
+
+    /// Black resigned. White wins.
+    BlackResigned,
+
+    /// White ran out of time (cheesed). Black wins.
+    WhitecheeseTimeflagged,
+
+    /// Black ran out of time (cheesed). White wins.
+    BlackcheeseTimeflagged,
 }
 
 // ============================================================================
@@ -521,7 +594,7 @@ pub enum MoveValidationError {
 /// then turn information, then the auxiliary state required to implement
 /// special move rules (castling, en passant), then bookkeeping (move
 /// counters, status).
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct BoardState {
     /// The 64 squares of the board. `None` represents an empty square.
     /// Indexed per the module-level board indexing convention:
@@ -719,7 +792,7 @@ pub fn create_initial_board_state() -> BoardState {
         en_passant_target_square: None,
         fullmove_number: 1,
         halfmove_clock: 0,
-        game_status: GameStatus::Playing,
+        game_status: GameStatus::StillPlaying,
     }
 }
 
@@ -1020,7 +1093,7 @@ mod tests_part_1_data_types_and_initial_state {
         assert_eq!(state.en_passant_target_square, None);
         assert_eq!(state.fullmove_number, 1);
         assert_eq!(state.halfmove_clock, 0);
-        assert_eq!(state.game_status, GameStatus::Playing);
+        assert_eq!(state.game_status, GameStatus::StillPlaying);
         assert!(state.castling_rights.white_kingside);
         assert!(state.castling_rights.white_queenside);
         assert!(state.castling_rights.black_kingside);
@@ -1297,6 +1370,4003 @@ mod tests_part_1_data_types_and_initial_state {
         assert_copy::<BoardState>();
         assert_copy::<MoveValidationError>();
         assert_copy::<LegalMovesForCurrentTurn>();
+    }
+}
+
+// ============================================================================
+// SECTION Extra: Game-Engine: Move Making & Validation
+// ============================================================================
+
+/// Returns `true` if any piece of `attacker_color` could (pseudo-legally,
+/// ignoring whether such a move would expose the attacker's own king
+/// to check) move to or capture on `target_square_index` in the given
+/// board state.
+///
+/// "Attack" for pawns is the diagonal capture move only — pawn pushes
+/// do not attack the square in front of them.
+///
+/// Used by `is_king_currently_in_check` and by castling validation.
+///
+/// ## Algorithm
+///
+/// Scans outward from the target square rather than iterating all 64
+/// squares. For each piece type, the relevant set of source squares
+/// is finite and bounded:
+///   - Pawns: 2 diagonal squares one rank "behind" the target
+///     relative to the attacker's direction of advance.
+///   - Knights: 8 L-shaped offsets.
+///   - Kings: 8 adjacent squares.
+///   - Bishops/queens: 4 diagonal rays, up to 7 steps each.
+///   - Rooks/queens: 4 orthogonal rays, up to 7 steps each.
+///
+/// A sliding ray stops at the first occupied square. If that square
+/// holds a piece of `attacker_color` of the appropriate kind
+/// (bishop/queen on diagonals, rook/queen on orthogonals), the target
+/// is attacked. Otherwise the ray is blocked and the function moves
+/// on to the next direction.
+///
+/// ## Returns
+///
+/// `true` if at least one piece of `attacker_color` attacks the
+/// target square. `false` otherwise, including the defensive case
+/// where `target_square_index >= BOARD_SQUARE_COUNT`.
+///
+/// ## Memory & Panic Policy
+///
+/// No heap. No panics. Bounded loops only.
+pub fn is_square_attacked_by_color(
+    state: &BoardState,
+    target_square_index: u8,
+    attacker_color: PieceColor,
+) -> bool {
+    // Defensive bounds check on the target square index. An invalid
+    // index cannot be attacked because it is not on the board.
+    if (target_square_index as usize) >= BOARD_SQUARE_COUNT {
+        return false;
+    }
+
+    // Convert target to file/rank via the canonical helpers. On error
+    // (which should not occur after the bounds check above), treat as
+    // not attacked.
+    let target_file_i16: i16 = match file_from_square_index(target_square_index) {
+        Ok(file_zero_to_seven) => file_zero_to_seven as i16,
+        Err(_) => return false,
+    };
+    let target_rank_i16: i16 = match rank_from_square_index(target_square_index) {
+        Ok(rank_zero_to_seven) => rank_zero_to_seven as i16,
+        Err(_) => return false,
+    };
+
+    // ----- 1. Pawn attacks -----
+    // A White pawn on square S attacks S + 1 rank, +/- 1 file.
+    // So to detect a White attacker of `target`, look one rank BELOW
+    // the target (toward rank 0) on both adjacent files. Black is
+    // the mirror image.
+    let pawn_attacker_rank_offset: i16 = match attacker_color {
+        PieceColor::White => -1,
+        PieceColor::Black => 1,
+    };
+    for pawn_file_offset in [-1_i16, 1_i16] {
+        let pawn_file = target_file_i16 + pawn_file_offset;
+        let pawn_rank = target_rank_i16 + pawn_attacker_rank_offset;
+        if pawn_file < 0 || pawn_file > 7 || pawn_rank < 0 || pawn_rank > 7 {
+            continue;
+        }
+        let pawn_square_index =
+            match square_index_from_file_and_rank(pawn_file as u8, pawn_rank as u8) {
+                Ok(index) => index,
+                Err(_) => continue,
+            };
+        if let Some(piece) = state.board_squares[pawn_square_index as usize] {
+            if piece.piece_color == attacker_color && piece.piece_kind == PieceKind::Pawn {
+                return true;
+            }
+        }
+    }
+
+    // ----- 2. Knight attacks -----
+    let knight_offsets: [(i16, i16); 8] = [
+        (1, 2),
+        (2, 1),
+        (2, -1),
+        (1, -2),
+        (-1, -2),
+        (-2, -1),
+        (-2, 1),
+        (-1, 2),
+    ];
+    for (file_offset, rank_offset) in knight_offsets {
+        let knight_file = target_file_i16 + file_offset;
+        let knight_rank = target_rank_i16 + rank_offset;
+        if knight_file < 0 || knight_file > 7 || knight_rank < 0 || knight_rank > 7 {
+            continue;
+        }
+        let knight_square_index =
+            match square_index_from_file_and_rank(knight_file as u8, knight_rank as u8) {
+                Ok(index) => index,
+                Err(_) => continue,
+            };
+        if let Some(piece) = state.board_squares[knight_square_index as usize] {
+            if piece.piece_color == attacker_color && piece.piece_kind == PieceKind::Knight {
+                return true;
+            }
+        }
+    }
+
+    // ----- 3. King attacks (one-square offsets in eight directions) -----
+    let king_offsets: [(i16, i16); 8] = [
+        (-1, -1),
+        (-1, 0),
+        (-1, 1),
+        (0, -1),
+        (0, 1),
+        (1, -1),
+        (1, 0),
+        (1, 1),
+    ];
+    for (file_offset, rank_offset) in king_offsets {
+        let king_file = target_file_i16 + file_offset;
+        let king_rank = target_rank_i16 + rank_offset;
+        if king_file < 0 || king_file > 7 || king_rank < 0 || king_rank > 7 {
+            continue;
+        }
+        let king_square_index =
+            match square_index_from_file_and_rank(king_file as u8, king_rank as u8) {
+                Ok(index) => index,
+                Err(_) => continue,
+            };
+        if let Some(piece) = state.board_squares[king_square_index as usize] {
+            if piece.piece_color == attacker_color && piece.piece_kind == PieceKind::King {
+                return true;
+            }
+        }
+    }
+
+    // ----- 4. Diagonal sliding attacks (bishop or queen) -----
+    let diagonal_directions: [(i16, i16); 4] = [(1, 1), (1, -1), (-1, 1), (-1, -1)];
+    for (file_step_direction, rank_step_direction) in diagonal_directions {
+        // Walk at most 7 squares along this diagonal.
+        for step_count in 1_i16..=7_i16 {
+            let ray_file = target_file_i16 + file_step_direction * step_count;
+            let ray_rank = target_rank_i16 + rank_step_direction * step_count;
+            if ray_file < 0 || ray_file > 7 || ray_rank < 0 || ray_rank > 7 {
+                break;
+            }
+            let ray_square_index =
+                match square_index_from_file_and_rank(ray_file as u8, ray_rank as u8) {
+                    Ok(index) => index,
+                    Err(_) => break,
+                };
+            if let Some(piece) = state.board_squares[ray_square_index as usize] {
+                // First occupied square on the ray.
+                if piece.piece_color == attacker_color
+                    && (piece.piece_kind == PieceKind::Bishop
+                        || piece.piece_kind == PieceKind::Queen)
+                {
+                    return true;
+                }
+                // Either friendly to attacker, or wrong kind: the ray
+                // is blocked. Stop scanning this direction.
+                break;
+            }
+        }
+    }
+
+    // ----- 5. Orthogonal sliding attacks (rook or queen) -----
+    let orthogonal_directions: [(i16, i16); 4] = [(1, 0), (-1, 0), (0, 1), (0, -1)];
+    for (file_step_direction, rank_step_direction) in orthogonal_directions {
+        for step_count in 1_i16..=7_i16 {
+            let ray_file = target_file_i16 + file_step_direction * step_count;
+            let ray_rank = target_rank_i16 + rank_step_direction * step_count;
+            if ray_file < 0 || ray_file > 7 || ray_rank < 0 || ray_rank > 7 {
+                break;
+            }
+            let ray_square_index =
+                match square_index_from_file_and_rank(ray_file as u8, ray_rank as u8) {
+                    Ok(index) => index,
+                    Err(_) => break,
+                };
+            if let Some(piece) = state.board_squares[ray_square_index as usize] {
+                if piece.piece_color == attacker_color
+                    && (piece.piece_kind == PieceKind::Rook || piece.piece_kind == PieceKind::Queen)
+                {
+                    return true;
+                }
+                break;
+            }
+        }
+    }
+
+    false
+}
+
+/// Returns `true` if the king of `for_color` is currently attacked
+/// by any opposing piece in the given board state.
+///
+/// If no king of `for_color` is present on the board (defensive case;
+/// should not occur in a valid game), returns `false`.
+///
+/// ## Algorithm
+///
+/// Linear scan of the 64 board squares to locate the king. Then
+/// delegate to `is_square_attacked_by_color` with the opposite color.
+///
+/// ## Memory & Panic Policy
+///
+/// No heap. No panics. One bounded loop over 64 squares.
+pub fn is_king_currently_in_check(state: &BoardState, for_color: PieceColor) -> bool {
+    // Locate the king of `for_color`. Bounded loop over the board.
+    let mut king_square_index_option: Option<u8> = None;
+    for square_index in 0..BOARD_SQUARE_COUNT {
+        if let Some(piece) = state.board_squares[square_index] {
+            if piece.piece_color == for_color && piece.piece_kind == PieceKind::King {
+                king_square_index_option = Some(square_index as u8);
+                break;
+            }
+        }
+    }
+
+    let king_square_index = match king_square_index_option {
+        Some(index) => index,
+        // Defensive case (per Option A in the design discussion):
+        // no king present → not in check.
+        None => return false,
+    };
+
+    is_square_attacked_by_color(state, king_square_index, for_color.opposite_color())
+}
+
+#[cfg(test)]
+mod batch_one_tests {
+    use super::*;
+
+    /// Build a board state with all squares empty, White to move, no
+    /// castling rights, no en passant, fullmove 1, halfmove 0, status
+    /// `StillPlaying`. Tests then place pieces explicitly.
+    fn make_empty_board_state_for_tests() -> BoardState {
+        BoardState {
+            board_squares: [None; BOARD_SQUARE_COUNT],
+            side_to_move: PieceColor::White,
+            castling_rights: CastlingRights {
+                white_kingside: false,
+                white_queenside: false,
+                black_kingside: false,
+                black_queenside: false,
+            },
+            en_passant_target_square: None,
+            fullmove_number: 1,
+            halfmove_clock: 0,
+            game_status: GameStatus::StillPlaying,
+        }
+    }
+
+    /// Resolve a coordinate like (file 4, rank 1) = e2 to a square
+    /// index. Panics inside a test if helper returns an error; this
+    /// is acceptable because test code is allowed to use assert
+    /// macros.
+    fn square_index_for_test(file_zero_to_seven: u8, rank_zero_to_seven: u8) -> u8 {
+        match square_index_from_file_and_rank(file_zero_to_seven, rank_zero_to_seven) {
+            Ok(index) => index,
+            Err(error) => panic!(
+                "test setup: square_index_from_file_and_rank failed: {:?}",
+                error
+            ),
+        }
+    }
+
+    // ---------- is_square_attacked_by_color ----------
+
+    #[test]
+    fn test_is_square_attacked_empty_board_no_attack() {
+        let state = make_empty_board_state_for_tests();
+        // Sample a handful of squares.
+        for square_index in [0_u8, 7, 27, 28, 35, 56, 63] {
+            assert!(
+                !is_square_attacked_by_color(&state, square_index, PieceColor::White),
+                "empty board: square {} should not be attacked by White",
+                square_index
+            );
+            assert!(
+                !is_square_attacked_by_color(&state, square_index, PieceColor::Black),
+                "empty board: square {} should not be attacked by Black",
+                square_index
+            );
+        }
+    }
+
+    #[test]
+    fn test_is_square_attacked_white_pawn_attacks_diagonals_only() {
+        let mut state = make_empty_board_state_for_tests();
+        let e4 = square_index_for_test(4, 3);
+        let d5 = square_index_for_test(3, 4);
+        let f5 = square_index_for_test(5, 4);
+        let e5 = square_index_for_test(4, 4);
+
+        state.board_squares[e4 as usize] = Some(Piece {
+            piece_color: PieceColor::White,
+            piece_kind: PieceKind::Pawn,
+        });
+
+        assert!(
+            is_square_attacked_by_color(&state, d5, PieceColor::White),
+            "white pawn on e4 should attack d5"
+        );
+        assert!(
+            is_square_attacked_by_color(&state, f5, PieceColor::White),
+            "white pawn on e4 should attack f5"
+        );
+        assert!(
+            !is_square_attacked_by_color(&state, e5, PieceColor::White),
+            "white pawn on e4 should NOT attack e5 (push square)"
+        );
+    }
+
+    #[test]
+    fn test_is_square_attacked_black_pawn_attacks_diagonals_only() {
+        let mut state = make_empty_board_state_for_tests();
+        let e5 = square_index_for_test(4, 4);
+        let d4 = square_index_for_test(3, 3);
+        let f4 = square_index_for_test(5, 3);
+        let e4 = square_index_for_test(4, 3);
+
+        state.board_squares[e5 as usize] = Some(Piece {
+            piece_color: PieceColor::Black,
+            piece_kind: PieceKind::Pawn,
+        });
+
+        assert!(is_square_attacked_by_color(&state, d4, PieceColor::Black));
+        assert!(is_square_attacked_by_color(&state, f4, PieceColor::Black));
+        assert!(!is_square_attacked_by_color(&state, e4, PieceColor::Black));
+    }
+
+    #[test]
+    fn test_is_square_attacked_knight_center_eight_squares() {
+        let mut state = make_empty_board_state_for_tests();
+        let d4 = square_index_for_test(3, 3);
+        state.board_squares[d4 as usize] = Some(Piece {
+            piece_color: PieceColor::White,
+            piece_kind: PieceKind::Knight,
+        });
+
+        // The 8 L-moves from d4: b3, b5, c2, c6, e2, e6, f3, f5.
+        let attacked_squares: [(u8, u8); 8] = [
+            (1, 2),
+            (1, 4),
+            (2, 1),
+            (2, 5),
+            (4, 1),
+            (4, 5),
+            (5, 2),
+            (5, 4),
+        ];
+        for (file_index, rank_index) in attacked_squares {
+            let square_idx = square_index_for_test(file_index, rank_index);
+            assert!(
+                is_square_attacked_by_color(&state, square_idx, PieceColor::White),
+                "knight on d4 should attack ({},{}) idx {}",
+                file_index,
+                rank_index,
+                square_idx
+            );
+        }
+    }
+
+    #[test]
+    fn test_is_square_attacked_knight_corner_two_squares() {
+        let mut state = make_empty_board_state_for_tests();
+        let a1 = SQUARE_INDEX_A1;
+        state.board_squares[a1 as usize] = Some(Piece {
+            piece_color: PieceColor::White,
+            piece_kind: PieceKind::Knight,
+        });
+
+        let b3 = square_index_for_test(1, 2);
+        let c2 = square_index_for_test(2, 1);
+
+        assert!(is_square_attacked_by_color(&state, b3, PieceColor::White));
+        assert!(is_square_attacked_by_color(&state, c2, PieceColor::White));
+
+        // Sanity: some non-attacked squares
+        let d4 = square_index_for_test(3, 3);
+        let a8 = SQUARE_INDEX_A8;
+        assert!(!is_square_attacked_by_color(&state, d4, PieceColor::White));
+        assert!(!is_square_attacked_by_color(&state, a8, PieceColor::White));
+    }
+
+    #[test]
+    fn test_is_square_attacked_rook_blocked_by_friendly_piece() {
+        let mut state = make_empty_board_state_for_tests();
+        let a1 = SQUARE_INDEX_A1;
+        let a4 = square_index_for_test(0, 3);
+        let a5 = square_index_for_test(0, 4);
+        let a2 = square_index_for_test(0, 1);
+        let a3 = square_index_for_test(0, 2);
+
+        state.board_squares[a1 as usize] = Some(Piece {
+            piece_color: PieceColor::White,
+            piece_kind: PieceKind::Rook,
+        });
+        // Friendly (white) pawn blocker on a4.
+        state.board_squares[a4 as usize] = Some(Piece {
+            piece_color: PieceColor::White,
+            piece_kind: PieceKind::Pawn,
+        });
+
+        assert!(is_square_attacked_by_color(&state, a2, PieceColor::White));
+        assert!(is_square_attacked_by_color(&state, a3, PieceColor::White));
+        // a4: the rook defends its own piece. Attacked by White.
+        assert!(
+            is_square_attacked_by_color(&state, a4, PieceColor::White),
+            "rook on a1 defends friendly pawn on a4 — a4 IS attacked by White"
+        );
+        // a5: ray blocked at a4, not attacked.
+        assert!(!is_square_attacked_by_color(&state, a5, PieceColor::White));
+    }
+
+    #[test]
+    fn test_is_square_attacked_rook_capture_square_included() {
+        let mut state = make_empty_board_state_for_tests();
+        let a1 = SQUARE_INDEX_A1;
+        let a4 = square_index_for_test(0, 3);
+        let a5 = square_index_for_test(0, 4);
+
+        state.board_squares[a1 as usize] = Some(Piece {
+            piece_color: PieceColor::White,
+            piece_kind: PieceKind::Rook,
+        });
+        // Enemy (black) pawn on a4 — the rook attacks the capture square.
+        state.board_squares[a4 as usize] = Some(Piece {
+            piece_color: PieceColor::Black,
+            piece_kind: PieceKind::Pawn,
+        });
+
+        assert!(
+            is_square_attacked_by_color(&state, a4, PieceColor::White),
+            "rook on a1 should attack a4 (enemy capture square)"
+        );
+        // Beyond the capture square: not attacked (ray stops on a4).
+        assert!(!is_square_attacked_by_color(&state, a5, PieceColor::White));
+    }
+
+    #[test]
+    fn test_is_square_attacked_bishop_blocked_by_friendly() {
+        let mut state = make_empty_board_state_for_tests();
+        let c1 = square_index_for_test(2, 0);
+        let d2 = square_index_for_test(3, 1);
+        let e3 = square_index_for_test(4, 2);
+        let f4 = square_index_for_test(5, 3);
+
+        state.board_squares[c1 as usize] = Some(Piece {
+            piece_color: PieceColor::White,
+            piece_kind: PieceKind::Bishop,
+        });
+        // Use a knight as the blocker. A knight on d2 attacks b1, b3,
+        // c4, e4, f1, f3 — none of which collide with the test squares
+        // (e3, f4). This isolates the assertion to bishop ray-blocking.
+        state.board_squares[d2 as usize] = Some(Piece {
+            piece_color: PieceColor::White,
+            piece_kind: PieceKind::Knight,
+        });
+
+        // Bishop's NE ray from c1 is blocked at d2, so the squares
+        // beyond (e3, f4, ...) are not attacked by the bishop. The
+        // knight on d2 does not attack e3 or f4. Therefore neither
+        // square is attacked by any White piece.
+        assert!(
+            !is_square_attacked_by_color(&state, e3, PieceColor::White),
+            "bishop ray blocked at d2, knight on d2 does not attack e3"
+        );
+        assert!(
+            !is_square_attacked_by_color(&state, f4, PieceColor::White),
+            "bishop ray blocked at d2, knight on d2 does not attack f4"
+        );
+    }
+
+    #[test]
+    fn test_is_square_attacked_queen_attacks_eight_rays() {
+        let mut state = make_empty_board_state_for_tests();
+        let d4 = square_index_for_test(3, 3);
+        state.board_squares[d4 as usize] = Some(Piece {
+            piece_color: PieceColor::White,
+            piece_kind: PieceKind::Queen,
+        });
+
+        // Sample one square on each of the eight rays.
+        let sampled_attacked: [(u8, u8); 8] = [
+            (3, 5), // d6 (north)
+            (3, 0), // d1 (south)
+            (5, 3), // f4 (east)
+            (0, 3), // a4 (west)
+            (5, 5), // f6 (NE)
+            (1, 5), // b6 (NW)
+            (5, 1), // f2 (SE)
+            (1, 1), // b2 (SW)
+        ];
+        for (file_index, rank_index) in sampled_attacked {
+            let square_idx = square_index_for_test(file_index, rank_index);
+            assert!(
+                is_square_attacked_by_color(&state, square_idx, PieceColor::White),
+                "queen on d4 should attack ({},{})",
+                file_index,
+                rank_index
+            );
+        }
+
+        // A square not on any ray from d4: e6 is NOT on any d4 ray.
+        // d4 = (3, 3); e6 = (4, 5). Diff = (+1, +2) — knight pattern, not queen.
+        let e6 = square_index_for_test(4, 5);
+        assert!(!is_square_attacked_by_color(&state, e6, PieceColor::White));
+    }
+
+    #[test]
+    fn test_is_square_attacked_two_pieces_same_target() {
+        let mut state = make_empty_board_state_for_tests();
+        let e4 = square_index_for_test(4, 3);
+        let e1 = square_index_for_test(4, 0);
+        let a4 = square_index_for_test(0, 3);
+
+        // White rook on e1 (attacks e4 via file), white rook on a4
+        // (attacks e4 via rank).
+        state.board_squares[e1 as usize] = Some(Piece {
+            piece_color: PieceColor::White,
+            piece_kind: PieceKind::Rook,
+        });
+        state.board_squares[a4 as usize] = Some(Piece {
+            piece_color: PieceColor::White,
+            piece_kind: PieceKind::Rook,
+        });
+
+        assert!(is_square_attacked_by_color(&state, e4, PieceColor::White));
+    }
+
+    #[test]
+    fn test_is_square_attacked_invalid_square_index_returns_false() {
+        let state = make_empty_board_state_for_tests();
+        // Out-of-range index, defensive case.
+        assert!(!is_square_attacked_by_color(&state, 64, PieceColor::White));
+        assert!(!is_square_attacked_by_color(&state, 200, PieceColor::Black));
+    }
+
+    // ---------- is_king_currently_in_check ----------
+
+    #[test]
+    fn test_is_king_in_check_starting_position_neither_in_check() {
+        let state = create_initial_board_state();
+        assert!(!is_king_currently_in_check(&state, PieceColor::White));
+        assert!(!is_king_currently_in_check(&state, PieceColor::Black));
+    }
+
+    #[test]
+    fn test_is_king_in_check_by_pawn() {
+        let mut state = make_empty_board_state_for_tests();
+        let e4 = square_index_for_test(4, 3);
+        let d5 = square_index_for_test(3, 4);
+        // Black king on d5, white pawn on e4 attacks d5.
+        state.board_squares[d5 as usize] = Some(Piece {
+            piece_color: PieceColor::Black,
+            piece_kind: PieceKind::King,
+        });
+        state.board_squares[e4 as usize] = Some(Piece {
+            piece_color: PieceColor::White,
+            piece_kind: PieceKind::Pawn,
+        });
+
+        assert!(is_king_currently_in_check(&state, PieceColor::Black));
+        assert!(!is_king_currently_in_check(&state, PieceColor::White));
+    }
+
+    #[test]
+    fn test_is_king_in_check_by_knight() {
+        let mut state = make_empty_board_state_for_tests();
+        let e8 = SQUARE_INDEX_E8;
+        let f6 = square_index_for_test(5, 5);
+        state.board_squares[e8 as usize] = Some(Piece {
+            piece_color: PieceColor::Black,
+            piece_kind: PieceKind::King,
+        });
+        state.board_squares[f6 as usize] = Some(Piece {
+            piece_color: PieceColor::White,
+            piece_kind: PieceKind::Knight,
+        });
+
+        assert!(is_king_currently_in_check(&state, PieceColor::Black));
+    }
+
+    #[test]
+    fn test_is_king_in_check_by_bishop_diagonal() {
+        let mut state = make_empty_board_state_for_tests();
+        let e1 = SQUARE_INDEX_E1;
+        let h4 = square_index_for_test(7, 3);
+        state.board_squares[e1 as usize] = Some(Piece {
+            piece_color: PieceColor::White,
+            piece_kind: PieceKind::King,
+        });
+        state.board_squares[h4 as usize] = Some(Piece {
+            piece_color: PieceColor::Black,
+            piece_kind: PieceKind::Bishop,
+        });
+
+        assert!(is_king_currently_in_check(&state, PieceColor::White));
+    }
+
+    #[test]
+    fn test_is_king_in_check_by_rook_along_file() {
+        let mut state = make_empty_board_state_for_tests();
+        let e1 = SQUARE_INDEX_E1;
+        let e8 = SQUARE_INDEX_E8;
+        state.board_squares[e1 as usize] = Some(Piece {
+            piece_color: PieceColor::White,
+            piece_kind: PieceKind::King,
+        });
+        state.board_squares[e8 as usize] = Some(Piece {
+            piece_color: PieceColor::Black,
+            piece_kind: PieceKind::Rook,
+        });
+
+        assert!(is_king_currently_in_check(&state, PieceColor::White));
+    }
+
+    #[test]
+    fn test_is_king_in_check_by_queen_diagonal() {
+        let mut state = make_empty_board_state_for_tests();
+        let e1 = SQUARE_INDEX_E1;
+        let h4 = square_index_for_test(7, 3);
+        state.board_squares[e1 as usize] = Some(Piece {
+            piece_color: PieceColor::White,
+            piece_kind: PieceKind::King,
+        });
+        state.board_squares[h4 as usize] = Some(Piece {
+            piece_color: PieceColor::Black,
+            piece_kind: PieceKind::Queen,
+        });
+
+        assert!(is_king_currently_in_check(&state, PieceColor::White));
+    }
+
+    #[test]
+    fn test_is_king_not_in_check_when_attacker_blocked() {
+        let mut state = make_empty_board_state_for_tests();
+        let e1 = SQUARE_INDEX_E1;
+        let e8 = SQUARE_INDEX_E8;
+        let e5 = square_index_for_test(4, 4);
+
+        // White king e1, black rook e8 would give check along the file,
+        // but black's own pawn on e5 blocks the ray.
+        state.board_squares[e1 as usize] = Some(Piece {
+            piece_color: PieceColor::White,
+            piece_kind: PieceKind::King,
+        });
+        state.board_squares[e8 as usize] = Some(Piece {
+            piece_color: PieceColor::Black,
+            piece_kind: PieceKind::Rook,
+        });
+        state.board_squares[e5 as usize] = Some(Piece {
+            piece_color: PieceColor::Black,
+            piece_kind: PieceKind::Pawn,
+        });
+
+        assert!(
+            !is_king_currently_in_check(&state, PieceColor::White),
+            "rook check blocked by intervening pawn"
+        );
+    }
+
+    #[test]
+    fn test_is_king_in_check_missing_king_returns_false() {
+        // Defensive case (Option A): no white king on the board.
+        let mut state = make_empty_board_state_for_tests();
+        let e8 = SQUARE_INDEX_E8;
+        state.board_squares[e8 as usize] = Some(Piece {
+            piece_color: PieceColor::Black,
+            piece_kind: PieceKind::King,
+        });
+        // No white king at all.
+        assert!(!is_king_currently_in_check(&state, PieceColor::White));
+    }
+}
+
+/// Append all pseudo-legal pawn moves for the piece at
+/// `from_square_index` to `output_legal_moves`.
+///
+/// Pseudo-legal: respects pawn movement rules (single push, double
+/// push from starting rank, diagonal capture, en passant) and
+/// promotion (when reaching the back rank, one move is emitted per
+/// each of the four valid promotion piece kinds: queen, rook,
+/// bishop, knight). Does NOT check whether the move leaves the
+/// moving side's king in check; that filter is applied later by
+/// `generate_all_legal_moves_for_current_turn`.
+///
+/// The pawn's color is determined from the piece at `from_square_index`.
+/// If that square does not contain a pawn, the function appends nothing.
+///
+/// En passant move category is `ChessMoveCategory::EnPassant`.
+/// Double-pawn-push move category is `ChessMoveCategory::DoublePawnPush`.
+/// A move that triggers promotion has category `ChessMoveCategory::Promotion`
+/// and `promotion_piece_kind` set.
+///
+/// ## Memory & Panic Policy
+///
+/// No heap. No panics. Returns `Err` only if `output_legal_moves` is
+/// at capacity (`InternalMoveBufferFull`).
+fn generate_pseudo_legal_pawn_moves(
+    state: &BoardState,
+    from_square_index: u8,
+    output_legal_moves: &mut LegalMovesForCurrentTurn,
+) -> Result<(), MoveValidationError> {
+    // Defensive: out-of-range index → nothing to append.
+    if (from_square_index as usize) >= BOARD_SQUARE_COUNT {
+        return Ok(());
+    }
+
+    // The source must contain a pawn. Otherwise, nothing to do.
+    let pawn_piece = match state.board_squares[from_square_index as usize] {
+        Some(piece) => piece,
+        None => return Ok(()),
+    };
+    if pawn_piece.piece_kind != PieceKind::Pawn {
+        return Ok(());
+    }
+    let pawn_color = pawn_piece.piece_color;
+
+    let from_file_i16: i16 = match file_from_square_index(from_square_index) {
+        Ok(file_zero_to_seven) => file_zero_to_seven as i16,
+        Err(_) => return Ok(()),
+    };
+    let from_rank_i16: i16 = match rank_from_square_index(from_square_index) {
+        Ok(rank_zero_to_seven) => rank_zero_to_seven as i16,
+        Err(_) => return Ok(()),
+    };
+
+    // Color-dependent constants:
+    //   rank_step: +1 for White (moves up the board), -1 for Black.
+    //   starting_rank: rank index where double-push is allowed.
+    //   promotion_rank: destination rank that triggers promotion.
+    let (rank_step, starting_rank, promotion_rank): (i16, i16, i16) = match pawn_color {
+        PieceColor::White => (1, 1, 7),
+        PieceColor::Black => (-1, 6, 0),
+    };
+
+    // ---------- Single push (and double push, conditional) ----------
+    let push_rank = from_rank_i16 + rank_step;
+    if push_rank >= 0 && push_rank <= 7 {
+        let push_target_index =
+            match square_index_from_file_and_rank(from_file_i16 as u8, push_rank as u8) {
+                Ok(index) => index,
+                Err(_) => {
+                    // Cannot resolve; skip the push entirely.
+                    return Ok(());
+                }
+            };
+
+        if state.board_squares[push_target_index as usize].is_none() {
+            // Push square is empty.
+            if push_rank == promotion_rank {
+                // Emit one promotion move per promotion piece kind.
+                let promotion_kinds: [PieceKind; 4] = [
+                    PieceKind::Queen,
+                    PieceKind::Rook,
+                    PieceKind::Bishop,
+                    PieceKind::Knight,
+                ];
+                for promotion_kind in promotion_kinds {
+                    output_legal_moves.push_move(ChessMove {
+                        from_square_index,
+                        to_square_index: push_target_index,
+                        promotion_piece_kind: Some(promotion_kind),
+                        move_category: ChessMoveCategory::Promotion,
+                    })?;
+                }
+            } else {
+                output_legal_moves.push_move(ChessMove {
+                    from_square_index,
+                    to_square_index: push_target_index,
+                    promotion_piece_kind: None,
+                    move_category: ChessMoveCategory::Normal,
+                })?;
+            }
+
+            // Double push: only allowed if the pawn is on its starting
+            // rank AND the single-push square was empty (already checked
+            // above by being inside this branch).
+            if from_rank_i16 == starting_rank {
+                let double_push_rank = from_rank_i16 + 2 * rank_step;
+                if double_push_rank >= 0 && double_push_rank <= 7 {
+                    let double_push_target_index = match square_index_from_file_and_rank(
+                        from_file_i16 as u8,
+                        double_push_rank as u8,
+                    ) {
+                        Ok(index) => index,
+                        Err(_) => return Ok(()),
+                    };
+                    if state.board_squares[double_push_target_index as usize].is_none() {
+                        output_legal_moves.push_move(ChessMove {
+                            from_square_index,
+                            to_square_index: double_push_target_index,
+                            promotion_piece_kind: None,
+                            move_category: ChessMoveCategory::DoublePawnPush,
+                        })?;
+                    }
+                }
+            }
+        }
+    }
+
+    // ---------- Diagonal captures (and en passant) ----------
+    for diagonal_file_offset in [-1_i16, 1_i16] {
+        let capture_file = from_file_i16 + diagonal_file_offset;
+        let capture_rank = from_rank_i16 + rank_step;
+        if capture_file < 0 || capture_file > 7 || capture_rank < 0 || capture_rank > 7 {
+            continue;
+        }
+        let capture_target_index =
+            match square_index_from_file_and_rank(capture_file as u8, capture_rank as u8) {
+                Ok(index) => index,
+                Err(_) => continue,
+            };
+
+        match state.board_squares[capture_target_index as usize] {
+            Some(target_piece) => {
+                // Regular diagonal capture (only if enemy).
+                if target_piece.piece_color != pawn_color {
+                    if capture_rank == promotion_rank {
+                        let promotion_kinds: [PieceKind; 4] = [
+                            PieceKind::Queen,
+                            PieceKind::Rook,
+                            PieceKind::Bishop,
+                            PieceKind::Knight,
+                        ];
+                        for promotion_kind in promotion_kinds {
+                            output_legal_moves.push_move(ChessMove {
+                                from_square_index,
+                                to_square_index: capture_target_index,
+                                promotion_piece_kind: Some(promotion_kind),
+                                move_category: ChessMoveCategory::Promotion,
+                            })?;
+                        }
+                    } else {
+                        output_legal_moves.push_move(ChessMove {
+                            from_square_index,
+                            to_square_index: capture_target_index,
+                            promotion_piece_kind: None,
+                            move_category: ChessMoveCategory::Normal,
+                        })?;
+                    }
+                }
+                // If target is own piece, no move emitted.
+            }
+            None => {
+                // En passant: target empty AND matches the recorded
+                // en-passant target square in the state.
+                if let Some(en_passant_square) = state.en_passant_target_square {
+                    if en_passant_square == capture_target_index {
+                        output_legal_moves.push_move(ChessMove {
+                            from_square_index,
+                            to_square_index: capture_target_index,
+                            promotion_piece_kind: None,
+                            move_category: ChessMoveCategory::EnPassant,
+                        })?;
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Append all pseudo-legal knight moves for the piece at
+/// `from_square_index` to `output_legal_moves`.
+///
+/// Knights move in an L-shape: ±1 file and ±2 ranks, or ±2 files
+/// and ±1 rank. Knights are NOT blocked by intervening pieces.
+/// Destination squares must be empty or contain an enemy piece;
+/// landing on a friendly piece is rejected.
+///
+/// If `from_square_index` does not contain a knight, the function
+/// appends nothing.
+///
+/// All moves emitted by this function have category
+/// `ChessMoveCategory::Normal`.
+///
+/// ## Memory & Panic Policy
+///
+/// No heap. No panics. Returns `Err` only on buffer overflow.
+fn generate_pseudo_legal_knight_moves(
+    state: &BoardState,
+    from_square_index: u8,
+    output_legal_moves: &mut LegalMovesForCurrentTurn,
+) -> Result<(), MoveValidationError> {
+    if (from_square_index as usize) >= BOARD_SQUARE_COUNT {
+        return Ok(());
+    }
+
+    let knight_piece = match state.board_squares[from_square_index as usize] {
+        Some(piece) => piece,
+        None => return Ok(()),
+    };
+    if knight_piece.piece_kind != PieceKind::Knight {
+        return Ok(());
+    }
+    let knight_color = knight_piece.piece_color;
+
+    let from_file_i16: i16 = match file_from_square_index(from_square_index) {
+        Ok(file_zero_to_seven) => file_zero_to_seven as i16,
+        Err(_) => return Ok(()),
+    };
+    let from_rank_i16: i16 = match rank_from_square_index(from_square_index) {
+        Ok(rank_zero_to_seven) => rank_zero_to_seven as i16,
+        Err(_) => return Ok(()),
+    };
+
+    let knight_offsets: [(i16, i16); 8] = [
+        (1, 2),
+        (2, 1),
+        (2, -1),
+        (1, -2),
+        (-1, -2),
+        (-2, -1),
+        (-2, 1),
+        (-1, 2),
+    ];
+
+    for (file_offset, rank_offset) in knight_offsets {
+        let destination_file = from_file_i16 + file_offset;
+        let destination_rank = from_rank_i16 + rank_offset;
+        if destination_file < 0
+            || destination_file > 7
+            || destination_rank < 0
+            || destination_rank > 7
+        {
+            continue;
+        }
+        let destination_index =
+            match square_index_from_file_and_rank(destination_file as u8, destination_rank as u8) {
+                Ok(index) => index,
+                Err(_) => continue,
+            };
+
+        // Reject landing on a friendly piece. Empty or enemy is OK.
+        if let Some(destination_piece) = state.board_squares[destination_index as usize] {
+            if destination_piece.piece_color == knight_color {
+                continue;
+            }
+        }
+        output_legal_moves.push_move(ChessMove {
+            from_square_index,
+            to_square_index: destination_index,
+            promotion_piece_kind: None,
+            move_category: ChessMoveCategory::Normal,
+        })?;
+    }
+
+    Ok(())
+}
+
+#[cfg(test)]
+mod batch_two_tests {
+    use super::*;
+
+    fn make_empty_board_state_for_tests() -> BoardState {
+        BoardState {
+            board_squares: [None; BOARD_SQUARE_COUNT],
+            side_to_move: PieceColor::White,
+            castling_rights: CastlingRights {
+                white_kingside: false,
+                white_queenside: false,
+                black_kingside: false,
+                black_queenside: false,
+            },
+            en_passant_target_square: None,
+            fullmove_number: 1,
+            halfmove_clock: 0,
+            game_status: GameStatus::StillPlaying,
+        }
+    }
+
+    fn square_index_for_test(file_zero_to_seven: u8, rank_zero_to_seven: u8) -> u8 {
+        match square_index_from_file_and_rank(file_zero_to_seven, rank_zero_to_seven) {
+            Ok(index) => index,
+            Err(error) => panic!(
+                "test setup: square_index_from_file_and_rank failed: {:?}",
+                error
+            ),
+        }
+    }
+
+    /// Helper: collect the moves currently in the buffer into a
+    /// `Vec<ChessMove>` for ergonomic comparison. Tests are allowed
+    /// to use heap; production code paths are not.
+    fn collected_moves(moves: &LegalMovesForCurrentTurn) -> Vec<ChessMove> {
+        moves.as_slice().to_vec()
+    }
+
+    /// Helper: assert that there is exactly one move in `moves` whose
+    /// `from` and `to` match the given indices and whose category
+    /// matches.
+    fn assert_contains_move(
+        moves: &[ChessMove],
+        from_index: u8,
+        to_index: u8,
+        category: ChessMoveCategory,
+        description: &str,
+    ) {
+        let matching_count = moves
+            .iter()
+            .filter(|m| {
+                m.from_square_index == from_index
+                    && m.to_square_index == to_index
+                    && m.move_category == category
+            })
+            .count();
+        assert_eq!(
+            matching_count, 1,
+            "expected exactly one matching move ({}); found {}",
+            description, matching_count
+        );
+    }
+
+    // ---------- Pawn: White ----------
+
+    #[test]
+    fn test_pawn_white_starting_rank_emits_single_and_double_push() {
+        let mut state = make_empty_board_state_for_tests();
+        let e2 = square_index_for_test(4, 1);
+        let e3 = square_index_for_test(4, 2);
+        let e4 = square_index_for_test(4, 3);
+        state.board_squares[e2 as usize] = Some(Piece {
+            piece_color: PieceColor::White,
+            piece_kind: PieceKind::Pawn,
+        });
+
+        let mut moves = LegalMovesForCurrentTurn::new_empty_legal_moves_list();
+        let result = generate_pseudo_legal_pawn_moves(&state, e2, &mut moves);
+        assert!(result.is_ok());
+
+        let collected = collected_moves(&moves);
+        assert_eq!(collected.len(), 2, "expected single push + double push");
+        assert_contains_move(&collected, e2, e3, ChessMoveCategory::Normal, "e2-e3");
+        assert_contains_move(
+            &collected,
+            e2,
+            e4,
+            ChessMoveCategory::DoublePawnPush,
+            "e2-e4",
+        );
+    }
+
+    #[test]
+    fn test_pawn_white_non_starting_rank_single_push_only() {
+        let mut state = make_empty_board_state_for_tests();
+        let e3 = square_index_for_test(4, 2);
+        let e4 = square_index_for_test(4, 3);
+        state.board_squares[e3 as usize] = Some(Piece {
+            piece_color: PieceColor::White,
+            piece_kind: PieceKind::Pawn,
+        });
+
+        let mut moves = LegalMovesForCurrentTurn::new_empty_legal_moves_list();
+        let _ = generate_pseudo_legal_pawn_moves(&state, e3, &mut moves);
+        let collected = collected_moves(&moves);
+        assert_eq!(collected.len(), 1);
+        assert_contains_move(&collected, e3, e4, ChessMoveCategory::Normal, "e3-e4");
+    }
+
+    #[test]
+    fn test_pawn_white_blocked_directly_in_front_no_moves() {
+        let mut state = make_empty_board_state_for_tests();
+        let e2 = square_index_for_test(4, 1);
+        let e3 = square_index_for_test(4, 2);
+        state.board_squares[e2 as usize] = Some(Piece {
+            piece_color: PieceColor::White,
+            piece_kind: PieceKind::Pawn,
+        });
+        state.board_squares[e3 as usize] = Some(Piece {
+            piece_color: PieceColor::White,
+            piece_kind: PieceKind::Knight,
+        });
+
+        let mut moves = LegalMovesForCurrentTurn::new_empty_legal_moves_list();
+        let _ = generate_pseudo_legal_pawn_moves(&state, e2, &mut moves);
+        let collected = collected_moves(&moves);
+        assert_eq!(
+            collected.len(),
+            0,
+            "blocked pawn cannot push or double-push"
+        );
+    }
+
+    #[test]
+    fn test_pawn_white_double_push_blocked_single_push_emitted() {
+        let mut state = make_empty_board_state_for_tests();
+        let e2 = square_index_for_test(4, 1);
+        let e3 = square_index_for_test(4, 2);
+        let e4 = square_index_for_test(4, 3);
+        state.board_squares[e2 as usize] = Some(Piece {
+            piece_color: PieceColor::White,
+            piece_kind: PieceKind::Pawn,
+        });
+        state.board_squares[e4 as usize] = Some(Piece {
+            piece_color: PieceColor::White,
+            piece_kind: PieceKind::Knight,
+        });
+
+        let mut moves = LegalMovesForCurrentTurn::new_empty_legal_moves_list();
+        let _ = generate_pseudo_legal_pawn_moves(&state, e2, &mut moves);
+        let collected = collected_moves(&moves);
+        assert_eq!(collected.len(), 1);
+        assert_contains_move(&collected, e2, e3, ChessMoveCategory::Normal, "e2-e3");
+    }
+
+    #[test]
+    fn test_pawn_white_diagonal_capture() {
+        let mut state = make_empty_board_state_for_tests();
+        let e4 = square_index_for_test(4, 3);
+        let d5 = square_index_for_test(3, 4);
+        let e5 = square_index_for_test(4, 4);
+        state.board_squares[e4 as usize] = Some(Piece {
+            piece_color: PieceColor::White,
+            piece_kind: PieceKind::Pawn,
+        });
+        state.board_squares[d5 as usize] = Some(Piece {
+            piece_color: PieceColor::Black,
+            piece_kind: PieceKind::Pawn,
+        });
+
+        let mut moves = LegalMovesForCurrentTurn::new_empty_legal_moves_list();
+        let _ = generate_pseudo_legal_pawn_moves(&state, e4, &mut moves);
+        let collected = collected_moves(&moves);
+        assert_eq!(collected.len(), 2, "push e5 + capture d5");
+        assert_contains_move(&collected, e4, e5, ChessMoveCategory::Normal, "e4-e5");
+        assert_contains_move(&collected, e4, d5, ChessMoveCategory::Normal, "e4xd5");
+    }
+
+    #[test]
+    fn test_pawn_white_en_passant_capture() {
+        let mut state = make_empty_board_state_for_tests();
+        let e5 = square_index_for_test(4, 4);
+        let d5 = square_index_for_test(3, 4);
+        let d6 = square_index_for_test(3, 5);
+        let e6 = square_index_for_test(4, 5);
+        state.board_squares[e5 as usize] = Some(Piece {
+            piece_color: PieceColor::White,
+            piece_kind: PieceKind::Pawn,
+        });
+        // Black pawn on d5 that just moved from d7-d5 (recorded via
+        // en_passant_target_square = d6).
+        state.board_squares[d5 as usize] = Some(Piece {
+            piece_color: PieceColor::Black,
+            piece_kind: PieceKind::Pawn,
+        });
+        state.en_passant_target_square = Some(d6);
+
+        let mut moves = LegalMovesForCurrentTurn::new_empty_legal_moves_list();
+        let _ = generate_pseudo_legal_pawn_moves(&state, e5, &mut moves);
+        let collected = collected_moves(&moves);
+        // Moves expected: push e6 (Normal), en passant to d6 (EnPassant).
+        assert_eq!(collected.len(), 2);
+        assert_contains_move(&collected, e5, e6, ChessMoveCategory::Normal, "e5-e6");
+        assert_contains_move(&collected, e5, d6, ChessMoveCategory::EnPassant, "e5xd6 ep");
+    }
+
+    #[test]
+    fn test_pawn_white_promotion_push_emits_four_moves() {
+        let mut state = make_empty_board_state_for_tests();
+        let e7 = square_index_for_test(4, 6);
+        let e8 = square_index_for_test(4, 7);
+        state.board_squares[e7 as usize] = Some(Piece {
+            piece_color: PieceColor::White,
+            piece_kind: PieceKind::Pawn,
+        });
+
+        let mut moves = LegalMovesForCurrentTurn::new_empty_legal_moves_list();
+        let _ = generate_pseudo_legal_pawn_moves(&state, e7, &mut moves);
+        let collected = collected_moves(&moves);
+        assert_eq!(collected.len(), 4);
+        for kind in [
+            PieceKind::Queen,
+            PieceKind::Rook,
+            PieceKind::Bishop,
+            PieceKind::Knight,
+        ] {
+            let count = collected
+                .iter()
+                .filter(|m| {
+                    m.from_square_index == e7
+                        && m.to_square_index == e8
+                        && m.move_category == ChessMoveCategory::Promotion
+                        && m.promotion_piece_kind == Some(kind)
+                })
+                .count();
+            assert_eq!(count, 1, "expected one promotion to {:?}", kind);
+        }
+    }
+
+    #[test]
+    fn test_pawn_white_promotion_capture_emits_four_moves_plus_push() {
+        let mut state = make_empty_board_state_for_tests();
+        let e7 = square_index_for_test(4, 6);
+        let d8 = square_index_for_test(3, 7);
+        // Place enemy piece on d8 to enable capture promotion. Leave e8
+        // empty so we also get push promotion.
+        state.board_squares[e7 as usize] = Some(Piece {
+            piece_color: PieceColor::White,
+            piece_kind: PieceKind::Pawn,
+        });
+        state.board_squares[d8 as usize] = Some(Piece {
+            piece_color: PieceColor::Black,
+            piece_kind: PieceKind::Rook,
+        });
+
+        let mut moves = LegalMovesForCurrentTurn::new_empty_legal_moves_list();
+        let _ = generate_pseudo_legal_pawn_moves(&state, e7, &mut moves);
+        let collected = collected_moves(&moves);
+        // 4 push promotions to e8 + 4 capture promotions to d8 = 8.
+        assert_eq!(collected.len(), 8);
+        let captures_to_d8 = collected
+            .iter()
+            .filter(|m| m.to_square_index == d8 && m.move_category == ChessMoveCategory::Promotion)
+            .count();
+        assert_eq!(captures_to_d8, 4);
+    }
+
+    // ---------- Pawn: Black ----------
+
+    #[test]
+    fn test_pawn_black_starting_rank_emits_single_and_double_push() {
+        let mut state = make_empty_board_state_for_tests();
+        let e7 = square_index_for_test(4, 6);
+        let e6 = square_index_for_test(4, 5);
+        let e5 = square_index_for_test(4, 4);
+        state.board_squares[e7 as usize] = Some(Piece {
+            piece_color: PieceColor::Black,
+            piece_kind: PieceKind::Pawn,
+        });
+
+        let mut moves = LegalMovesForCurrentTurn::new_empty_legal_moves_list();
+        let _ = generate_pseudo_legal_pawn_moves(&state, e7, &mut moves);
+        let collected = collected_moves(&moves);
+        assert_eq!(collected.len(), 2);
+        assert_contains_move(&collected, e7, e6, ChessMoveCategory::Normal, "e7-e6");
+        assert_contains_move(
+            &collected,
+            e7,
+            e5,
+            ChessMoveCategory::DoublePawnPush,
+            "e7-e5",
+        );
+    }
+
+    #[test]
+    fn test_pawn_black_promotion_push_emits_four_moves() {
+        let mut state = make_empty_board_state_for_tests();
+        let e2 = square_index_for_test(4, 1);
+        let e1 = square_index_for_test(4, 0);
+        state.board_squares[e2 as usize] = Some(Piece {
+            piece_color: PieceColor::Black,
+            piece_kind: PieceKind::Pawn,
+        });
+
+        let mut moves = LegalMovesForCurrentTurn::new_empty_legal_moves_list();
+        let _ = generate_pseudo_legal_pawn_moves(&state, e2, &mut moves);
+        let collected = collected_moves(&moves);
+        assert_eq!(collected.len(), 4);
+        for kind in [
+            PieceKind::Queen,
+            PieceKind::Rook,
+            PieceKind::Bishop,
+            PieceKind::Knight,
+        ] {
+            let count = collected
+                .iter()
+                .filter(|m| {
+                    m.from_square_index == e2
+                        && m.to_square_index == e1
+                        && m.move_category == ChessMoveCategory::Promotion
+                        && m.promotion_piece_kind == Some(kind)
+                })
+                .count();
+            assert_eq!(count, 1, "expected black promotion to {:?}", kind);
+        }
+    }
+
+    // ---------- Pawn: degenerate cases ----------
+
+    #[test]
+    fn test_pawn_source_square_empty_no_moves() {
+        let state = make_empty_board_state_for_tests();
+        let e2 = square_index_for_test(4, 1);
+        let mut moves = LegalMovesForCurrentTurn::new_empty_legal_moves_list();
+        let _ = generate_pseudo_legal_pawn_moves(&state, e2, &mut moves);
+        assert_eq!(moves.moves_count, 0);
+    }
+
+    #[test]
+    fn test_pawn_source_not_a_pawn_no_moves() {
+        let mut state = make_empty_board_state_for_tests();
+        let e2 = square_index_for_test(4, 1);
+        state.board_squares[e2 as usize] = Some(Piece {
+            piece_color: PieceColor::White,
+            piece_kind: PieceKind::Knight,
+        });
+        let mut moves = LegalMovesForCurrentTurn::new_empty_legal_moves_list();
+        let _ = generate_pseudo_legal_pawn_moves(&state, e2, &mut moves);
+        assert_eq!(moves.moves_count, 0);
+    }
+
+    // ---------- Knight ----------
+
+    #[test]
+    fn test_knight_center_emits_eight_moves() {
+        let mut state = make_empty_board_state_for_tests();
+        let d4 = square_index_for_test(3, 3);
+        state.board_squares[d4 as usize] = Some(Piece {
+            piece_color: PieceColor::White,
+            piece_kind: PieceKind::Knight,
+        });
+
+        let mut moves = LegalMovesForCurrentTurn::new_empty_legal_moves_list();
+        let _ = generate_pseudo_legal_knight_moves(&state, d4, &mut moves);
+        assert_eq!(moves.moves_count, 8);
+
+        // Spot-check a few of the expected targets.
+        let expected_targets: [(u8, u8); 8] = [
+            (1, 2),
+            (1, 4),
+            (2, 1),
+            (2, 5),
+            (4, 1),
+            (4, 5),
+            (5, 2),
+            (5, 4),
+        ];
+        let collected = collected_moves(&moves);
+        for (file_idx, rank_idx) in expected_targets {
+            let target = square_index_for_test(file_idx, rank_idx);
+            assert_contains_move(
+                &collected,
+                d4,
+                target,
+                ChessMoveCategory::Normal,
+                "knight d4 target",
+            );
+        }
+    }
+
+    #[test]
+    fn test_knight_corner_a1_emits_two_moves() {
+        let mut state = make_empty_board_state_for_tests();
+        let a1 = SQUARE_INDEX_A1;
+        state.board_squares[a1 as usize] = Some(Piece {
+            piece_color: PieceColor::White,
+            piece_kind: PieceKind::Knight,
+        });
+
+        let mut moves = LegalMovesForCurrentTurn::new_empty_legal_moves_list();
+        let _ = generate_pseudo_legal_knight_moves(&state, a1, &mut moves);
+        assert_eq!(moves.moves_count, 2);
+        let b3 = square_index_for_test(1, 2);
+        let c2 = square_index_for_test(2, 1);
+        let collected = collected_moves(&moves);
+        assert_contains_move(&collected, a1, b3, ChessMoveCategory::Normal, "Nb3");
+        assert_contains_move(&collected, a1, c2, ChessMoveCategory::Normal, "Nc2");
+    }
+
+    #[test]
+    fn test_knight_blocked_by_friendly_omits_that_square() {
+        let mut state = make_empty_board_state_for_tests();
+        let d4 = square_index_for_test(3, 3);
+        let f5 = square_index_for_test(5, 4);
+        state.board_squares[d4 as usize] = Some(Piece {
+            piece_color: PieceColor::White,
+            piece_kind: PieceKind::Knight,
+        });
+        state.board_squares[f5 as usize] = Some(Piece {
+            piece_color: PieceColor::White,
+            piece_kind: PieceKind::Pawn,
+        });
+
+        let mut moves = LegalMovesForCurrentTurn::new_empty_legal_moves_list();
+        let _ = generate_pseudo_legal_knight_moves(&state, d4, &mut moves);
+        assert_eq!(moves.moves_count, 7);
+        let collected = collected_moves(&moves);
+        let count_to_f5 = collected.iter().filter(|m| m.to_square_index == f5).count();
+        assert_eq!(count_to_f5, 0);
+    }
+
+    #[test]
+    fn test_knight_captures_enemy_on_destination() {
+        let mut state = make_empty_board_state_for_tests();
+        let d4 = square_index_for_test(3, 3);
+        let f5 = square_index_for_test(5, 4);
+        state.board_squares[d4 as usize] = Some(Piece {
+            piece_color: PieceColor::White,
+            piece_kind: PieceKind::Knight,
+        });
+        state.board_squares[f5 as usize] = Some(Piece {
+            piece_color: PieceColor::Black,
+            piece_kind: PieceKind::Pawn,
+        });
+
+        let mut moves = LegalMovesForCurrentTurn::new_empty_legal_moves_list();
+        let _ = generate_pseudo_legal_knight_moves(&state, d4, &mut moves);
+        assert_eq!(moves.moves_count, 8);
+        let collected = collected_moves(&moves);
+        let count_to_f5 = collected.iter().filter(|m| m.to_square_index == f5).count();
+        assert_eq!(count_to_f5, 1, "knight should capture enemy on f5");
+    }
+
+    #[test]
+    fn test_knight_source_not_a_knight_no_moves() {
+        let mut state = make_empty_board_state_for_tests();
+        let d4 = square_index_for_test(3, 3);
+        state.board_squares[d4 as usize] = Some(Piece {
+            piece_color: PieceColor::White,
+            piece_kind: PieceKind::Bishop,
+        });
+        let mut moves = LegalMovesForCurrentTurn::new_empty_legal_moves_list();
+        let _ = generate_pseudo_legal_knight_moves(&state, d4, &mut moves);
+        assert_eq!(moves.moves_count, 0);
+    }
+
+    #[test]
+    fn test_knight_source_square_empty_no_moves() {
+        let state = make_empty_board_state_for_tests();
+        let d4 = square_index_for_test(3, 3);
+        let mut moves = LegalMovesForCurrentTurn::new_empty_legal_moves_list();
+        let _ = generate_pseudo_legal_knight_moves(&state, d4, &mut moves);
+        assert_eq!(moves.moves_count, 0);
+    }
+}
+
+/// Internal helper: emit pseudo-legal sliding moves from
+/// `from_square_index` along each `(file_step, rank_step)` direction in
+/// `directions`. Each ray walks at most 7 steps. Stops at board edge,
+/// at a friendly piece (no emit), or at an enemy piece (emit capture
+/// then stop).
+///
+/// Used by bishop, rook, and queen generators. All emitted moves have
+/// category `ChessMoveCategory::Normal`.
+///
+/// ## Memory & Panic Policy
+///
+/// No heap. No panics. Bounded loop: at most 4 (queen: 8) directions
+/// × 7 steps.
+fn generate_sliding_moves_along_directions(
+    state: &BoardState,
+    from_square_index: u8,
+    moving_color: PieceColor,
+    directions: &[(i16, i16)],
+    output_legal_moves: &mut LegalMovesForCurrentTurn,
+) -> Result<(), MoveValidationError> {
+    // Defensive: out-of-range source index.
+    if (from_square_index as usize) >= BOARD_SQUARE_COUNT {
+        return Ok(());
+    }
+    let from_file_i16: i16 = match file_from_square_index(from_square_index) {
+        Ok(file_zero_to_seven) => file_zero_to_seven as i16,
+        Err(_) => return Ok(()),
+    };
+    let from_rank_i16: i16 = match rank_from_square_index(from_square_index) {
+        Ok(rank_zero_to_seven) => rank_zero_to_seven as i16,
+        Err(_) => return Ok(()),
+    };
+
+    for (file_step_direction, rank_step_direction) in directions {
+        // Walk at most 7 squares along this direction.
+        for step_count in 1_i16..=7_i16 {
+            let target_file = from_file_i16 + file_step_direction * step_count;
+            let target_rank = from_rank_i16 + rank_step_direction * step_count;
+            if target_file < 0 || target_file > 7 || target_rank < 0 || target_rank > 7 {
+                break;
+            }
+            let target_index =
+                match square_index_from_file_and_rank(target_file as u8, target_rank as u8) {
+                    Ok(index) => index,
+                    Err(_) => break,
+                };
+
+            match state.board_squares[target_index as usize] {
+                None => {
+                    // Empty square: emit and continue along ray.
+                    output_legal_moves.push_move(ChessMove {
+                        from_square_index,
+                        to_square_index: target_index,
+                        promotion_piece_kind: None,
+                        move_category: ChessMoveCategory::Normal,
+                    })?;
+                }
+                Some(occupant_piece) => {
+                    // Occupied: emit capture if enemy, then stop in
+                    // either case.
+                    if occupant_piece.piece_color != moving_color {
+                        output_legal_moves.push_move(ChessMove {
+                            from_square_index,
+                            to_square_index: target_index,
+                            promotion_piece_kind: None,
+                            move_category: ChessMoveCategory::Normal,
+                        })?;
+                    }
+                    break;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Append all pseudo-legal bishop moves for the piece at
+/// `from_square_index` to `output_legal_moves`.
+///
+/// Bishops slide along the four diagonals until they hit the board
+/// edge, a friendly piece (stop, do not include the square), or an
+/// enemy piece (stop, do include the square as a capture).
+///
+/// If `from_square_index` does not contain a bishop, the function
+/// appends nothing.
+///
+/// All moves emitted by this function have category
+/// `ChessMoveCategory::Normal`.
+///
+/// ## Memory & Panic Policy
+///
+/// No heap. No panics. Bounded loop (max 7 squares per direction).
+fn generate_pseudo_legal_bishop_moves(
+    state: &BoardState,
+    from_square_index: u8,
+    output_legal_moves: &mut LegalMovesForCurrentTurn,
+) -> Result<(), MoveValidationError> {
+    if (from_square_index as usize) >= BOARD_SQUARE_COUNT {
+        return Ok(());
+    }
+    let bishop_piece = match state.board_squares[from_square_index as usize] {
+        Some(piece) => piece,
+        None => return Ok(()),
+    };
+    if bishop_piece.piece_kind != PieceKind::Bishop {
+        return Ok(());
+    }
+    let diagonal_directions: [(i16, i16); 4] = [(1, 1), (1, -1), (-1, 1), (-1, -1)];
+    generate_sliding_moves_along_directions(
+        state,
+        from_square_index,
+        bishop_piece.piece_color,
+        &diagonal_directions,
+        output_legal_moves,
+    )
+}
+
+/// Append all pseudo-legal rook moves for the piece at
+/// `from_square_index` to `output_legal_moves`.
+///
+/// Rooks slide along the four orthogonal directions (along files
+/// and ranks) until they hit the board edge, a friendly piece, or
+/// an enemy piece (capture).
+///
+/// If `from_square_index` does not contain a rook, the function
+/// appends nothing.
+///
+/// All moves emitted by this function have category
+/// `ChessMoveCategory::Normal`.
+///
+/// ## Memory & Panic Policy
+///
+/// No heap. No panics. Bounded loop (max 7 squares per direction).
+fn generate_pseudo_legal_rook_moves(
+    state: &BoardState,
+    from_square_index: u8,
+    output_legal_moves: &mut LegalMovesForCurrentTurn,
+) -> Result<(), MoveValidationError> {
+    if (from_square_index as usize) >= BOARD_SQUARE_COUNT {
+        return Ok(());
+    }
+    let rook_piece = match state.board_squares[from_square_index as usize] {
+        Some(piece) => piece,
+        None => return Ok(()),
+    };
+    if rook_piece.piece_kind != PieceKind::Rook {
+        return Ok(());
+    }
+    let orthogonal_directions: [(i16, i16); 4] = [(1, 0), (-1, 0), (0, 1), (0, -1)];
+    generate_sliding_moves_along_directions(
+        state,
+        from_square_index,
+        rook_piece.piece_color,
+        &orthogonal_directions,
+        output_legal_moves,
+    )
+}
+
+/// Append all pseudo-legal queen moves for the piece at
+/// `from_square_index` to `output_legal_moves`.
+///
+/// Queens combine bishop and rook movement: eight sliding directions
+/// total.
+///
+/// If `from_square_index` does not contain a queen, the function
+/// appends nothing.
+///
+/// All moves emitted by this function have category
+/// `ChessMoveCategory::Normal`.
+///
+/// ## Memory & Panic Policy
+///
+/// No heap. No panics.
+fn generate_pseudo_legal_queen_moves(
+    state: &BoardState,
+    from_square_index: u8,
+    output_legal_moves: &mut LegalMovesForCurrentTurn,
+) -> Result<(), MoveValidationError> {
+    if (from_square_index as usize) >= BOARD_SQUARE_COUNT {
+        return Ok(());
+    }
+    let queen_piece = match state.board_squares[from_square_index as usize] {
+        Some(piece) => piece,
+        None => return Ok(()),
+    };
+    if queen_piece.piece_kind != PieceKind::Queen {
+        return Ok(());
+    }
+    let queen_directions: [(i16, i16); 8] = [
+        (1, 1),
+        (1, -1),
+        (-1, 1),
+        (-1, -1),
+        (1, 0),
+        (-1, 0),
+        (0, 1),
+        (0, -1),
+    ];
+    generate_sliding_moves_along_directions(
+        state,
+        from_square_index,
+        queen_piece.piece_color,
+        &queen_directions,
+        output_legal_moves,
+    )
+}
+
+#[cfg(test)]
+mod batch_three_tests {
+    use super::*;
+
+    fn make_empty_board_state_for_tests() -> BoardState {
+        BoardState {
+            board_squares: [None; BOARD_SQUARE_COUNT],
+            side_to_move: PieceColor::White,
+            castling_rights: CastlingRights {
+                white_kingside: false,
+                white_queenside: false,
+                black_kingside: false,
+                black_queenside: false,
+            },
+            en_passant_target_square: None,
+            fullmove_number: 1,
+            halfmove_clock: 0,
+            game_status: GameStatus::StillPlaying,
+        }
+    }
+
+    fn square_index_for_test(file_zero_to_seven: u8, rank_zero_to_seven: u8) -> u8 {
+        match square_index_from_file_and_rank(file_zero_to_seven, rank_zero_to_seven) {
+            Ok(index) => index,
+            Err(error) => panic!(
+                "test setup: square_index_from_file_and_rank failed: {:?}",
+                error
+            ),
+        }
+    }
+
+    fn count_moves_to(moves: &LegalMovesForCurrentTurn, target_index: u8) -> usize {
+        moves
+            .as_slice()
+            .iter()
+            .filter(|m| m.to_square_index == target_index)
+            .count()
+    }
+
+    fn move_set_contains(moves: &LegalMovesForCurrentTurn, target_index: u8) -> bool {
+        count_moves_to(moves, target_index) > 0
+    }
+
+    // ---------- Bishop ----------
+
+    #[test]
+    fn test_bishop_d4_empty_board_thirteen_moves() {
+        let mut state = make_empty_board_state_for_tests();
+        let d4 = square_index_for_test(3, 3);
+        state.board_squares[d4 as usize] = Some(Piece {
+            piece_color: PieceColor::White,
+            piece_kind: PieceKind::Bishop,
+        });
+
+        let mut moves = LegalMovesForCurrentTurn::new_empty_legal_moves_list();
+        let result = generate_pseudo_legal_bishop_moves(&state, d4, &mut moves);
+        assert!(result.is_ok());
+        // 4 (NE: e5,f6,g7,h8) + 3 (NW: c5,b6,a7) + 3 (SE: e3,f2,g1) + 3 (SW: c3,b2,a1) = 13
+        assert_eq!(moves.moves_count, 13);
+
+        // Spot-check the four ray endpoints.
+        for (file_idx, rank_idx) in [(7, 7), (0, 6), (6, 0), (0, 0)] {
+            let target = square_index_for_test(file_idx, rank_idx);
+            assert!(
+                move_set_contains(&moves, target),
+                "bishop d4 should reach ({},{})",
+                file_idx,
+                rank_idx
+            );
+        }
+    }
+
+    #[test]
+    fn test_bishop_corner_a1_emits_seven_moves() {
+        let mut state = make_empty_board_state_for_tests();
+        let a1 = SQUARE_INDEX_A1;
+        state.board_squares[a1 as usize] = Some(Piece {
+            piece_color: PieceColor::White,
+            piece_kind: PieceKind::Bishop,
+        });
+
+        let mut moves = LegalMovesForCurrentTurn::new_empty_legal_moves_list();
+        let _ = generate_pseudo_legal_bishop_moves(&state, a1, &mut moves);
+        // Only the NE diagonal is on the board: b2,c3,d4,e5,f6,g7,h8 = 7
+        assert_eq!(moves.moves_count, 7);
+    }
+
+    #[test]
+    fn test_bishop_blocked_by_friendly_piece() {
+        let mut state = make_empty_board_state_for_tests();
+        let d4 = square_index_for_test(3, 3);
+        let f6 = square_index_for_test(5, 5);
+        state.board_squares[d4 as usize] = Some(Piece {
+            piece_color: PieceColor::White,
+            piece_kind: PieceKind::Bishop,
+        });
+        state.board_squares[f6 as usize] = Some(Piece {
+            piece_color: PieceColor::White,
+            piece_kind: PieceKind::Knight,
+        });
+
+        let mut moves = LegalMovesForCurrentTurn::new_empty_legal_moves_list();
+        let _ = generate_pseudo_legal_bishop_moves(&state, d4, &mut moves);
+
+        // NE direction: only e5 is reachable (f6 friendly blocks).
+        let e5 = square_index_for_test(4, 4);
+        let g7 = square_index_for_test(6, 6);
+        let h8 = square_index_for_test(7, 7);
+        assert!(move_set_contains(&moves, e5));
+        assert!(!move_set_contains(&moves, f6), "blocked by friendly");
+        assert!(!move_set_contains(&moves, g7));
+        assert!(!move_set_contains(&moves, h8));
+
+        // Total: 1 (NE) + 3 (NW) + 3 (SE) + 3 (SW) = 10
+        assert_eq!(moves.moves_count, 10);
+    }
+
+    #[test]
+    fn test_bishop_captures_enemy_then_stops() {
+        let mut state = make_empty_board_state_for_tests();
+        let d4 = square_index_for_test(3, 3);
+        let f6 = square_index_for_test(5, 5);
+        state.board_squares[d4 as usize] = Some(Piece {
+            piece_color: PieceColor::White,
+            piece_kind: PieceKind::Bishop,
+        });
+        state.board_squares[f6 as usize] = Some(Piece {
+            piece_color: PieceColor::Black,
+            piece_kind: PieceKind::Knight,
+        });
+
+        let mut moves = LegalMovesForCurrentTurn::new_empty_legal_moves_list();
+        let _ = generate_pseudo_legal_bishop_moves(&state, d4, &mut moves);
+
+        let e5 = square_index_for_test(4, 4);
+        let g7 = square_index_for_test(6, 6);
+        assert!(move_set_contains(&moves, e5));
+        assert!(move_set_contains(&moves, f6), "should capture enemy on f6");
+        assert!(!move_set_contains(&moves, g7), "ray stops at capture");
+
+        // Total: 2 (NE: e5, f6 capture) + 3 + 3 + 3 = 11
+        assert_eq!(moves.moves_count, 11);
+    }
+
+    #[test]
+    fn test_bishop_source_not_bishop_no_moves() {
+        let mut state = make_empty_board_state_for_tests();
+        let d4 = square_index_for_test(3, 3);
+        state.board_squares[d4 as usize] = Some(Piece {
+            piece_color: PieceColor::White,
+            piece_kind: PieceKind::Rook,
+        });
+        let mut moves = LegalMovesForCurrentTurn::new_empty_legal_moves_list();
+        let _ = generate_pseudo_legal_bishop_moves(&state, d4, &mut moves);
+        assert_eq!(moves.moves_count, 0);
+    }
+
+    #[test]
+    fn test_bishop_source_empty_no_moves() {
+        let state = make_empty_board_state_for_tests();
+        let d4 = square_index_for_test(3, 3);
+        let mut moves = LegalMovesForCurrentTurn::new_empty_legal_moves_list();
+        let _ = generate_pseudo_legal_bishop_moves(&state, d4, &mut moves);
+        assert_eq!(moves.moves_count, 0);
+    }
+
+    // ---------- Rook ----------
+
+    #[test]
+    fn test_rook_d4_empty_board_fourteen_moves() {
+        let mut state = make_empty_board_state_for_tests();
+        let d4 = square_index_for_test(3, 3);
+        state.board_squares[d4 as usize] = Some(Piece {
+            piece_color: PieceColor::White,
+            piece_kind: PieceKind::Rook,
+        });
+
+        let mut moves = LegalMovesForCurrentTurn::new_empty_legal_moves_list();
+        let _ = generate_pseudo_legal_rook_moves(&state, d4, &mut moves);
+        // N: d5,d6,d7,d8 = 4; S: d3,d2,d1 = 3; E: e4..h4 = 4; W: c4,b4,a4 = 3. Total 14.
+        assert_eq!(moves.moves_count, 14);
+    }
+
+    #[test]
+    fn test_rook_blocked_by_friendly() {
+        let mut state = make_empty_board_state_for_tests();
+        let d4 = square_index_for_test(3, 3);
+        let d6 = square_index_for_test(3, 5);
+        state.board_squares[d4 as usize] = Some(Piece {
+            piece_color: PieceColor::White,
+            piece_kind: PieceKind::Rook,
+        });
+        state.board_squares[d6 as usize] = Some(Piece {
+            piece_color: PieceColor::White,
+            piece_kind: PieceKind::Pawn,
+        });
+
+        let mut moves = LegalMovesForCurrentTurn::new_empty_legal_moves_list();
+        let _ = generate_pseudo_legal_rook_moves(&state, d4, &mut moves);
+
+        let d5 = square_index_for_test(3, 4);
+        let d7 = square_index_for_test(3, 6);
+        let d8 = square_index_for_test(3, 7);
+        assert!(move_set_contains(&moves, d5));
+        assert!(!move_set_contains(&moves, d6), "blocked by friendly");
+        assert!(!move_set_contains(&moves, d7));
+        assert!(!move_set_contains(&moves, d8));
+        // N now contributes only 1 (d5). Total: 1 + 3 + 4 + 3 = 11.
+        assert_eq!(moves.moves_count, 11);
+    }
+
+    #[test]
+    fn test_rook_captures_enemy_then_stops() {
+        let mut state = make_empty_board_state_for_tests();
+        let d4 = square_index_for_test(3, 3);
+        let d6 = square_index_for_test(3, 5);
+        state.board_squares[d4 as usize] = Some(Piece {
+            piece_color: PieceColor::White,
+            piece_kind: PieceKind::Rook,
+        });
+        state.board_squares[d6 as usize] = Some(Piece {
+            piece_color: PieceColor::Black,
+            piece_kind: PieceKind::Pawn,
+        });
+
+        let mut moves = LegalMovesForCurrentTurn::new_empty_legal_moves_list();
+        let _ = generate_pseudo_legal_rook_moves(&state, d4, &mut moves);
+
+        let d5 = square_index_for_test(3, 4);
+        let d7 = square_index_for_test(3, 6);
+        assert!(move_set_contains(&moves, d5));
+        assert!(move_set_contains(&moves, d6));
+        assert!(!move_set_contains(&moves, d7));
+        // N contributes 2 (d5, d6 capture). Total: 2 + 3 + 4 + 3 = 12.
+        assert_eq!(moves.moves_count, 12);
+    }
+
+    #[test]
+    fn test_rook_source_not_rook_no_moves() {
+        let mut state = make_empty_board_state_for_tests();
+        let d4 = square_index_for_test(3, 3);
+        state.board_squares[d4 as usize] = Some(Piece {
+            piece_color: PieceColor::White,
+            piece_kind: PieceKind::Bishop,
+        });
+        let mut moves = LegalMovesForCurrentTurn::new_empty_legal_moves_list();
+        let _ = generate_pseudo_legal_rook_moves(&state, d4, &mut moves);
+        assert_eq!(moves.moves_count, 0);
+    }
+
+    #[test]
+    fn test_rook_source_empty_no_moves() {
+        let state = make_empty_board_state_for_tests();
+        let d4 = square_index_for_test(3, 3);
+        let mut moves = LegalMovesForCurrentTurn::new_empty_legal_moves_list();
+        let _ = generate_pseudo_legal_rook_moves(&state, d4, &mut moves);
+        assert_eq!(moves.moves_count, 0);
+    }
+
+    // ---------- Queen ----------
+
+    #[test]
+    fn test_queen_d4_empty_board_twenty_seven_moves() {
+        let mut state = make_empty_board_state_for_tests();
+        let d4 = square_index_for_test(3, 3);
+        state.board_squares[d4 as usize] = Some(Piece {
+            piece_color: PieceColor::White,
+            piece_kind: PieceKind::Queen,
+        });
+
+        let mut moves = LegalMovesForCurrentTurn::new_empty_legal_moves_list();
+        let _ = generate_pseudo_legal_queen_moves(&state, d4, &mut moves);
+        // Bishop (13) + Rook (14) = 27.
+        assert_eq!(moves.moves_count, 27);
+    }
+
+    #[test]
+    fn test_queen_blocked_in_multiple_directions() {
+        let mut state = make_empty_board_state_for_tests();
+        let d4 = square_index_for_test(3, 3);
+        let d6 = square_index_for_test(3, 5);
+        let f6 = square_index_for_test(5, 5);
+        state.board_squares[d4 as usize] = Some(Piece {
+            piece_color: PieceColor::White,
+            piece_kind: PieceKind::Queen,
+        });
+        // Friendly blockers along N (d6) and NE (f6).
+        state.board_squares[d6 as usize] = Some(Piece {
+            piece_color: PieceColor::White,
+            piece_kind: PieceKind::Pawn,
+        });
+        state.board_squares[f6 as usize] = Some(Piece {
+            piece_color: PieceColor::White,
+            piece_kind: PieceKind::Pawn,
+        });
+
+        let mut moves = LegalMovesForCurrentTurn::new_empty_legal_moves_list();
+        let _ = generate_pseudo_legal_queen_moves(&state, d4, &mut moves);
+
+        // Direction tallies:
+        //   N:  d5 only (d6 friendly blocks)        = 1
+        //   S:  d1,d2,d3                            = 3
+        //   E:  e4,f4,g4,h4                         = 4
+        //   W:  a4,b4,c4                            = 3
+        //   NE: e5 only (f6 friendly blocks)        = 1
+        //   NW: a7,b6,c5                            = 3
+        //   SE: e3,f2,g1                            = 3
+        //   SW: a1,b2,c3                            = 3
+        // Total: 21
+        assert_eq!(moves.moves_count, 21);
+    }
+
+    #[test]
+    fn test_queen_source_not_queen_no_moves() {
+        let mut state = make_empty_board_state_for_tests();
+        let d4 = square_index_for_test(3, 3);
+        state.board_squares[d4 as usize] = Some(Piece {
+            piece_color: PieceColor::White,
+            piece_kind: PieceKind::Rook,
+        });
+        let mut moves = LegalMovesForCurrentTurn::new_empty_legal_moves_list();
+        let _ = generate_pseudo_legal_queen_moves(&state, d4, &mut moves);
+        assert_eq!(moves.moves_count, 0);
+    }
+
+    #[test]
+    fn test_queen_source_empty_no_moves() {
+        let state = make_empty_board_state_for_tests();
+        let d4 = square_index_for_test(3, 3);
+        let mut moves = LegalMovesForCurrentTurn::new_empty_legal_moves_list();
+        let _ = generate_pseudo_legal_queen_moves(&state, d4, &mut moves);
+        assert_eq!(moves.moves_count, 0);
+    }
+}
+
+/// Append all pseudo-legal king moves for the piece at
+/// `from_square_index` to `output_legal_moves`. Includes the eight
+/// one-square king moves AND castling moves when the king has not
+/// moved and the relevant castling rights are intact.
+///
+/// For castling, this function checks:
+///   - The relevant castling-rights flag is `true`.
+///   - The squares between the king and the rook are empty.
+///   - The king is not currently in check.
+///   - The king does not pass through an attacked square.
+///   - The king does not land on an attacked square.
+///
+/// If all conditions are met, emit a move with category
+/// `ChessMoveCategory::CastleKingside` or `ChessMoveCategory::CastleQueenside`.
+/// The `to_square_index` is the king's final square (g1/g8 for
+/// kingside, c1/c8 for queenside).
+///
+/// If `from_square_index` does not contain a king, the function
+/// appends nothing.
+///
+/// ## Memory & Panic Policy
+///
+/// No heap. No panics.
+fn generate_pseudo_legal_king_moves(
+    state: &BoardState,
+    from_square_index: u8,
+    output_legal_moves: &mut LegalMovesForCurrentTurn,
+) -> Result<(), MoveValidationError> {
+    if (from_square_index as usize) >= BOARD_SQUARE_COUNT {
+        return Ok(());
+    }
+    let king_piece = match state.board_squares[from_square_index as usize] {
+        Some(piece) => piece,
+        None => return Ok(()),
+    };
+    if king_piece.piece_kind != PieceKind::King {
+        return Ok(());
+    }
+    let king_color = king_piece.piece_color;
+    let enemy_color = king_color.opposite_color();
+
+    let from_file_i16: i16 = match file_from_square_index(from_square_index) {
+        Ok(file_zero_to_seven) => file_zero_to_seven as i16,
+        Err(_) => return Ok(()),
+    };
+    let from_rank_i16: i16 = match rank_from_square_index(from_square_index) {
+        Ok(rank_zero_to_seven) => rank_zero_to_seven as i16,
+        Err(_) => return Ok(()),
+    };
+
+    // ----- Eight one-square moves -----
+    let king_offsets: [(i16, i16); 8] = [
+        (-1, -1),
+        (-1, 0),
+        (-1, 1),
+        (0, -1),
+        (0, 1),
+        (1, -1),
+        (1, 0),
+        (1, 1),
+    ];
+    for (file_offset, rank_offset) in king_offsets {
+        let destination_file = from_file_i16 + file_offset;
+        let destination_rank = from_rank_i16 + rank_offset;
+        if destination_file < 0
+            || destination_file > 7
+            || destination_rank < 0
+            || destination_rank > 7
+        {
+            continue;
+        }
+        let destination_index =
+            match square_index_from_file_and_rank(destination_file as u8, destination_rank as u8) {
+                Ok(index) => index,
+                Err(_) => continue,
+            };
+        if let Some(destination_piece) = state.board_squares[destination_index as usize] {
+            if destination_piece.piece_color == king_color {
+                continue;
+            }
+        }
+        output_legal_moves.push_move(ChessMove {
+            from_square_index,
+            to_square_index: destination_index,
+            promotion_piece_kind: None,
+            move_category: ChessMoveCategory::Normal,
+        })?;
+    }
+
+    // ----- Castling -----
+    //
+    // Castling is only possible if the king is on its starting square.
+    // If castling rights are correctly maintained this is redundant,
+    // but as a defensive check it prevents stale rights from emitting
+    // an illegal castle.
+    let (king_starting_square, kingside_right, queenside_right, home_rank): (u8, bool, bool, u8) =
+        match king_color {
+            PieceColor::White => (
+                SQUARE_INDEX_E1,
+                state.castling_rights.white_kingside,
+                state.castling_rights.white_queenside,
+                0,
+            ),
+            PieceColor::Black => (
+                SQUARE_INDEX_E8,
+                state.castling_rights.black_kingside,
+                state.castling_rights.black_queenside,
+                7,
+            ),
+        };
+    if from_square_index != king_starting_square {
+        return Ok(());
+    }
+
+    // Resolve the relevant square indices for this color's back rank.
+    let f_file_square = match square_index_from_file_and_rank(5, home_rank) {
+        Ok(index) => index,
+        Err(_) => return Ok(()),
+    };
+    let g_file_square = match square_index_from_file_and_rank(6, home_rank) {
+        Ok(index) => index,
+        Err(_) => return Ok(()),
+    };
+    let d_file_square = match square_index_from_file_and_rank(3, home_rank) {
+        Ok(index) => index,
+        Err(_) => return Ok(()),
+    };
+    let c_file_square = match square_index_from_file_and_rank(2, home_rank) {
+        Ok(index) => index,
+        Err(_) => return Ok(()),
+    };
+    let b_file_square = match square_index_from_file_and_rank(1, home_rank) {
+        Ok(index) => index,
+        Err(_) => return Ok(()),
+    };
+
+    // Compute "king is currently in check" once; used by both castle
+    // attempts.
+    let king_currently_in_check =
+        is_square_attacked_by_color(state, from_square_index, enemy_color);
+
+    // Kingside: king passes f, lands g. f and g must be empty AND
+    // unattacked.
+    if kingside_right
+        && state.board_squares[f_file_square as usize].is_none()
+        && state.board_squares[g_file_square as usize].is_none()
+        && !king_currently_in_check
+        && !is_square_attacked_by_color(state, f_file_square, enemy_color)
+        && !is_square_attacked_by_color(state, g_file_square, enemy_color)
+    {
+        output_legal_moves.push_move(ChessMove {
+            from_square_index,
+            to_square_index: g_file_square,
+            promotion_piece_kind: None,
+            move_category: ChessMoveCategory::CastleKingside,
+        })?;
+    }
+
+    // Queenside: king passes d, lands c. d and c must be empty AND
+    // unattacked. b must be empty (rook traverses) but is NOT
+    // attack-checked.
+    if queenside_right
+        && state.board_squares[d_file_square as usize].is_none()
+        && state.board_squares[c_file_square as usize].is_none()
+        && state.board_squares[b_file_square as usize].is_none()
+        && !king_currently_in_check
+        && !is_square_attacked_by_color(state, d_file_square, enemy_color)
+        && !is_square_attacked_by_color(state, c_file_square, enemy_color)
+    {
+        output_legal_moves.push_move(ChessMove {
+            from_square_index,
+            to_square_index: c_file_square,
+            promotion_piece_kind: None,
+            move_category: ChessMoveCategory::CastleQueenside,
+        })?;
+    }
+
+    Ok(())
+}
+
+/// Same as `apply_chess_move_to_state` but skips step 9 (the
+/// game-status update). Used internally by
+/// `generate_all_legal_moves_for_current_turn` during the king-in-check
+/// filtering step, to avoid the mutual recursion that would otherwise
+/// arise.
+///
+/// Returns a `BoardState` with `game_status` set to `StillPlaying`
+/// regardless of whether the new position is actually checkmate or
+/// stalemate. The caller must not rely on `game_status` of the
+/// returned state.
+///
+/// ## Memory & Panic Policy
+///
+/// No heap. No panics.
+fn apply_chess_move_to_state_without_status_update(
+    state: &BoardState,
+    chess_move: &ChessMove,
+) -> Result<BoardState, MoveValidationError> {
+    // ----- Bounds checks: the only error this function returns -----
+    if (chess_move.from_square_index as usize) >= BOARD_SQUARE_COUNT
+        || (chess_move.to_square_index as usize) >= BOARD_SQUARE_COUNT
+    {
+        return Err(MoveValidationError::InternalIndexOutOfBounds);
+    }
+    let from_index_usize = chess_move.from_square_index as usize;
+    let to_index_usize = chess_move.to_square_index as usize;
+
+    // Read the moving piece. If the source is empty (caller-contract
+    // violation), return the state unchanged. The spec restricts the
+    // error vocabulary, so we do not raise a new error variant here.
+    let moving_piece = match state.board_squares[from_index_usize] {
+        Some(piece) => piece,
+        None => return Ok(*state),
+    };
+
+    // Detect whether this move is a capture, for the halfmove-clock
+    // update. A capture is: target square occupied (regular capture),
+    // OR move category is EnPassant.
+    let target_square_occupant_before_move = state.board_squares[to_index_usize];
+    let move_is_capture = target_square_occupant_before_move.is_some()
+        || chess_move.move_category == ChessMoveCategory::EnPassant;
+
+    // Start with a copy of the input state. BoardState is Copy.
+    let mut new_state = *state;
+
+    // ----- Step 1: move the piece on the board -----
+    new_state.board_squares[from_index_usize] = None;
+    new_state.board_squares[to_index_usize] = Some(moving_piece);
+
+    // ----- Step 2: handle special move categories -----
+    match chess_move.move_category {
+        ChessMoveCategory::Normal | ChessMoveCategory::DoublePawnPush => {
+            // No extra board manipulation here. The en-passant target
+            // square update for DoublePawnPush is handled in step 5.
+        }
+        ChessMoveCategory::CastleKingside => {
+            // Move the rook from the h-file home to the f-file
+            // (next to the king's landing square).
+            let home_rank: u8 = match moving_piece.piece_color {
+                PieceColor::White => 0,
+                PieceColor::Black => 7,
+            };
+            let rook_from_square = match square_index_from_file_and_rank(7, home_rank) {
+                Ok(index) => index,
+                Err(_) => return Err(MoveValidationError::InternalIndexOutOfBounds),
+            };
+            let rook_to_square = match square_index_from_file_and_rank(5, home_rank) {
+                Ok(index) => index,
+                Err(_) => return Err(MoveValidationError::InternalIndexOutOfBounds),
+            };
+            let rook_piece_option = new_state.board_squares[rook_from_square as usize];
+            new_state.board_squares[rook_from_square as usize] = None;
+            new_state.board_squares[rook_to_square as usize] = rook_piece_option;
+        }
+        ChessMoveCategory::CastleQueenside => {
+            let home_rank: u8 = match moving_piece.piece_color {
+                PieceColor::White => 0,
+                PieceColor::Black => 7,
+            };
+            let rook_from_square = match square_index_from_file_and_rank(0, home_rank) {
+                Ok(index) => index,
+                Err(_) => return Err(MoveValidationError::InternalIndexOutOfBounds),
+            };
+            let rook_to_square = match square_index_from_file_and_rank(3, home_rank) {
+                Ok(index) => index,
+                Err(_) => return Err(MoveValidationError::InternalIndexOutOfBounds),
+            };
+            let rook_piece_option = new_state.board_squares[rook_from_square as usize];
+            new_state.board_squares[rook_from_square as usize] = None;
+            new_state.board_squares[rook_to_square as usize] = rook_piece_option;
+        }
+        ChessMoveCategory::EnPassant => {
+            // Remove the captured pawn from the square adjacent to
+            // the en-passant target. The captured pawn sits one rank
+            // "behind" the to-square relative to the mover's
+            // direction of advance.
+            let to_file = match file_from_square_index(chess_move.to_square_index) {
+                Ok(file_zero_to_seven) => file_zero_to_seven,
+                Err(_) => return Err(MoveValidationError::InternalIndexOutOfBounds),
+            };
+            let to_rank = match rank_from_square_index(chess_move.to_square_index) {
+                Ok(rank_zero_to_seven) => rank_zero_to_seven,
+                Err(_) => return Err(MoveValidationError::InternalIndexOutOfBounds),
+            };
+            let captured_pawn_rank_i16: i16 = match moving_piece.piece_color {
+                PieceColor::White => (to_rank as i16) - 1,
+                PieceColor::Black => (to_rank as i16) + 1,
+            };
+            if captured_pawn_rank_i16 < 0 || captured_pawn_rank_i16 > 7 {
+                return Err(MoveValidationError::InternalIndexOutOfBounds);
+            }
+            let captured_pawn_index =
+                match square_index_from_file_and_rank(to_file, captured_pawn_rank_i16 as u8) {
+                    Ok(index) => index,
+                    Err(_) => return Err(MoveValidationError::InternalIndexOutOfBounds),
+                };
+            new_state.board_squares[captured_pawn_index as usize] = None;
+        }
+        ChessMoveCategory::Promotion => {
+            // Replace the moved pawn with the promoted piece (same
+            // color). Defensive default to Queen if the promotion
+            // kind was not specified — a caller-contract violation
+            // not represented in this function's error vocabulary.
+            let promotion_kind = match chess_move.promotion_piece_kind {
+                Some(kind) => kind,
+                None => PieceKind::Queen,
+            };
+            new_state.board_squares[to_index_usize] = Some(Piece {
+                piece_color: moving_piece.piece_color,
+                piece_kind: promotion_kind,
+            });
+        }
+    }
+
+    // ----- Step 3: update castling rights -----
+    //
+    // Rule: "corner-touched" — any move whose from or to square is a
+    // corner (a1/h1/a8/h8) clears the matching castling right. This
+    // subsumes both "rook moved from home" and "rook captured on
+    // home". Additionally, if the moving piece is a king, both
+    // castling rights for that color are cleared regardless of
+    // destination.
+    if moving_piece.piece_kind == PieceKind::King {
+        match moving_piece.piece_color {
+            PieceColor::White => {
+                new_state.castling_rights.white_kingside = false;
+                new_state.castling_rights.white_queenside = false;
+            }
+            PieceColor::Black => {
+                new_state.castling_rights.black_kingside = false;
+                new_state.castling_rights.black_queenside = false;
+            }
+        }
+    }
+    let from_u8 = chess_move.from_square_index;
+    let to_u8 = chess_move.to_square_index;
+    if from_u8 == SQUARE_INDEX_A1 || to_u8 == SQUARE_INDEX_A1 {
+        new_state.castling_rights.white_queenside = false;
+    }
+    if from_u8 == SQUARE_INDEX_H1 || to_u8 == SQUARE_INDEX_H1 {
+        new_state.castling_rights.white_kingside = false;
+    }
+    if from_u8 == SQUARE_INDEX_A8 || to_u8 == SQUARE_INDEX_A8 {
+        new_state.castling_rights.black_queenside = false;
+    }
+    if from_u8 == SQUARE_INDEX_H8 || to_u8 == SQUARE_INDEX_H8 {
+        new_state.castling_rights.black_kingside = false;
+    }
+
+    // ----- Steps 4–5: update en-passant target square -----
+    new_state.en_passant_target_square = None;
+    if chess_move.move_category == ChessMoveCategory::DoublePawnPush {
+        let from_rank = match rank_from_square_index(chess_move.from_square_index) {
+            Ok(rank_zero_to_seven) => rank_zero_to_seven,
+            Err(_) => return Err(MoveValidationError::InternalIndexOutOfBounds),
+        };
+        let to_rank = match rank_from_square_index(chess_move.to_square_index) {
+            Ok(rank_zero_to_seven) => rank_zero_to_seven,
+            Err(_) => return Err(MoveValidationError::InternalIndexOutOfBounds),
+        };
+        let to_file = match file_from_square_index(chess_move.to_square_index) {
+            Ok(file_zero_to_seven) => file_zero_to_seven,
+            Err(_) => return Err(MoveValidationError::InternalIndexOutOfBounds),
+        };
+        // The skipped square is the rank halfway between from and to.
+        let skipped_rank: u8 = (from_rank + to_rank) / 2;
+        let skipped_square = match square_index_from_file_and_rank(to_file, skipped_rank) {
+            Ok(index) => index,
+            Err(_) => return Err(MoveValidationError::InternalIndexOutOfBounds),
+        };
+        new_state.en_passant_target_square = Some(skipped_square);
+    }
+
+    // ----- Step 6: flip side to move -----
+    let original_side_to_move = state.side_to_move;
+    new_state.side_to_move = original_side_to_move.opposite_color();
+
+    // ----- Step 7: fullmove number -----
+    // Incremented after Black moves (i.e., when the original side
+    // was Black). Use saturating_add to avoid u16 overflow on
+    // pathological inputs.
+    if original_side_to_move == PieceColor::Black {
+        new_state.fullmove_number = new_state.fullmove_number.saturating_add(1);
+    }
+
+    // ----- Step 8: halfmove clock -----
+    if moving_piece.piece_kind == PieceKind::Pawn || move_is_capture {
+        new_state.halfmove_clock = 0;
+    } else {
+        new_state.halfmove_clock = new_state.halfmove_clock.saturating_add(1);
+    }
+
+    // ----- Step 9 (deferred): status remains StillPlaying. -----
+    // This is the without-status variant. The with-status variant
+    // (Batch 5) sets game_status based on legal-move availability
+    // and king-in-check after the move.
+    new_state.game_status = GameStatus::StillPlaying;
+
+    Ok(new_state)
+}
+
+/// Generate all legal moves for `state.side_to_move` in the given
+/// position. Returns a fully populated `LegalMovesForCurrentTurn`.
+///
+/// Implementation:
+///   1. Iterate the 64 board squares. For each square containing a
+///      piece of `state.side_to_move`, call the appropriate
+///      `generate_pseudo_legal_<kind>_moves` helper to append
+///      pseudo-legal moves to a working buffer.
+///   2. Filter the pseudo-legal buffer: for each candidate move,
+///      simulate it via `apply_chess_move_to_state_without_status_update`
+///      and check whether the resulting position leaves the moving
+///      side's king in check via `is_king_currently_in_check`. If yes,
+///      drop the move. Otherwise, keep it.
+///   3. Return the filtered list.
+///
+/// ## Memory & Panic Policy
+///
+/// No heap. No panics. Stack-only.
+pub fn generate_all_legal_moves_for_current_turn(
+    state: &BoardState,
+) -> Result<LegalMovesForCurrentTurn, MoveValidationError> {
+    // Step 1: collect pseudo-legal moves.
+    let mut pseudo_legal_moves = LegalMovesForCurrentTurn::new_empty_legal_moves_list();
+    for square_index in 0..(BOARD_SQUARE_COUNT as u8) {
+        let piece_at_square = match state.board_squares[square_index as usize] {
+            Some(piece) => piece,
+            None => continue,
+        };
+        if piece_at_square.piece_color != state.side_to_move {
+            continue;
+        }
+        match piece_at_square.piece_kind {
+            PieceKind::Pawn => {
+                generate_pseudo_legal_pawn_moves(state, square_index, &mut pseudo_legal_moves)?
+            }
+            PieceKind::Knight => {
+                generate_pseudo_legal_knight_moves(state, square_index, &mut pseudo_legal_moves)?
+            }
+            PieceKind::Bishop => {
+                generate_pseudo_legal_bishop_moves(state, square_index, &mut pseudo_legal_moves)?
+            }
+            PieceKind::Rook => {
+                generate_pseudo_legal_rook_moves(state, square_index, &mut pseudo_legal_moves)?
+            }
+            PieceKind::Queen => {
+                generate_pseudo_legal_queen_moves(state, square_index, &mut pseudo_legal_moves)?
+            }
+            PieceKind::King => {
+                generate_pseudo_legal_king_moves(state, square_index, &mut pseudo_legal_moves)?
+            }
+        }
+    }
+
+    // Step 2: filter pseudo-legal moves by the king-in-check rule.
+    let mut legal_moves = LegalMovesForCurrentTurn::new_empty_legal_moves_list();
+    let moving_color = state.side_to_move;
+    let pseudo_count_usize = pseudo_legal_moves.moves_count as usize;
+    // Bounded loop over the buffer.
+    for candidate_index in 0..pseudo_count_usize {
+        let candidate_move = pseudo_legal_moves.moves_buffer[candidate_index];
+        let simulated_state =
+            apply_chess_move_to_state_without_status_update(state, &candidate_move)?;
+        if !is_king_currently_in_check(&simulated_state, moving_color) {
+            legal_moves.push_move(candidate_move)?;
+        }
+    }
+
+    Ok(legal_moves)
+}
+
+#[cfg(test)]
+mod batch_four_tests {
+    use super::*;
+
+    fn make_empty_board_state_for_tests() -> BoardState {
+        BoardState {
+            board_squares: [None; BOARD_SQUARE_COUNT],
+            side_to_move: PieceColor::White,
+            castling_rights: CastlingRights {
+                white_kingside: false,
+                white_queenside: false,
+                black_kingside: false,
+                black_queenside: false,
+            },
+            en_passant_target_square: None,
+            fullmove_number: 1,
+            halfmove_clock: 0,
+            game_status: GameStatus::StillPlaying,
+        }
+    }
+
+    fn square_index_for_test(file_zero_to_seven: u8, rank_zero_to_seven: u8) -> u8 {
+        match square_index_from_file_and_rank(file_zero_to_seven, rank_zero_to_seven) {
+            Ok(index) => index,
+            Err(error) => panic!(
+                "test setup: square_index_from_file_and_rank failed: {:?}",
+                error
+            ),
+        }
+    }
+
+    fn move_set_contains_with_category(
+        moves: &LegalMovesForCurrentTurn,
+        from_index: u8,
+        to_index: u8,
+        category: ChessMoveCategory,
+    ) -> bool {
+        moves.as_slice().iter().any(|m| {
+            m.from_square_index == from_index
+                && m.to_square_index == to_index
+                && m.move_category == category
+        })
+    }
+
+    // ====================================================
+    // King move generator
+    // ====================================================
+
+    #[test]
+    fn test_king_e1_no_castling_rights_five_moves() {
+        let mut state = make_empty_board_state_for_tests();
+        let e1 = SQUARE_INDEX_E1;
+        state.board_squares[e1 as usize] = Some(Piece {
+            piece_color: PieceColor::White,
+            piece_kind: PieceKind::King,
+        });
+        let mut moves = LegalMovesForCurrentTurn::new_empty_legal_moves_list();
+        let _ = generate_pseudo_legal_king_moves(&state, e1, &mut moves);
+        // Neighbors of e1 (idx 4): d1, d2, e2, f1, f2 = 5
+        assert_eq!(moves.moves_count, 5);
+    }
+
+    #[test]
+    fn test_king_e4_center_eight_moves() {
+        let mut state = make_empty_board_state_for_tests();
+        let e4 = square_index_for_test(4, 3);
+        state.board_squares[e4 as usize] = Some(Piece {
+            piece_color: PieceColor::White,
+            piece_kind: PieceKind::King,
+        });
+        let mut moves = LegalMovesForCurrentTurn::new_empty_legal_moves_list();
+        let _ = generate_pseudo_legal_king_moves(&state, e4, &mut moves);
+        assert_eq!(moves.moves_count, 8);
+    }
+
+    #[test]
+    fn test_king_castle_kingside_emitted_when_legal() {
+        let mut state = make_empty_board_state_for_tests();
+        let e1 = SQUARE_INDEX_E1;
+        let h1 = SQUARE_INDEX_H1;
+        let g1 = square_index_for_test(6, 0);
+        state.board_squares[e1 as usize] = Some(Piece {
+            piece_color: PieceColor::White,
+            piece_kind: PieceKind::King,
+        });
+        state.board_squares[h1 as usize] = Some(Piece {
+            piece_color: PieceColor::White,
+            piece_kind: PieceKind::Rook,
+        });
+        state.castling_rights.white_kingside = true;
+
+        let mut moves = LegalMovesForCurrentTurn::new_empty_legal_moves_list();
+        let _ = generate_pseudo_legal_king_moves(&state, e1, &mut moves);
+        // 5 normal king moves + 1 castle = 6
+        assert_eq!(moves.moves_count, 6);
+        assert!(move_set_contains_with_category(
+            &moves,
+            e1,
+            g1,
+            ChessMoveCategory::CastleKingside
+        ));
+    }
+
+    #[test]
+    fn test_king_castle_kingside_blocked_by_friendly_piece_on_f1() {
+        let mut state = make_empty_board_state_for_tests();
+        let e1 = SQUARE_INDEX_E1;
+        let h1 = SQUARE_INDEX_H1;
+        let f1 = square_index_for_test(5, 0);
+        state.board_squares[e1 as usize] = Some(Piece {
+            piece_color: PieceColor::White,
+            piece_kind: PieceKind::King,
+        });
+        state.board_squares[h1 as usize] = Some(Piece {
+            piece_color: PieceColor::White,
+            piece_kind: PieceKind::Rook,
+        });
+        state.board_squares[f1 as usize] = Some(Piece {
+            piece_color: PieceColor::White,
+            piece_kind: PieceKind::Bishop,
+        });
+        state.castling_rights.white_kingside = true;
+
+        let mut moves = LegalMovesForCurrentTurn::new_empty_legal_moves_list();
+        let _ = generate_pseudo_legal_king_moves(&state, e1, &mut moves);
+        // Normal moves: d1, d2, e2, f2 (f1 occupied by friendly). No castle.
+        assert_eq!(moves.moves_count, 4);
+        let g1 = square_index_for_test(6, 0);
+        assert!(!move_set_contains_with_category(
+            &moves,
+            e1,
+            g1,
+            ChessMoveCategory::CastleKingside
+        ));
+    }
+
+    #[test]
+    fn test_king_castle_kingside_rejected_when_king_in_check() {
+        let mut state = make_empty_board_state_for_tests();
+        let e1 = SQUARE_INDEX_E1;
+        let h1 = SQUARE_INDEX_H1;
+        let e8 = SQUARE_INDEX_E8;
+        state.board_squares[e1 as usize] = Some(Piece {
+            piece_color: PieceColor::White,
+            piece_kind: PieceKind::King,
+        });
+        state.board_squares[h1 as usize] = Some(Piece {
+            piece_color: PieceColor::White,
+            piece_kind: PieceKind::Rook,
+        });
+        state.board_squares[e8 as usize] = Some(Piece {
+            piece_color: PieceColor::Black,
+            piece_kind: PieceKind::Rook,
+        });
+        state.castling_rights.white_kingside = true;
+
+        let mut moves = LegalMovesForCurrentTurn::new_empty_legal_moves_list();
+        let _ = generate_pseudo_legal_king_moves(&state, e1, &mut moves);
+        // Castling not emitted because the king is currently in check.
+        let g1 = square_index_for_test(6, 0);
+        assert!(!move_set_contains_with_category(
+            &moves,
+            e1,
+            g1,
+            ChessMoveCategory::CastleKingside
+        ));
+    }
+
+    #[test]
+    fn test_king_castle_kingside_rejected_when_passing_through_attack() {
+        let mut state = make_empty_board_state_for_tests();
+        let e1 = SQUARE_INDEX_E1;
+        let h1 = SQUARE_INDEX_H1;
+        let f8 = square_index_for_test(5, 7);
+        // Black rook on f8 attacks the f1 pass-through square.
+        state.board_squares[e1 as usize] = Some(Piece {
+            piece_color: PieceColor::White,
+            piece_kind: PieceKind::King,
+        });
+        state.board_squares[h1 as usize] = Some(Piece {
+            piece_color: PieceColor::White,
+            piece_kind: PieceKind::Rook,
+        });
+        state.board_squares[f8 as usize] = Some(Piece {
+            piece_color: PieceColor::Black,
+            piece_kind: PieceKind::Rook,
+        });
+        state.castling_rights.white_kingside = true;
+
+        let mut moves = LegalMovesForCurrentTurn::new_empty_legal_moves_list();
+        let _ = generate_pseudo_legal_king_moves(&state, e1, &mut moves);
+        let g1 = square_index_for_test(6, 0);
+        assert!(!move_set_contains_with_category(
+            &moves,
+            e1,
+            g1,
+            ChessMoveCategory::CastleKingside
+        ));
+    }
+
+    #[test]
+    fn test_king_castle_kingside_rejected_when_landing_on_attack() {
+        let mut state = make_empty_board_state_for_tests();
+        let e1 = SQUARE_INDEX_E1;
+        let h1 = SQUARE_INDEX_H1;
+        let g8 = square_index_for_test(6, 7);
+        // Black rook on g8 attacks the g1 landing square.
+        state.board_squares[e1 as usize] = Some(Piece {
+            piece_color: PieceColor::White,
+            piece_kind: PieceKind::King,
+        });
+        state.board_squares[h1 as usize] = Some(Piece {
+            piece_color: PieceColor::White,
+            piece_kind: PieceKind::Rook,
+        });
+        state.board_squares[g8 as usize] = Some(Piece {
+            piece_color: PieceColor::Black,
+            piece_kind: PieceKind::Rook,
+        });
+        state.castling_rights.white_kingside = true;
+
+        let mut moves = LegalMovesForCurrentTurn::new_empty_legal_moves_list();
+        let _ = generate_pseudo_legal_king_moves(&state, e1, &mut moves);
+        let g1 = square_index_for_test(6, 0);
+        assert!(!move_set_contains_with_category(
+            &moves,
+            e1,
+            g1,
+            ChessMoveCategory::CastleKingside
+        ));
+    }
+
+    #[test]
+    fn test_king_castle_queenside_emitted_when_legal() {
+        let mut state = make_empty_board_state_for_tests();
+        let e1 = SQUARE_INDEX_E1;
+        let a1 = SQUARE_INDEX_A1;
+        let c1 = square_index_for_test(2, 0);
+        state.board_squares[e1 as usize] = Some(Piece {
+            piece_color: PieceColor::White,
+            piece_kind: PieceKind::King,
+        });
+        state.board_squares[a1 as usize] = Some(Piece {
+            piece_color: PieceColor::White,
+            piece_kind: PieceKind::Rook,
+        });
+        state.castling_rights.white_queenside = true;
+
+        let mut moves = LegalMovesForCurrentTurn::new_empty_legal_moves_list();
+        let _ = generate_pseudo_legal_king_moves(&state, e1, &mut moves);
+        assert!(move_set_contains_with_category(
+            &moves,
+            e1,
+            c1,
+            ChessMoveCategory::CastleQueenside
+        ));
+    }
+
+    #[test]
+    fn test_king_castle_queenside_b1_attacked_still_allowed() {
+        // The b-file pass square for the rook must be empty, but it
+        // is NOT attack-checked (the king never passes through it).
+        let mut state = make_empty_board_state_for_tests();
+        let e1 = SQUARE_INDEX_E1;
+        let a1 = SQUARE_INDEX_A1;
+        let b8 = square_index_for_test(1, 7);
+        let c1 = square_index_for_test(2, 0);
+        state.board_squares[e1 as usize] = Some(Piece {
+            piece_color: PieceColor::White,
+            piece_kind: PieceKind::King,
+        });
+        state.board_squares[a1 as usize] = Some(Piece {
+            piece_color: PieceColor::White,
+            piece_kind: PieceKind::Rook,
+        });
+        // Black rook on b8 attacks b1 (a square the king does NOT
+        // pass through). Castling should still be legal.
+        state.board_squares[b8 as usize] = Some(Piece {
+            piece_color: PieceColor::Black,
+            piece_kind: PieceKind::Rook,
+        });
+        state.castling_rights.white_queenside = true;
+
+        let mut moves = LegalMovesForCurrentTurn::new_empty_legal_moves_list();
+        let _ = generate_pseudo_legal_king_moves(&state, e1, &mut moves);
+        assert!(move_set_contains_with_category(
+            &moves,
+            e1,
+            c1,
+            ChessMoveCategory::CastleQueenside
+        ));
+    }
+
+    #[test]
+    fn test_king_castle_black_kingside_emitted_when_legal() {
+        let mut state = make_empty_board_state_for_tests();
+        let e8 = SQUARE_INDEX_E8;
+        let h8 = SQUARE_INDEX_H8;
+        let g8 = square_index_for_test(6, 7);
+        state.board_squares[e8 as usize] = Some(Piece {
+            piece_color: PieceColor::Black,
+            piece_kind: PieceKind::King,
+        });
+        state.board_squares[h8 as usize] = Some(Piece {
+            piece_color: PieceColor::Black,
+            piece_kind: PieceKind::Rook,
+        });
+        state.castling_rights.black_kingside = true;
+        state.side_to_move = PieceColor::Black;
+
+        let mut moves = LegalMovesForCurrentTurn::new_empty_legal_moves_list();
+        let _ = generate_pseudo_legal_king_moves(&state, e8, &mut moves);
+        assert!(move_set_contains_with_category(
+            &moves,
+            e8,
+            g8,
+            ChessMoveCategory::CastleKingside
+        ));
+    }
+
+    #[test]
+    fn test_king_not_on_starting_square_no_castling() {
+        let mut state = make_empty_board_state_for_tests();
+        let d4 = square_index_for_test(3, 3);
+        let h1 = SQUARE_INDEX_H1;
+        // King on d4 (not starting square), but castling rights still
+        // somehow true. Defensive check: castling must not be emitted.
+        state.board_squares[d4 as usize] = Some(Piece {
+            piece_color: PieceColor::White,
+            piece_kind: PieceKind::King,
+        });
+        state.board_squares[h1 as usize] = Some(Piece {
+            piece_color: PieceColor::White,
+            piece_kind: PieceKind::Rook,
+        });
+        state.castling_rights.white_kingside = true;
+
+        let mut moves = LegalMovesForCurrentTurn::new_empty_legal_moves_list();
+        let _ = generate_pseudo_legal_king_moves(&state, d4, &mut moves);
+        // Should be 8 normal king moves, no castle.
+        assert_eq!(moves.moves_count, 8);
+        for chess_move in moves.as_slice() {
+            assert!(
+                chess_move.move_category != ChessMoveCategory::CastleKingside
+                    && chess_move.move_category != ChessMoveCategory::CastleQueenside,
+                "no castling expected when king is not on starting square"
+            );
+        }
+    }
+
+    #[test]
+    fn test_king_source_not_a_king_no_moves() {
+        let mut state = make_empty_board_state_for_tests();
+        let e1 = SQUARE_INDEX_E1;
+        state.board_squares[e1 as usize] = Some(Piece {
+            piece_color: PieceColor::White,
+            piece_kind: PieceKind::Queen,
+        });
+        let mut moves = LegalMovesForCurrentTurn::new_empty_legal_moves_list();
+        let _ = generate_pseudo_legal_king_moves(&state, e1, &mut moves);
+        assert_eq!(moves.moves_count, 0);
+    }
+
+    // ====================================================
+    // apply_chess_move_to_state_without_status_update
+    // ====================================================
+
+    #[test]
+    fn test_apply_e2_to_e4_from_starting_position() {
+        let state = create_initial_board_state();
+        let e2 = square_index_for_test(4, 1);
+        let e4 = square_index_for_test(4, 3);
+        let e3 = square_index_for_test(4, 2);
+        let chess_move = ChessMove {
+            from_square_index: e2,
+            to_square_index: e4,
+            promotion_piece_kind: None,
+            move_category: ChessMoveCategory::DoublePawnPush,
+        };
+        let new_state = match apply_chess_move_to_state_without_status_update(&state, &chess_move) {
+            Ok(s) => s,
+            Err(error) => panic!("apply failed: {:?}", error),
+        };
+        assert!(new_state.board_squares[e2 as usize].is_none());
+        match new_state.board_squares[e4 as usize] {
+            Some(piece) => {
+                assert_eq!(piece.piece_color, PieceColor::White);
+                assert_eq!(piece.piece_kind, PieceKind::Pawn);
+            }
+            None => panic!("e4 should hold a white pawn"),
+        }
+        assert_eq!(new_state.side_to_move, PieceColor::Black);
+        assert_eq!(new_state.en_passant_target_square, Some(e3));
+        assert_eq!(new_state.halfmove_clock, 0);
+        assert_eq!(new_state.fullmove_number, 1);
+    }
+
+    #[test]
+    fn test_apply_black_double_push_increments_fullmove() {
+        // After 1.e4, apply 1...e5.
+        let state = create_initial_board_state();
+        let e2 = square_index_for_test(4, 1);
+        let e4 = square_index_for_test(4, 3);
+        let e7 = square_index_for_test(4, 6);
+        let e5 = square_index_for_test(4, 4);
+        let e6 = square_index_for_test(4, 5);
+
+        let white_move = ChessMove {
+            from_square_index: e2,
+            to_square_index: e4,
+            promotion_piece_kind: None,
+            move_category: ChessMoveCategory::DoublePawnPush,
+        };
+        let state_after_e4 =
+            apply_chess_move_to_state_without_status_update(&state, &white_move).expect("e4 ok");
+
+        let black_move = ChessMove {
+            from_square_index: e7,
+            to_square_index: e5,
+            promotion_piece_kind: None,
+            move_category: ChessMoveCategory::DoublePawnPush,
+        };
+        let state_after_e5 =
+            apply_chess_move_to_state_without_status_update(&state_after_e4, &black_move)
+                .expect("e5 ok");
+
+        assert_eq!(state_after_e5.side_to_move, PieceColor::White);
+        assert_eq!(state_after_e5.en_passant_target_square, Some(e6));
+        assert_eq!(state_after_e5.fullmove_number, 2);
+        assert_eq!(state_after_e5.halfmove_clock, 0);
+    }
+
+    #[test]
+    fn test_apply_non_pawn_non_capture_increments_halfmove_clock() {
+        let state = create_initial_board_state();
+        let g1 = square_index_for_test(6, 0);
+        let f3 = square_index_for_test(5, 2);
+        let chess_move = ChessMove {
+            from_square_index: g1,
+            to_square_index: f3,
+            promotion_piece_kind: None,
+            move_category: ChessMoveCategory::Normal,
+        };
+        let new_state =
+            apply_chess_move_to_state_without_status_update(&state, &chess_move).expect("ok");
+        assert_eq!(new_state.halfmove_clock, 1);
+        assert_eq!(new_state.en_passant_target_square, None);
+    }
+
+    #[test]
+    fn test_apply_capture_resets_halfmove_clock() {
+        // Construct a position where a non-pawn capture happens and
+        // verify halfmove_clock resets to 0.
+        let mut state = make_empty_board_state_for_tests();
+        let d4 = square_index_for_test(3, 3);
+        let d5 = square_index_for_test(3, 4);
+        state.board_squares[d4 as usize] = Some(Piece {
+            piece_color: PieceColor::White,
+            piece_kind: PieceKind::Rook,
+        });
+        state.board_squares[d5 as usize] = Some(Piece {
+            piece_color: PieceColor::Black,
+            piece_kind: PieceKind::Knight,
+        });
+        state.halfmove_clock = 17;
+
+        let chess_move = ChessMove {
+            from_square_index: d4,
+            to_square_index: d5,
+            promotion_piece_kind: None,
+            move_category: ChessMoveCategory::Normal,
+        };
+        let new_state =
+            apply_chess_move_to_state_without_status_update(&state, &chess_move).expect("ok");
+        assert_eq!(new_state.halfmove_clock, 0);
+    }
+
+    #[test]
+    fn test_apply_castle_kingside_white() {
+        let mut state = make_empty_board_state_for_tests();
+        let e1 = SQUARE_INDEX_E1;
+        let h1 = SQUARE_INDEX_H1;
+        let g1 = square_index_for_test(6, 0);
+        let f1 = square_index_for_test(5, 0);
+        state.board_squares[e1 as usize] = Some(Piece {
+            piece_color: PieceColor::White,
+            piece_kind: PieceKind::King,
+        });
+        state.board_squares[h1 as usize] = Some(Piece {
+            piece_color: PieceColor::White,
+            piece_kind: PieceKind::Rook,
+        });
+        state.castling_rights.white_kingside = true;
+        state.castling_rights.white_queenside = true;
+
+        let chess_move = ChessMove {
+            from_square_index: e1,
+            to_square_index: g1,
+            promotion_piece_kind: None,
+            move_category: ChessMoveCategory::CastleKingside,
+        };
+        let new_state =
+            apply_chess_move_to_state_without_status_update(&state, &chess_move).expect("ok");
+
+        assert!(new_state.board_squares[e1 as usize].is_none());
+        assert!(new_state.board_squares[h1 as usize].is_none());
+        match new_state.board_squares[g1 as usize] {
+            Some(p) => assert_eq!(p.piece_kind, PieceKind::King),
+            None => panic!("king should be on g1"),
+        }
+        match new_state.board_squares[f1 as usize] {
+            Some(p) => assert_eq!(p.piece_kind, PieceKind::Rook),
+            None => panic!("rook should be on f1"),
+        }
+        assert!(!new_state.castling_rights.white_kingside);
+        assert!(!new_state.castling_rights.white_queenside);
+    }
+
+    #[test]
+    fn test_apply_castle_queenside_white() {
+        let mut state = make_empty_board_state_for_tests();
+        let e1 = SQUARE_INDEX_E1;
+        let a1 = SQUARE_INDEX_A1;
+        let c1 = square_index_for_test(2, 0);
+        let d1 = square_index_for_test(3, 0);
+        state.board_squares[e1 as usize] = Some(Piece {
+            piece_color: PieceColor::White,
+            piece_kind: PieceKind::King,
+        });
+        state.board_squares[a1 as usize] = Some(Piece {
+            piece_color: PieceColor::White,
+            piece_kind: PieceKind::Rook,
+        });
+        state.castling_rights.white_queenside = true;
+
+        let chess_move = ChessMove {
+            from_square_index: e1,
+            to_square_index: c1,
+            promotion_piece_kind: None,
+            move_category: ChessMoveCategory::CastleQueenside,
+        };
+        let new_state =
+            apply_chess_move_to_state_without_status_update(&state, &chess_move).expect("ok");
+
+        match new_state.board_squares[c1 as usize] {
+            Some(p) => assert_eq!(p.piece_kind, PieceKind::King),
+            None => panic!("king should be on c1"),
+        }
+        match new_state.board_squares[d1 as usize] {
+            Some(p) => assert_eq!(p.piece_kind, PieceKind::Rook),
+            None => panic!("rook should be on d1"),
+        }
+        assert!(!new_state.castling_rights.white_queenside);
+    }
+
+    #[test]
+    fn test_apply_en_passant_removes_captured_pawn() {
+        let mut state = make_empty_board_state_for_tests();
+        let e5 = square_index_for_test(4, 4);
+        let d5 = square_index_for_test(3, 4);
+        let d6 = square_index_for_test(3, 5);
+        state.board_squares[e5 as usize] = Some(Piece {
+            piece_color: PieceColor::White,
+            piece_kind: PieceKind::Pawn,
+        });
+        state.board_squares[d5 as usize] = Some(Piece {
+            piece_color: PieceColor::Black,
+            piece_kind: PieceKind::Pawn,
+        });
+        state.en_passant_target_square = Some(d6);
+
+        let chess_move = ChessMove {
+            from_square_index: e5,
+            to_square_index: d6,
+            promotion_piece_kind: None,
+            move_category: ChessMoveCategory::EnPassant,
+        };
+        let new_state =
+            apply_chess_move_to_state_without_status_update(&state, &chess_move).expect("ok");
+
+        // Capturing pawn now on d6.
+        match new_state.board_squares[d6 as usize] {
+            Some(p) => {
+                assert_eq!(p.piece_color, PieceColor::White);
+                assert_eq!(p.piece_kind, PieceKind::Pawn);
+            }
+            None => panic!("d6 should hold the capturing pawn"),
+        }
+        // Captured black pawn on d5 removed.
+        assert!(new_state.board_squares[d5 as usize].is_none());
+        // Source e5 empty.
+        assert!(new_state.board_squares[e5 as usize].is_none());
+        // Halfmove clock reset (pawn move + capture).
+        assert_eq!(new_state.halfmove_clock, 0);
+    }
+
+    #[test]
+    fn test_apply_promotion_replaces_pawn_with_queen() {
+        let mut state = make_empty_board_state_for_tests();
+        let e7 = square_index_for_test(4, 6);
+        let e8 = square_index_for_test(4, 7);
+        state.board_squares[e7 as usize] = Some(Piece {
+            piece_color: PieceColor::White,
+            piece_kind: PieceKind::Pawn,
+        });
+        let chess_move = ChessMove {
+            from_square_index: e7,
+            to_square_index: e8,
+            promotion_piece_kind: Some(PieceKind::Queen),
+            move_category: ChessMoveCategory::Promotion,
+        };
+        let new_state =
+            apply_chess_move_to_state_without_status_update(&state, &chess_move).expect("ok");
+        match new_state.board_squares[e8 as usize] {
+            Some(p) => {
+                assert_eq!(p.piece_color, PieceColor::White);
+                assert_eq!(p.piece_kind, PieceKind::Queen);
+            }
+            None => panic!("e8 should hold a white queen"),
+        }
+        assert!(new_state.board_squares[e7 as usize].is_none());
+    }
+
+    #[test]
+    fn test_apply_king_move_clears_both_castling_rights() {
+        let mut state = make_empty_board_state_for_tests();
+        let e1 = SQUARE_INDEX_E1;
+        let e2 = square_index_for_test(4, 1);
+        state.board_squares[e1 as usize] = Some(Piece {
+            piece_color: PieceColor::White,
+            piece_kind: PieceKind::King,
+        });
+        state.castling_rights.white_kingside = true;
+        state.castling_rights.white_queenside = true;
+        state.castling_rights.black_kingside = true;
+        state.castling_rights.black_queenside = true;
+
+        let chess_move = ChessMove {
+            from_square_index: e1,
+            to_square_index: e2,
+            promotion_piece_kind: None,
+            move_category: ChessMoveCategory::Normal,
+        };
+        let new_state =
+            apply_chess_move_to_state_without_status_update(&state, &chess_move).expect("ok");
+
+        assert!(!new_state.castling_rights.white_kingside);
+        assert!(!new_state.castling_rights.white_queenside);
+        // Black's rights are unaffected.
+        assert!(new_state.castling_rights.black_kingside);
+        assert!(new_state.castling_rights.black_queenside);
+    }
+
+    #[test]
+    fn test_apply_rook_move_from_h1_clears_white_kingside() {
+        let mut state = make_empty_board_state_for_tests();
+        let h1 = SQUARE_INDEX_H1;
+        let h4 = square_index_for_test(7, 3);
+        state.board_squares[h1 as usize] = Some(Piece {
+            piece_color: PieceColor::White,
+            piece_kind: PieceKind::Rook,
+        });
+        state.castling_rights.white_kingside = true;
+        state.castling_rights.white_queenside = true;
+
+        let chess_move = ChessMove {
+            from_square_index: h1,
+            to_square_index: h4,
+            promotion_piece_kind: None,
+            move_category: ChessMoveCategory::Normal,
+        };
+        let new_state =
+            apply_chess_move_to_state_without_status_update(&state, &chess_move).expect("ok");
+
+        assert!(!new_state.castling_rights.white_kingside);
+        assert!(new_state.castling_rights.white_queenside);
+    }
+
+    #[test]
+    fn test_apply_rook_captured_on_h8_clears_black_kingside() {
+        let mut state = make_empty_board_state_for_tests();
+        let h1 = SQUARE_INDEX_H1;
+        let h8 = SQUARE_INDEX_H8;
+        state.board_squares[h1 as usize] = Some(Piece {
+            piece_color: PieceColor::White,
+            piece_kind: PieceKind::Rook,
+        });
+        state.board_squares[h8 as usize] = Some(Piece {
+            piece_color: PieceColor::Black,
+            piece_kind: PieceKind::Rook,
+        });
+        state.castling_rights.black_kingside = true;
+        state.castling_rights.black_queenside = true;
+
+        let chess_move = ChessMove {
+            from_square_index: h1,
+            to_square_index: h8,
+            promotion_piece_kind: None,
+            move_category: ChessMoveCategory::Normal,
+        };
+        let new_state =
+            apply_chess_move_to_state_without_status_update(&state, &chess_move).expect("ok");
+
+        // h1 also cleared white_kingside (rook left h1).
+        // h8 capture cleared black_kingside.
+        assert!(!new_state.castling_rights.black_kingside);
+        assert!(new_state.castling_rights.black_queenside);
+    }
+
+    #[test]
+    fn test_apply_out_of_bounds_returns_error() {
+        let state = create_initial_board_state();
+        let bad_move = ChessMove {
+            from_square_index: 64,
+            to_square_index: 0,
+            promotion_piece_kind: None,
+            move_category: ChessMoveCategory::Normal,
+        };
+        let result = apply_chess_move_to_state_without_status_update(&state, &bad_move);
+        assert_eq!(result, Err(MoveValidationError::InternalIndexOutOfBounds));
+
+        let bad_move_2 = ChessMove {
+            from_square_index: 0,
+            to_square_index: 200,
+            promotion_piece_kind: None,
+            move_category: ChessMoveCategory::Normal,
+        };
+        let result_2 = apply_chess_move_to_state_without_status_update(&state, &bad_move_2);
+        assert_eq!(result_2, Err(MoveValidationError::InternalIndexOutOfBounds));
+    }
+
+    // ====================================================
+    // generate_all_legal_moves_for_current_turn
+    // ====================================================
+
+    #[test]
+    fn test_legal_moves_starting_position_white_has_twenty() {
+        let state = create_initial_board_state();
+        let legal = match generate_all_legal_moves_for_current_turn(&state) {
+            Ok(list) => list,
+            Err(error) => panic!("legal-move generation failed: {:?}", error),
+        };
+        assert_eq!(legal.moves_count, 20, "starting position: 20 legal moves");
+    }
+
+    #[test]
+    fn test_legal_moves_after_e4_black_has_twenty() {
+        let state = create_initial_board_state();
+        let e2 = square_index_for_test(4, 1);
+        let e4 = square_index_for_test(4, 3);
+        let white_move = ChessMove {
+            from_square_index: e2,
+            to_square_index: e4,
+            promotion_piece_kind: None,
+            move_category: ChessMoveCategory::DoublePawnPush,
+        };
+        let state_after_e4 =
+            apply_chess_move_to_state_without_status_update(&state, &white_move).expect("ok");
+
+        let legal = generate_all_legal_moves_for_current_turn(&state_after_e4).expect("ok");
+        assert_eq!(legal.moves_count, 20);
+    }
+
+    #[test]
+    fn test_legal_moves_pinned_piece_has_no_moves() {
+        // White king on e1, white knight on e2, black rook on e8.
+        // The knight is absolutely pinned: it cannot move at all,
+        // since any move uncovers a check from the black rook on e8.
+        let mut state = make_empty_board_state_for_tests();
+        let e1 = SQUARE_INDEX_E1;
+        let e2 = square_index_for_test(4, 1);
+        let e8 = SQUARE_INDEX_E8;
+        state.board_squares[e1 as usize] = Some(Piece {
+            piece_color: PieceColor::White,
+            piece_kind: PieceKind::King,
+        });
+        state.board_squares[e2 as usize] = Some(Piece {
+            piece_color: PieceColor::White,
+            piece_kind: PieceKind::Knight,
+        });
+        state.board_squares[e8 as usize] = Some(Piece {
+            piece_color: PieceColor::Black,
+            piece_kind: PieceKind::Rook,
+        });
+        state.side_to_move = PieceColor::White;
+
+        let legal = generate_all_legal_moves_for_current_turn(&state).expect("ok");
+        // No move whose from_square_index is e2 should be in the list.
+        let knight_moves_count = legal
+            .as_slice()
+            .iter()
+            .filter(|m| m.from_square_index == e2)
+            .count();
+        assert_eq!(knight_moves_count, 0, "pinned knight has no legal moves");
+    }
+
+    #[test]
+    fn test_legal_moves_king_in_check_only_escapes() {
+        // White king on e1, black rook on e8. White must respond to
+        // the check. Every legal move must result in a position
+        // where the white king is not in check.
+        let mut state = make_empty_board_state_for_tests();
+        let e1 = SQUARE_INDEX_E1;
+        let e8 = SQUARE_INDEX_E8;
+        state.board_squares[e1 as usize] = Some(Piece {
+            piece_color: PieceColor::White,
+            piece_kind: PieceKind::King,
+        });
+        state.board_squares[e8 as usize] = Some(Piece {
+            piece_color: PieceColor::Black,
+            piece_kind: PieceKind::Rook,
+        });
+        state.side_to_move = PieceColor::White;
+
+        let legal = generate_all_legal_moves_for_current_turn(&state).expect("ok");
+        // The king has 5 neighbors: d1, d2, e2, f1, f2. Of these,
+        // e2 stays in check (still on the e-file). So 4 escape moves.
+        assert_eq!(legal.moves_count, 4);
+        for chess_move in legal.as_slice() {
+            let resulting =
+                apply_chess_move_to_state_without_status_update(&state, chess_move).expect("ok");
+            assert!(
+                !is_king_currently_in_check(&resulting, PieceColor::White),
+                "every legal move must escape check"
+            );
+        }
+    }
+
+    #[test]
+    fn test_legal_moves_checkmate_position_zero_moves() {
+        // Construct a back-rank mate: BK on h8, WR on h1 giving
+        // check along the h-file; BK has no pieces and is surrounded
+        // by ... let's pick a simpler classical mate.
+        //
+        // Position: BK h8, WQ g7, WK f6. Black to move.
+        //   - BK on h8 is attacked by Wq on g7 (adjacent diagonal).
+        //   - Escape squares g8, h7 also attacked by Wq.
+        //   - g7 (the queen) is defended by WK on f6, so BK cannot
+        //     capture.
+        //   - This is checkmate.
+        let mut state = make_empty_board_state_for_tests();
+        let h8 = SQUARE_INDEX_H8;
+        let g7 = square_index_for_test(6, 6);
+        let f6 = square_index_for_test(5, 5);
+        state.board_squares[h8 as usize] = Some(Piece {
+            piece_color: PieceColor::Black,
+            piece_kind: PieceKind::King,
+        });
+        state.board_squares[g7 as usize] = Some(Piece {
+            piece_color: PieceColor::White,
+            piece_kind: PieceKind::Queen,
+        });
+        state.board_squares[f6 as usize] = Some(Piece {
+            piece_color: PieceColor::White,
+            piece_kind: PieceKind::King,
+        });
+        state.side_to_move = PieceColor::Black;
+
+        assert!(is_king_currently_in_check(&state, PieceColor::Black));
+        let legal = generate_all_legal_moves_for_current_turn(&state).expect("ok");
+        assert_eq!(legal.moves_count, 0, "checkmate: zero legal moves");
+    }
+
+    #[test]
+    fn test_legal_moves_stalemate_position_zero_moves() {
+        // Stalemate: BK h8, WQ g6, WK f7. Black to move.
+        //   - BK h8 is NOT in check (g6 doesn't attack h8 — diff is
+        //     (1, 2), a knight pattern, not a queen line).
+        //   - g8 attacked by Wq g6 (g-file).
+        //   - h7 attacked by Wq g6 (diagonal).
+        //   - g7 attacked by Wq g6 (adjacent) and by WK f7.
+        //   - BK has no legal moves. Not in check. → Stalemate.
+        let mut state = make_empty_board_state_for_tests();
+        let h8 = SQUARE_INDEX_H8;
+        let g6 = square_index_for_test(6, 5);
+        let f7 = square_index_for_test(5, 6);
+        state.board_squares[h8 as usize] = Some(Piece {
+            piece_color: PieceColor::Black,
+            piece_kind: PieceKind::King,
+        });
+        state.board_squares[g6 as usize] = Some(Piece {
+            piece_color: PieceColor::White,
+            piece_kind: PieceKind::Queen,
+        });
+        state.board_squares[f7 as usize] = Some(Piece {
+            piece_color: PieceColor::White,
+            piece_kind: PieceKind::King,
+        });
+        state.side_to_move = PieceColor::Black;
+
+        assert!(
+            !is_king_currently_in_check(&state, PieceColor::Black),
+            "stalemate precondition: black king not in check"
+        );
+        let legal = generate_all_legal_moves_for_current_turn(&state).expect("ok");
+        assert_eq!(legal.moves_count, 0, "stalemate: zero legal moves");
+    }
+}
+
+/// Apply a fully-resolved `ChessMove` to the given board, returning
+/// a new `BoardState` with the move applied. The input state is not
+/// modified (immutable-return-new pattern).
+///
+/// Steps:
+///   1–8: Delegate to `apply_chess_move_to_state_without_status_update`.
+///   9: Compute `game_status` by generating all legal moves for the new
+///      side to move, then determining whether that side is in
+///      checkmate, stalemated, or still playing.
+///
+/// ## Returns
+///
+/// On success: a new `BoardState` reflecting the move and all updates,
+/// including a correctly computed `game_status`.
+///
+/// On error: `InternalIndexOutOfBounds` if the move references an
+/// out-of-range square index, or `InternalMoveBufferFull` from the
+/// underlying legal-move generation step.
+///
+/// ## Memory & Panic Policy
+///
+/// No heap. No panics. Stack-only.
+pub fn apply_chess_move_to_state(
+    state: &BoardState,
+    chess_move: &ChessMove,
+) -> Result<BoardState, MoveValidationError> {
+    // Steps 1–8: board, castling, en-passant, side, fullmove, halfmove.
+    let intermediate_state = apply_chess_move_to_state_without_status_update(state, chess_move)?;
+
+    // Step 9: status determination.
+    let legal_moves_for_new_side = generate_all_legal_moves_for_current_turn(&intermediate_state)?;
+
+    let mut new_state = intermediate_state;
+
+    if legal_moves_for_new_side.moves_count == 0 {
+        // The side to move has no legal moves. Distinguish checkmate
+        // from stalemate by whether the king of the side to move is
+        // currently in check.
+        let side_to_move_in_check =
+            is_king_currently_in_check(&intermediate_state, intermediate_state.side_to_move);
+        new_state.game_status = match (side_to_move_in_check, intermediate_state.side_to_move) {
+            // Black has no moves AND is in check → White won.
+            (true, PieceColor::Black) => GameStatus::CheckmateWhitewin,
+            // White has no moves AND is in check → Black won.
+            (true, PieceColor::White) => GameStatus::CheckmateBlackwin,
+            // No moves but not in check → stalemate of the side to move.
+            (false, PieceColor::White) => GameStatus::WhiteStalemated,
+            (false, PieceColor::Black) => GameStatus::BlackStalemated,
+        };
+    } else {
+        new_state.game_status = GameStatus::StillPlaying;
+    }
+
+    Ok(new_state)
+}
+
+/// Resolve a `ParsedMoveNotation` (the output of the notation parser)
+/// to a fully-formed `ChessMove`, validating that exactly one legal
+/// move in the current position matches the parsed notation.
+///
+/// Strategy:
+///   1. Generate all legal moves for `state.side_to_move`.
+///   2. Filter the legal moves by matching against the parsed
+///      notation's constraints.
+///   3. Resolve:
+///        - Exactly one match: return it.
+///        - Zero matches AND a promotion candidate was rejected for
+///          lack of a notation promotion piece: return
+///          `InvalidPromotionRequired`.
+///        - Zero matches otherwise: `InvalidNoMatchingLegalMove`.
+///        - Two or more matches: `InvalidAmbiguousNotation`.
+///
+/// ## Memory & Panic Policy
+///
+/// No heap. No panics.
+pub fn resolve_parsed_move_to_legal_chess_move(
+    state: &BoardState,
+    parsed_notation: &ParsedMoveNotation,
+) -> Result<ChessMove, MoveValidationError> {
+    let legal_moves = generate_all_legal_moves_for_current_turn(state)?;
+
+    let mut matching_count: u16 = 0;
+    let mut last_matching_move: Option<ChessMove> = None;
+    let mut promotion_required_was_detected: bool = false;
+
+    // Bounded loop over the legal-moves buffer.
+    for chess_move in legal_moves.as_slice() {
+        // Source-square piece kind (used for piece_kind matching).
+        let piece_at_source = match state.board_squares[chess_move.from_square_index as usize] {
+            Some(piece) => piece,
+            None => continue, // Defensive: should not occur for legal moves.
+        };
+
+        // ----- Filter: piece_kind -----
+        if piece_at_source.piece_kind != parsed_notation.piece_kind {
+            continue;
+        }
+
+        // ----- Filter: destination file and rank -----
+        let to_file = match file_from_square_index(chess_move.to_square_index) {
+            Ok(file_zero_to_seven) => file_zero_to_seven,
+            Err(_) => continue,
+        };
+        let to_rank = match rank_from_square_index(chess_move.to_square_index) {
+            Ok(rank_zero_to_seven) => rank_zero_to_seven,
+            Err(_) => continue,
+        };
+        if to_file != parsed_notation.destination_file
+            || to_rank != parsed_notation.destination_rank
+        {
+            continue;
+        }
+
+        // ----- Filter: is_capture -----
+        // Capture: destination occupied by enemy in the ORIGINAL
+        // state, OR the move category is EnPassant.
+        let target_occupant_in_state = state.board_squares[chess_move.to_square_index as usize];
+        let move_is_capture = target_occupant_in_state.is_some()
+            || chess_move.move_category == ChessMoveCategory::EnPassant;
+        if parsed_notation.is_capture != move_is_capture {
+            continue;
+        }
+
+        // ----- Filter: disambiguation source file -----
+        let from_file = match file_from_square_index(chess_move.from_square_index) {
+            Ok(file_zero_to_seven) => file_zero_to_seven,
+            Err(_) => continue,
+        };
+        let from_rank = match rank_from_square_index(chess_move.from_square_index) {
+            Ok(rank_zero_to_seven) => rank_zero_to_seven,
+            Err(_) => continue,
+        };
+        if let Some(disambiguation_file) = parsed_notation.disambiguation_source_file {
+            if disambiguation_file != from_file {
+                continue;
+            }
+        }
+        if let Some(disambiguation_rank) = parsed_notation.disambiguation_source_rank {
+            if disambiguation_rank != from_rank {
+                continue;
+            }
+        }
+
+        // ----- Filter: explicit source file/rank -----
+        if let Some(explicit_file) = parsed_notation.explicit_source_file {
+            if explicit_file != from_file {
+                continue;
+            }
+        }
+        if let Some(explicit_rank) = parsed_notation.explicit_source_rank {
+            if explicit_rank != from_rank {
+                continue;
+            }
+        }
+
+        // ----- Filter: castling flags -----
+        if parsed_notation.is_castle_kingside
+            && chess_move.move_category != ChessMoveCategory::CastleKingside
+        {
+            continue;
+        }
+        if parsed_notation.is_castle_queenside
+            && chess_move.move_category != ChessMoveCategory::CastleQueenside
+        {
+            continue;
+        }
+
+        // ----- Filter: promotion -----
+        match (
+            parsed_notation.promotion_piece_kind,
+            chess_move.move_category,
+        ) {
+            (Some(notation_promotion_kind), ChessMoveCategory::Promotion) => {
+                // Both notation and move are promotions; piece kinds must match.
+                if chess_move.promotion_piece_kind != Some(notation_promotion_kind) {
+                    continue;
+                }
+            }
+            (Some(_), _) => {
+                // Notation specifies a promotion piece but the candidate is not
+                // a promotion move. Reject this candidate.
+                continue;
+            }
+            (None, ChessMoveCategory::Promotion) => {
+                // Candidate IS a promotion, but the notation did not specify a
+                // promotion piece. Record this and reject the candidate. If
+                // matching_count ends at zero, this flag triggers the
+                // InvalidPromotionRequired error.
+                promotion_required_was_detected = true;
+                continue;
+            }
+            (None, _) => {
+                // Neither is a promotion. OK.
+            }
+        }
+
+        // ----- Match -----
+        matching_count = matching_count.saturating_add(1);
+        last_matching_move = Some(*chess_move);
+        // Early exit on >= 2 matches: we will return InvalidAmbiguousNotation.
+        // We do not need to keep iterating; but iterating to completion is
+        // harmless and keeps control flow simple. Bounded by buffer size.
+    }
+
+    if matching_count == 1 {
+        match last_matching_move {
+            Some(unique_move) => Ok(unique_move),
+            None => Err(MoveValidationError::InvalidNoMatchingLegalMove),
+        }
+    } else if matching_count == 0 {
+        if promotion_required_was_detected {
+            Err(MoveValidationError::InvalidPromotionRequired)
+        } else {
+            Err(MoveValidationError::InvalidNoMatchingLegalMove)
+        }
+    } else {
+        Err(MoveValidationError::InvalidAmbiguousNotation)
+    }
+}
+
+#[cfg(test)]
+mod batch_five_tests {
+    use super::*;
+
+    fn make_empty_board_state_for_tests() -> BoardState {
+        BoardState {
+            board_squares: [None; BOARD_SQUARE_COUNT],
+            side_to_move: PieceColor::White,
+            castling_rights: CastlingRights {
+                white_kingside: false,
+                white_queenside: false,
+                black_kingside: false,
+                black_queenside: false,
+            },
+            en_passant_target_square: None,
+            fullmove_number: 1,
+            halfmove_clock: 0,
+            game_status: GameStatus::StillPlaying,
+        }
+    }
+
+    fn square_index_for_test(file_zero_to_seven: u8, rank_zero_to_seven: u8) -> u8 {
+        match square_index_from_file_and_rank(file_zero_to_seven, rank_zero_to_seven) {
+            Ok(index) => index,
+            Err(error) => panic!(
+                "test setup: square_index_from_file_and_rank failed: {:?}",
+                error
+            ),
+        }
+    }
+
+    /// Build a `ParsedMoveNotation` with default Empty/None values, then
+    /// fill in fields per test. Reduces test boilerplate.
+    fn default_parsed_notation() -> ParsedMoveNotation {
+        ParsedMoveNotation {
+            piece_kind: PieceKind::Pawn,
+            destination_file: 0,
+            destination_rank: 0,
+            is_capture: false,
+            disambiguation_source_file: None,
+            disambiguation_source_rank: None,
+            promotion_piece_kind: None,
+            explicit_source_file: None,
+            explicit_source_rank: None,
+            is_castle_kingside: false,
+            is_castle_queenside: false,
+        }
+    }
+
+    // ============================================================
+    // apply_chess_move_to_state (with status)
+    // ============================================================
+
+    #[test]
+    fn test_apply_with_status_quiet_move_still_playing() {
+        let state = create_initial_board_state();
+        let e2 = square_index_for_test(4, 1);
+        let e4 = square_index_for_test(4, 3);
+        let chess_move = ChessMove {
+            from_square_index: e2,
+            to_square_index: e4,
+            promotion_piece_kind: None,
+            move_category: ChessMoveCategory::DoublePawnPush,
+        };
+        let new_state = apply_chess_move_to_state(&state, &chess_move).expect("apply ok");
+        assert_eq!(new_state.game_status, GameStatus::StillPlaying);
+    }
+
+    #[test]
+    fn test_apply_with_status_fools_mate_checkmate_black_wins() {
+        // 1.f3 e5 2.g4 Qh4#. After Qh4, white king on e1 is in
+        // check from black queen on h4 (diagonal h4-g3-f2-e1, clear)
+        // and has no legal response. → CheckmateBlackwin.
+        let state = create_initial_board_state();
+
+        let f2 = square_index_for_test(5, 1);
+        let f3 = square_index_for_test(5, 2);
+        let e7 = square_index_for_test(4, 6);
+        let e5 = square_index_for_test(4, 4);
+        let g2 = square_index_for_test(6, 1);
+        let g4 = square_index_for_test(6, 3);
+        let d8 = square_index_for_test(3, 7);
+        let h4 = square_index_for_test(7, 3);
+
+        // 1.f3 (Normal pawn push; single push from f2 to f3).
+        let move_f3 = ChessMove {
+            from_square_index: f2,
+            to_square_index: f3,
+            promotion_piece_kind: None,
+            move_category: ChessMoveCategory::Normal,
+        };
+        let state_after_1 = apply_chess_move_to_state(&state, &move_f3).expect("f3 ok");
+        assert_eq!(state_after_1.game_status, GameStatus::StillPlaying);
+
+        // 1...e5 (DoublePawnPush).
+        let move_e5 = ChessMove {
+            from_square_index: e7,
+            to_square_index: e5,
+            promotion_piece_kind: None,
+            move_category: ChessMoveCategory::DoublePawnPush,
+        };
+        let state_after_2 = apply_chess_move_to_state(&state_after_1, &move_e5).expect("e5 ok");
+        assert_eq!(state_after_2.game_status, GameStatus::StillPlaying);
+
+        // 2.g4 (DoublePawnPush).
+        let move_g4 = ChessMove {
+            from_square_index: g2,
+            to_square_index: g4,
+            promotion_piece_kind: None,
+            move_category: ChessMoveCategory::DoublePawnPush,
+        };
+        let state_after_3 = apply_chess_move_to_state(&state_after_2, &move_g4).expect("g4 ok");
+        assert_eq!(state_after_3.game_status, GameStatus::StillPlaying);
+
+        // 2...Qh4# (Normal queen move; checkmate).
+        let move_qh4 = ChessMove {
+            from_square_index: d8,
+            to_square_index: h4,
+            promotion_piece_kind: None,
+            move_category: ChessMoveCategory::Normal,
+        };
+        let state_after_4 = apply_chess_move_to_state(&state_after_3, &move_qh4).expect("Qh4 ok");
+        assert_eq!(
+            state_after_4.game_status,
+            GameStatus::CheckmateBlackwin,
+            "Fool's Mate completes with Black winning by checkmate"
+        );
+    }
+
+    #[test]
+    fn test_apply_with_status_move_into_stalemate() {
+        // Pre-position: WK f6, WQ g3, BK h8. Side to move: White.
+        // After Wq g3-g6: WK f6, WQ g6, BK h8, Black to move. Black
+        // has no legal moves (g8, h7, g7 all attacked; h8 not in
+        // check) → BlackStalemated.
+        let mut state = make_empty_board_state_for_tests();
+        let f6 = square_index_for_test(5, 5);
+        let g3 = square_index_for_test(6, 2);
+        let g6 = square_index_for_test(6, 5);
+        let h8 = SQUARE_INDEX_H8;
+        state.board_squares[f6 as usize] = Some(Piece {
+            piece_color: PieceColor::White,
+            piece_kind: PieceKind::King,
+        });
+        state.board_squares[g3 as usize] = Some(Piece {
+            piece_color: PieceColor::White,
+            piece_kind: PieceKind::Queen,
+        });
+        state.board_squares[h8 as usize] = Some(Piece {
+            piece_color: PieceColor::Black,
+            piece_kind: PieceKind::King,
+        });
+        state.side_to_move = PieceColor::White;
+
+        let stalemating_move = ChessMove {
+            from_square_index: g3,
+            to_square_index: g6,
+            promotion_piece_kind: None,
+            move_category: ChessMoveCategory::Normal,
+        };
+        let new_state = apply_chess_move_to_state(&state, &stalemating_move).expect("Qg6 ok");
+        assert_eq!(
+            new_state.game_status,
+            GameStatus::BlackStalemated,
+            "Qg6 stalemates the black king on h8"
+        );
+    }
+
+    // ============================================================
+    // resolve_parsed_move_to_legal_chess_move
+    // ============================================================
+
+    #[test]
+    fn test_resolve_e4_in_starting_position() {
+        let state = create_initial_board_state();
+        let e2 = square_index_for_test(4, 1);
+        let e4 = square_index_for_test(4, 3);
+        let mut notation = default_parsed_notation();
+        notation.piece_kind = PieceKind::Pawn;
+        notation.destination_file = 4;
+        notation.destination_rank = 3;
+
+        let resolved =
+            resolve_parsed_move_to_legal_chess_move(&state, &notation).expect("resolve ok");
+        assert_eq!(resolved.from_square_index, e2);
+        assert_eq!(resolved.to_square_index, e4);
+        assert_eq!(resolved.move_category, ChessMoveCategory::DoublePawnPush);
+    }
+
+    #[test]
+    fn test_resolve_nf3_in_starting_position() {
+        let state = create_initial_board_state();
+        let g1 = square_index_for_test(6, 0);
+        let f3 = square_index_for_test(5, 2);
+        let mut notation = default_parsed_notation();
+        notation.piece_kind = PieceKind::Knight;
+        notation.destination_file = 5;
+        notation.destination_rank = 2;
+
+        let resolved =
+            resolve_parsed_move_to_legal_chess_move(&state, &notation).expect("resolve ok");
+        assert_eq!(resolved.from_square_index, g1);
+        assert_eq!(resolved.to_square_index, f3);
+        assert_eq!(resolved.move_category, ChessMoveCategory::Normal);
+    }
+
+    #[test]
+    fn test_resolve_nc3_only_b1_knight_reaches() {
+        let state = create_initial_board_state();
+        let b1 = square_index_for_test(1, 0);
+        let c3 = square_index_for_test(2, 2);
+        let mut notation = default_parsed_notation();
+        notation.piece_kind = PieceKind::Knight;
+        notation.destination_file = 2;
+        notation.destination_rank = 2;
+
+        let resolved =
+            resolve_parsed_move_to_legal_chess_move(&state, &notation).expect("resolve ok");
+        assert_eq!(resolved.from_square_index, b1);
+        assert_eq!(resolved.to_square_index, c3);
+    }
+
+    #[test]
+    fn test_resolve_nbd2_with_disambiguation() {
+        // Construct a position with two white knights both able to
+        // reach d2: knight on b1 and knight on f3. Plus kings for
+        // legality. Black to move would not work; we need White to move
+        // with both knights present, neither pinned.
+        let mut state = make_empty_board_state_for_tests();
+        let e1 = SQUARE_INDEX_E1;
+        let e8 = SQUARE_INDEX_E8;
+        let b1 = square_index_for_test(1, 0);
+        let f3 = square_index_for_test(5, 2);
+        state.board_squares[e1 as usize] = Some(Piece {
+            piece_color: PieceColor::White,
+            piece_kind: PieceKind::King,
+        });
+        state.board_squares[e8 as usize] = Some(Piece {
+            piece_color: PieceColor::Black,
+            piece_kind: PieceKind::King,
+        });
+        state.board_squares[b1 as usize] = Some(Piece {
+            piece_color: PieceColor::White,
+            piece_kind: PieceKind::Knight,
+        });
+        state.board_squares[f3 as usize] = Some(Piece {
+            piece_color: PieceColor::White,
+            piece_kind: PieceKind::Knight,
+        });
+        state.side_to_move = PieceColor::White;
+
+        // "Nbd2" — knight from b-file to d2.
+        let d2 = square_index_for_test(3, 1);
+        let mut notation = default_parsed_notation();
+        notation.piece_kind = PieceKind::Knight;
+        notation.destination_file = 3;
+        notation.destination_rank = 1;
+        notation.disambiguation_source_file = Some(1);
+
+        let resolved =
+            resolve_parsed_move_to_legal_chess_move(&state, &notation).expect("resolve ok");
+        assert_eq!(resolved.from_square_index, b1);
+        assert_eq!(resolved.to_square_index, d2);
+    }
+
+    #[test]
+    fn test_resolve_nd2_ambiguous_returns_error() {
+        // Same position as above but no disambiguation in notation.
+        let mut state = make_empty_board_state_for_tests();
+        let e1 = SQUARE_INDEX_E1;
+        let e8 = SQUARE_INDEX_E8;
+        let b1 = square_index_for_test(1, 0);
+        let f3 = square_index_for_test(5, 2);
+        state.board_squares[e1 as usize] = Some(Piece {
+            piece_color: PieceColor::White,
+            piece_kind: PieceKind::King,
+        });
+        state.board_squares[e8 as usize] = Some(Piece {
+            piece_color: PieceColor::Black,
+            piece_kind: PieceKind::King,
+        });
+        state.board_squares[b1 as usize] = Some(Piece {
+            piece_color: PieceColor::White,
+            piece_kind: PieceKind::Knight,
+        });
+        state.board_squares[f3 as usize] = Some(Piece {
+            piece_color: PieceColor::White,
+            piece_kind: PieceKind::Knight,
+        });
+        state.side_to_move = PieceColor::White;
+
+        let mut notation = default_parsed_notation();
+        notation.piece_kind = PieceKind::Knight;
+        notation.destination_file = 3;
+        notation.destination_rank = 1;
+
+        let result = resolve_parsed_move_to_legal_chess_move(&state, &notation);
+        assert_eq!(result, Err(MoveValidationError::InvalidAmbiguousNotation));
+    }
+
+    #[test]
+    fn test_resolve_e5_as_white_first_move_no_matching() {
+        // Starting position, White to move. "e5" notation would require
+        // a white pawn able to reach e5 — none can on move 1.
+        let state = create_initial_board_state();
+        let mut notation = default_parsed_notation();
+        notation.piece_kind = PieceKind::Pawn;
+        notation.destination_file = 4;
+        notation.destination_rank = 4;
+
+        let result = resolve_parsed_move_to_legal_chess_move(&state, &notation);
+        assert_eq!(result, Err(MoveValidationError::InvalidNoMatchingLegalMove));
+    }
+
+    #[test]
+    fn test_resolve_castle_kingside() {
+        // Construct a position where white kingside castling is legal.
+        let mut state = make_empty_board_state_for_tests();
+        let e1 = SQUARE_INDEX_E1;
+        let h1 = SQUARE_INDEX_H1;
+        let e8 = SQUARE_INDEX_E8;
+        let g1 = square_index_for_test(6, 0);
+        state.board_squares[e1 as usize] = Some(Piece {
+            piece_color: PieceColor::White,
+            piece_kind: PieceKind::King,
+        });
+        state.board_squares[h1 as usize] = Some(Piece {
+            piece_color: PieceColor::White,
+            piece_kind: PieceKind::Rook,
+        });
+        state.board_squares[e8 as usize] = Some(Piece {
+            piece_color: PieceColor::Black,
+            piece_kind: PieceKind::King,
+        });
+        state.castling_rights.white_kingside = true;
+        state.side_to_move = PieceColor::White;
+
+        let mut notation = default_parsed_notation();
+        notation.piece_kind = PieceKind::King;
+        notation.is_castle_kingside = true;
+        // Parser convention: dest = king's landing square.
+        notation.destination_file = 6;
+        notation.destination_rank = 0;
+
+        let resolved =
+            resolve_parsed_move_to_legal_chess_move(&state, &notation).expect("resolve ok");
+        assert_eq!(resolved.from_square_index, e1);
+        assert_eq!(resolved.to_square_index, g1);
+        assert_eq!(resolved.move_category, ChessMoveCategory::CastleKingside);
+    }
+
+    #[test]
+    fn test_resolve_promotion_e8_equals_queen() {
+        // Position: WK a1, WP e7, BK h8. White to move. Pawn e7-e8=Q.
+        let mut state = make_empty_board_state_for_tests();
+        let a1 = SQUARE_INDEX_A1;
+        let e7 = square_index_for_test(4, 6);
+        let e8_idx = square_index_for_test(4, 7);
+        let h8 = SQUARE_INDEX_H8;
+        state.board_squares[a1 as usize] = Some(Piece {
+            piece_color: PieceColor::White,
+            piece_kind: PieceKind::King,
+        });
+        state.board_squares[e7 as usize] = Some(Piece {
+            piece_color: PieceColor::White,
+            piece_kind: PieceKind::Pawn,
+        });
+        state.board_squares[h8 as usize] = Some(Piece {
+            piece_color: PieceColor::Black,
+            piece_kind: PieceKind::King,
+        });
+        state.side_to_move = PieceColor::White;
+
+        let mut notation = default_parsed_notation();
+        notation.piece_kind = PieceKind::Pawn;
+        notation.destination_file = 4;
+        notation.destination_rank = 7;
+        notation.promotion_piece_kind = Some(PieceKind::Queen);
+
+        let resolved =
+            resolve_parsed_move_to_legal_chess_move(&state, &notation).expect("resolve ok");
+        assert_eq!(resolved.from_square_index, e7);
+        assert_eq!(resolved.to_square_index, e8_idx);
+        assert_eq!(resolved.move_category, ChessMoveCategory::Promotion);
+        assert_eq!(resolved.promotion_piece_kind, Some(PieceKind::Queen));
+    }
+
+    #[test]
+    fn test_resolve_promotion_required_when_piece_kind_omitted() {
+        // Same position as above. Notation does not specify a
+        // promotion piece. Expect InvalidPromotionRequired.
+        let mut state = make_empty_board_state_for_tests();
+        let a1 = SQUARE_INDEX_A1;
+        let e7 = square_index_for_test(4, 6);
+        let h8 = SQUARE_INDEX_H8;
+        state.board_squares[a1 as usize] = Some(Piece {
+            piece_color: PieceColor::White,
+            piece_kind: PieceKind::King,
+        });
+        state.board_squares[e7 as usize] = Some(Piece {
+            piece_color: PieceColor::White,
+            piece_kind: PieceKind::Pawn,
+        });
+        state.board_squares[h8 as usize] = Some(Piece {
+            piece_color: PieceColor::Black,
+            piece_kind: PieceKind::King,
+        });
+        state.side_to_move = PieceColor::White;
+
+        let mut notation = default_parsed_notation();
+        notation.piece_kind = PieceKind::Pawn;
+        notation.destination_file = 4;
+        notation.destination_rank = 7;
+        // promotion_piece_kind intentionally left as None.
+
+        let result = resolve_parsed_move_to_legal_chess_move(&state, &notation);
+        assert_eq!(result, Err(MoveValidationError::InvalidPromotionRequired));
     }
 }
 
@@ -3298,7 +7368,7 @@ mod game_time_tests {
             en_passant_target_square: None,
             fullmove_number: 1,
             halfmove_clock: 0,
-            game_status: GameStatus::Playing,
+            game_status: GameStatus::StillPlaying,
         }
     }
 
@@ -3920,6 +7990,23 @@ pub struct MemochessGameConfig {
     /// consecutive half-moves with no pawn move and no capture.
     /// In range `[MIN_N_MOVE_RULE_VALUE, MAX_N_MOVE_RULE_VALUE]`.
     pub n_move_rule: u16,
+
+    /// Unix timestamp (seconds since epoch) captured at the start of
+    /// `q_and_a_setup_bootstrap`.
+    ///
+    /// Used as the filename infix for the bootstrap error log file
+    /// (`chess_error_logs_<timestamp>.txt`, Section 57) and the
+    /// game-log file (`chess_game_log_<timestamp>.txt`, Section 63),
+    /// so both log files from one bootstrap run share the same
+    /// filename infix and can be correlated by file listing.
+    ///
+    /// A value of `0` indicates a degraded clock state at bootstrap
+    /// entry. The log files still write correctly; only the filename
+    /// infix is degraded.
+    ///
+    /// The full `u64` range is valid. No range validation is applied
+    /// at construction time.
+    pub bootstrap_run_unix_timestamp_seconds: u64,
 }
 
 // ============================================================================
@@ -3965,6 +8052,18 @@ impl MemochessGameConfig {
     pub fn black_player_name_as_bytes(&self) -> &[u8] {
         let length_as_usize: usize = self.black_player_name_length as usize;
         &self.black_player_name_buffer[..length_as_usize]
+    }
+
+    /// Returns the bootstrap-run Unix timestamp (seconds since epoch).
+    ///
+    /// Used as the filename infix for both the bootstrap error log
+    /// and the game log so the two files from one run can be
+    /// correlated by directory listing.
+    ///
+    /// A returned value of `0` indicates a degraded clock state at
+    /// bootstrap entry; the caller may proceed.
+    pub const fn bootstrap_run_unix_timestamp_seconds(&self) -> u64 {
+        self.bootstrap_run_unix_timestamp_seconds
     }
 
     /// Construct a `MemochessGameConfig` from validated inputs.
@@ -4032,6 +8131,7 @@ impl MemochessGameConfig {
         max_time_limit_per_player_seconds: u32,
         refresh_rate_seconds: u8,
         n_move_rule: u16,
+        bootstrap_run_unix_timestamp_seconds: u64,
     ) -> Result<MemochessGameConfig, MemochessGameConfigError> {
         // ---- Validate the three filesystem paths ----
 
@@ -4161,6 +8261,7 @@ impl MemochessGameConfig {
             max_time_limit_per_player_seconds: max_time_limit_per_player_seconds,
             refresh_rate_seconds: refresh_rate_seconds,
             n_move_rule: n_move_rule,
+            bootstrap_run_unix_timestamp_seconds: bootstrap_run_unix_timestamp_seconds,
         })
     }
 
@@ -4179,7 +8280,6 @@ impl MemochessGameConfig {
         };
         &self.memo_toml_files_directory_path_buffer[..safe_length]
     }
-
 }
 
 // ============================================================================
@@ -4463,6 +8563,7 @@ mod memochess_game_config_tests {
         u32,           // max_time_limit_per_player_seconds
         u8,            // refresh_rate_seconds
         u16,           // n_move_rule
+        u64,           // time
     ) {
         (
             b"/tmp/memo_chess_games",
@@ -4474,14 +8575,15 @@ mod memochess_game_config_tests {
             600u32,
             10u8,
             50u16,
+            1_000_000_000, // bootstrap_run_unix_timestamp_seconds
         )
     }
 
     #[test]
     fn constructs_with_all_valid_inputs() {
-        let (m, c, l, u, w, b, t, r, n) = valid_inputs_template();
+        let (m, c, l, u, w, b, t, r, n, bt) = valid_inputs_template();
         let result =
-            MemochessGameConfig::try_construct_memochess_game_config(m, c, l, u, w, b, t, r, n);
+            MemochessGameConfig::try_construct_memochess_game_config(m, c, l, u, w, b, t, r, n, bt);
         let config = match result {
             Ok(v) => v,
             Err(e) => panic!("expected valid config, got error: {:?}", e),
@@ -4499,9 +8601,10 @@ mod memochess_game_config_tests {
 
     #[test]
     fn rejects_empty_memo_toml_files_directory_path() {
-        let (_, c, l, u, w, b, t, r, n) = valid_inputs_template();
-        let result =
-            MemochessGameConfig::try_construct_memochess_game_config(b"", c, l, u, w, b, t, r, n);
+        let (_, c, l, u, w, b, t, r, n, bt) = valid_inputs_template();
+        let result = MemochessGameConfig::try_construct_memochess_game_config(
+            b"", c, l, u, w, b, t, r, n, bt,
+        );
         assert_eq!(
             result,
             Err(MemochessGameConfigError::MemoTomlFilesDirectoryPathEmpty)
@@ -4511,9 +8614,9 @@ mod memochess_game_config_tests {
     #[test]
     fn rejects_overlong_memo_toml_files_directory_path() {
         let overlong = vec![b'a'; MAX_DIRECTORY_PATH_BYTES + 1];
-        let (_, c, l, u, w, b, t, r, n) = valid_inputs_template();
+        let (_, c, l, u, w, b, t, r, n, bt) = valid_inputs_template();
         let result = MemochessGameConfig::try_construct_memochess_game_config(
-            &overlong, c, l, u, w, b, t, r, n,
+            &overlong, c, l, u, w, b, t, r, n, bt,
         );
         assert_eq!(
             result,
@@ -4523,9 +8626,10 @@ mod memochess_game_config_tests {
 
     #[test]
     fn rejects_empty_chrono_sort_temp_directory_path() {
-        let (m, _, l, u, w, b, t, r, n) = valid_inputs_template();
-        let result =
-            MemochessGameConfig::try_construct_memochess_game_config(m, b"", l, u, w, b, t, r, n);
+        let (m, _, l, u, w, b, t, r, n, bt) = valid_inputs_template();
+        let result = MemochessGameConfig::try_construct_memochess_game_config(
+            m, b"", l, u, w, b, t, r, n, bt,
+        );
         assert_eq!(
             result,
             Err(MemochessGameConfigError::ChronoSortTempDirectoryPathEmpty)
@@ -4535,9 +8639,9 @@ mod memochess_game_config_tests {
     #[test]
     fn rejects_overlong_chrono_sort_temp_directory_path() {
         let overlong = vec![b'a'; MAX_DIRECTORY_PATH_BYTES + 1];
-        let (m, _, l, u, w, b, t, r, n) = valid_inputs_template();
+        let (m, _, l, u, w, b, t, r, n, bt) = valid_inputs_template();
         let result = MemochessGameConfig::try_construct_memochess_game_config(
-            m, &overlong, l, u, w, b, t, r, n,
+            m, &overlong, l, u, w, b, t, r, n, bt,
         );
         assert_eq!(
             result,
@@ -4547,9 +8651,10 @@ mod memochess_game_config_tests {
 
     #[test]
     fn rejects_empty_memo_chess_log_directory_path() {
-        let (m, c, _, u, w, b, t, r, n) = valid_inputs_template();
-        let result =
-            MemochessGameConfig::try_construct_memochess_game_config(m, c, b"", u, w, b, t, r, n);
+        let (m, c, _, u, w, b, t, r, n, bt) = valid_inputs_template();
+        let result = MemochessGameConfig::try_construct_memochess_game_config(
+            m, c, b"", u, w, b, t, r, n, bt,
+        );
         assert_eq!(
             result,
             Err(MemochessGameConfigError::MemoChessLogDirectoryPathEmpty)
@@ -4559,9 +8664,9 @@ mod memochess_game_config_tests {
     #[test]
     fn rejects_overlong_memo_chess_log_directory_path() {
         let overlong = vec![b'a'; MAX_DIRECTORY_PATH_BYTES + 1];
-        let (m, c, _, u, w, b, t, r, n) = valid_inputs_template();
+        let (m, c, _, u, w, b, t, r, n, bt) = valid_inputs_template();
         let result = MemochessGameConfig::try_construct_memochess_game_config(
-            m, c, &overlong, u, w, b, t, r, n,
+            m, c, &overlong, u, w, b, t, r, n, bt,
         );
         assert_eq!(
             result,
@@ -4571,43 +8676,46 @@ mod memochess_game_config_tests {
 
     #[test]
     fn rejects_empty_local_user_name() {
-        let (m, c, l, _, w, b, t, r, n) = valid_inputs_template();
-        let result =
-            MemochessGameConfig::try_construct_memochess_game_config(m, c, l, b"", w, b, t, r, n);
+        let (m, c, l, _, w, b, t, r, n, bt) = valid_inputs_template();
+        let result = MemochessGameConfig::try_construct_memochess_game_config(
+            m, c, l, b"", w, b, t, r, n, bt,
+        );
         assert_eq!(result, Err(MemochessGameConfigError::LocalUserNameEmpty));
     }
 
     #[test]
     fn rejects_overlong_local_user_name() {
         let overlong = vec![b'x'; MAX_USERNAME_BYTES + 1];
-        let (m, c, l, _, w, b, t, r, n) = valid_inputs_template();
+        let (m, c, l, _, w, b, t, r, n, bt) = valid_inputs_template();
         let result = MemochessGameConfig::try_construct_memochess_game_config(
-            m, c, l, &overlong, w, b, t, r, n,
+            m, c, l, &overlong, w, b, t, r, n, bt,
         );
         assert_eq!(result, Err(MemochessGameConfigError::LocalUserNameTooLong));
     }
 
     #[test]
     fn rejects_empty_white_player_name() {
-        let (m, c, l, u, _, b, t, r, n) = valid_inputs_template();
-        let result =
-            MemochessGameConfig::try_construct_memochess_game_config(m, c, l, u, b"", b, t, r, n);
+        let (m, c, l, u, _, b, t, r, n, bt) = valid_inputs_template();
+        let result = MemochessGameConfig::try_construct_memochess_game_config(
+            m, c, l, u, b"", b, t, r, n, bt,
+        );
         assert_eq!(result, Err(MemochessGameConfigError::WhitePlayerNameEmpty));
     }
 
     #[test]
     fn rejects_empty_black_player_name() {
-        let (m, c, l, u, w, _, t, r, n) = valid_inputs_template();
-        let result =
-            MemochessGameConfig::try_construct_memochess_game_config(m, c, l, u, w, b"", t, r, n);
+        let (m, c, l, u, w, _, t, r, n, bt) = valid_inputs_template();
+        let result = MemochessGameConfig::try_construct_memochess_game_config(
+            m, c, l, u, w, b"", t, r, n, bt,
+        );
         assert_eq!(result, Err(MemochessGameConfigError::BlackPlayerNameEmpty));
     }
 
     #[test]
     fn rejects_identical_white_and_black_player_names() {
-        let (m, c, l, u, w, _, t, r, n) = valid_inputs_template();
+        let (m, c, l, u, w, _, t, r, n, bt) = valid_inputs_template();
         let result =
-            MemochessGameConfig::try_construct_memochess_game_config(m, c, l, u, w, w, t, r, n);
+            MemochessGameConfig::try_construct_memochess_game_config(m, c, l, u, w, w, t, r, n, bt);
         assert_eq!(
             result,
             Err(MemochessGameConfigError::WhiteAndBlackPlayerNamesIdentical)
@@ -4616,10 +8724,10 @@ mod memochess_game_config_tests {
 
     #[test]
     fn rejects_below_minimum_time_limit() {
-        let (m, c, l, u, w, b, _, r, n) = valid_inputs_template();
+        let (m, c, l, u, w, b, _, r, n, bt) = valid_inputs_template();
         let too_low = MIN_TIME_LIMIT_PER_PLAYER_SECONDS - 1;
         let result = MemochessGameConfig::try_construct_memochess_game_config(
-            m, c, l, u, w, b, too_low, r, n,
+            m, c, l, u, w, b, too_low, r, n, bt,
         );
         assert_eq!(
             result,
@@ -4629,40 +8737,40 @@ mod memochess_game_config_tests {
 
     #[test]
     fn rejects_refresh_rate_below_minimum() {
-        let (m, c, l, u, w, b, t, _, n) = valid_inputs_template();
+        let (m, c, l, u, w, b, t, _, n, bt) = valid_inputs_template();
         let too_low = MIN_REFRESH_RATE_SECONDS - 1;
         let result = MemochessGameConfig::try_construct_memochess_game_config(
-            m, c, l, u, w, b, t, too_low, n,
+            m, c, l, u, w, b, t, too_low, n, bt,
         );
         assert_eq!(result, Err(MemochessGameConfigError::RefreshRateOutOfRange));
     }
 
     #[test]
     fn rejects_refresh_rate_above_maximum() {
-        let (m, c, l, u, w, b, t, _, n) = valid_inputs_template();
+        let (m, c, l, u, w, b, t, _, n, bt) = valid_inputs_template();
         let too_high = MAX_REFRESH_RATE_SECONDS + 1;
         let result = MemochessGameConfig::try_construct_memochess_game_config(
-            m, c, l, u, w, b, t, too_high, n,
+            m, c, l, u, w, b, t, too_high, n, bt,
         );
         assert_eq!(result, Err(MemochessGameConfigError::RefreshRateOutOfRange));
     }
 
     #[test]
     fn rejects_n_move_rule_below_minimum() {
-        let (m, c, l, u, w, b, t, r, _) = valid_inputs_template();
+        let (m, c, l, u, w, b, t, r, _, bt) = valid_inputs_template();
         let too_low = MIN_N_MOVE_RULE_VALUE - 1;
         let result = MemochessGameConfig::try_construct_memochess_game_config(
-            m, c, l, u, w, b, t, r, too_low,
+            m, c, l, u, w, b, t, r, too_low, bt,
         );
         assert_eq!(result, Err(MemochessGameConfigError::NMoveRuleOutOfRange));
     }
 
     #[test]
     fn rejects_n_move_rule_above_maximum() {
-        let (m, c, l, u, w, b, t, r, _) = valid_inputs_template();
+        let (m, c, l, u, w, b, t, r, _, bt) = valid_inputs_template();
         let too_high = MAX_N_MOVE_RULE_VALUE + 1;
         let result = MemochessGameConfig::try_construct_memochess_game_config(
-            m, c, l, u, w, b, t, r, too_high,
+            m, c, l, u, w, b, t, r, too_high, bt,
         );
         assert_eq!(result, Err(MemochessGameConfigError::NMoveRuleOutOfRange));
     }
@@ -7946,6 +12054,7 @@ pub fn build_memochess_config_if_complete(
     chrono_sort_temp_directory_path_bytes: &[u8],
     memo_chess_log_directory_path_bytes: &[u8],
     local_user_name_bytes: &[u8],
+    bootstrap_run_unix_timestamp_seconds: u64,
 ) -> Option<MemochessGameConfig> {
     // ── Step 1: required fields must all be populated ───────────────
     let (white_name_buffer, white_name_length) = match partial_config.white_player_name {
@@ -8009,6 +12118,7 @@ pub fn build_memochess_config_if_complete(
         max_time_limit_per_player_seconds,
         refresh_rate_seconds,
         n_move_rule,
+        bootstrap_run_unix_timestamp_seconds,
     );
 
     match construction_result {
@@ -8208,6 +12318,7 @@ mod build_memochess_config_if_complete_tests {
     const TEST_CHRONO_SORT_TEMP_PATH: &[u8] = b"/tmp/memo_chess_chrono";
     const TEST_MEMO_CHESS_LOG_PATH: &[u8] = b"/tmp/memo_chess_logs";
     const TEST_LOCAL_USER_NAME: &[u8] = b"tester";
+    const TEST_TIMESTAMP: u64 = 1_000_000_000;
 
     #[test]
     fn finalizes_fully_populated_partial_config() {
@@ -8218,6 +12329,7 @@ mod build_memochess_config_if_complete_tests {
             TEST_CHRONO_SORT_TEMP_PATH,
             TEST_MEMO_CHESS_LOG_PATH,
             TEST_LOCAL_USER_NAME,
+            TEST_TIMESTAMP,
         );
         let config = match finalized {
             Some(c) => c,
@@ -8253,6 +12365,7 @@ mod build_memochess_config_if_complete_tests {
             TEST_CHRONO_SORT_TEMP_PATH,
             TEST_MEMO_CHESS_LOG_PATH,
             TEST_LOCAL_USER_NAME,
+            TEST_TIMESTAMP,
         );
         assert!(finalized.is_none());
     }
@@ -8267,6 +12380,7 @@ mod build_memochess_config_if_complete_tests {
             TEST_CHRONO_SORT_TEMP_PATH,
             TEST_MEMO_CHESS_LOG_PATH,
             TEST_LOCAL_USER_NAME,
+            TEST_TIMESTAMP,
         );
         assert!(finalized.is_none());
     }
@@ -8281,6 +12395,7 @@ mod build_memochess_config_if_complete_tests {
             TEST_CHRONO_SORT_TEMP_PATH,
             TEST_MEMO_CHESS_LOG_PATH,
             TEST_LOCAL_USER_NAME,
+            TEST_TIMESTAMP,
         );
         assert!(finalized.is_none());
     }
@@ -8295,6 +12410,7 @@ mod build_memochess_config_if_complete_tests {
             TEST_CHRONO_SORT_TEMP_PATH,
             TEST_MEMO_CHESS_LOG_PATH,
             TEST_LOCAL_USER_NAME,
+            TEST_TIMESTAMP,
         );
         assert!(finalized.is_none());
     }
@@ -8309,6 +12425,7 @@ mod build_memochess_config_if_complete_tests {
             TEST_CHRONO_SORT_TEMP_PATH,
             TEST_MEMO_CHESS_LOG_PATH,
             TEST_LOCAL_USER_NAME,
+            TEST_TIMESTAMP,
         );
         assert!(finalized.is_none());
     }
@@ -8324,6 +12441,7 @@ mod build_memochess_config_if_complete_tests {
             TEST_CHRONO_SORT_TEMP_PATH,
             TEST_MEMO_CHESS_LOG_PATH,
             TEST_LOCAL_USER_NAME,
+            TEST_TIMESTAMP,
         );
         assert!(finalized.is_none());
     }
@@ -8344,6 +12462,7 @@ mod build_memochess_config_if_complete_tests {
             TEST_CHRONO_SORT_TEMP_PATH,
             TEST_MEMO_CHESS_LOG_PATH,
             TEST_LOCAL_USER_NAME,
+            TEST_TIMESTAMP,
         );
         assert!(finalized.is_none());
     }
@@ -17263,6 +21382,9 @@ pub fn q_and_a_setup_bootstrap(
     };
     let memochess_logging_dir_path_bytes = memochess_logging_dir_path_str.as_bytes();
 
+    let bootstrap_run_unix_timestamp_seconds: u64 =
+        read_current_unix_timestamp_seconds_best_effort();
+
     // ----- Main loop -----
     loop {
         // Step 1: attempt finalization if all required fields are set.
@@ -17273,6 +21395,7 @@ pub fn q_and_a_setup_bootstrap(
                 chrono_sort_temp_dir_path_bytes,
                 memochess_logging_dir_path_bytes,
                 local_user_name_bytes,
+                bootstrap_run_unix_timestamp_seconds,
             );
             if let Some(finalized_config) = finalization_attempt {
                 return Ok(finalized_config);
@@ -17408,7 +21531,7 @@ pub struct DungeonMasterState {
     /// `apply_chess_move_to_state` after each successfully resolved
     /// move. End-of-game by checkmate, stalemate, resignation, or
     /// agreed draw surfaces here as `board.game_status` no longer
-    /// being `GameStatus::Playing`.
+    /// being `GameStatus::StillPlaying`.
     pub board: BoardState,
 
     /// Per-player time accounting.
@@ -17551,6 +21674,7 @@ mod dungeon_master_state_tests {
         let max_time_limit_per_player_seconds: u32 = 600;
         let refresh_rate_seconds: u8 = 10;
         let n_move_rule: u16 = 50;
+        let test_timestamp: u64 = 1_000_000_000; // bootstrap_run_unix_timestamp_seconds
 
         let constructed_config_result = MemochessGameConfig::try_construct_memochess_game_config(
             memo_toml_files_directory_path_bytes,
@@ -17562,6 +21686,7 @@ mod dungeon_master_state_tests {
             max_time_limit_per_player_seconds,
             refresh_rate_seconds,
             n_move_rule,
+            test_timestamp,
         );
 
         match constructed_config_result {
@@ -17631,7 +21756,7 @@ mod dungeon_master_state_tests {
         let test_config = build_test_config();
         let initial_state = create_initial_dungeon_master_state(test_config);
 
-        assert_eq!(initial_state.board.game_status, GameStatus::Playing);
+        assert_eq!(initial_state.board.game_status, GameStatus::StillPlaying);
     }
 
     #[test]
@@ -17837,9 +21962,7 @@ enum ScanPositionClassification {
     /// The file at this position contains a resignation command
     /// owned by the target player. The scan stops; the caller will
     /// end the game.
-    FoundResignationCommand {
-        command_unix_timestamp: u64,
-    },
+    FoundResignationCommand { command_unix_timestamp: u64 },
 }
 
 /// Examine one chrono-index position and classify what is found.
@@ -18061,24 +22184,2031 @@ fn scan_chrono_range_for_player_move(
 ///
 /// No heap. No panics. Pure: returns a new `BoardState` (consistent
 /// with the immutable-return-new pattern of `apply_chess_move_to_state`).
-fn apply_timeflag_to_game_status(
-    board: BoardState,
-    game_time: GameTimeState,
-) -> BoardState {
-    if board.game_status != GameStatus::Playing {
+fn apply_timeflag_to_game_status(board: BoardState, game_time: GameTimeState) -> BoardState {
+    if board.game_status != GameStatus::StillPlaying {
         return board;
     }
     match game_time.timeflagged_player {
         Some(PieceColor::White) => {
             let mut updated_board = board;
-            updated_board.game_status = GameStatus::BlackWon;
+            updated_board.game_status = GameStatus::WhitecheeseTimeflagged;
             updated_board
         }
         Some(PieceColor::Black) => {
             let mut updated_board = board;
-            updated_board.game_status = GameStatus::WhiteWon;
+            updated_board.game_status = GameStatus::BlackcheeseTimeflagged;
             updated_board
         }
         None => board,
+    }
+}
+
+// ============================================================================
+// SECTION 62: TUI + Log Output — write_dungeon_master_state_to_tui_and_log
+// ============================================================================
+//
+// ## Project Context
+//
+// This is the per-tick output function of the dungeon-master process.
+// It is called by the outer wrapper (Section 64) once per refresh
+// cycle, after `run_one_dungeon_master_tick` has returned its
+// `TickResult`. The function composes the current game state into a
+// sequence of content lines and emits each line through a
+// caller-supplied closure.
+//
+// The closure pattern (`emit_line: &mut dyn FnMut(&[u8])`) is the
+// "double-publish" seam: in production the wrapper passes a closure
+// that writes each line to the terminal via Buffy AND appends the
+// same line to the game-log file via Section 63. In tests the
+// closure captures emitted lines into a stack-frame-owned vector for
+// assertion.
+//
+// ## What this function writes
+//
+// One frame consists of:
+//
+//   1. ANSI clear-screen sequence written DIRECTLY to the terminal
+//      via Buffy. Not routed through `emit_line`, so it does not
+//      appear in the log.
+//
+//   2. Eight board rank lines, plus a blank line, plus the file-label
+//      line, plus a blank line. Each emitted as one `emit_line` call.
+//
+//   3. Six status block lines: Status, Current Move, Move Number,
+//      White Time, Black Time, Total Time. Each emitted as one
+//      `emit_line` call.
+//
+// Total content lines per frame: 8 + 1 + 1 + 1 + 6 = 17.
+//
+// ## End-of-game behavior
+//
+// When `state.board.game_status != GameStatus::StillPlaying`, the
+// full board and clock lines are still emitted. Only the "Status:"
+// line content changes from "playing" to the variant-specific
+// end-of-game message (e.g., "Checkmate. White wins.").
+//
+// ## View orientation
+//
+// Rendered from Black's perspective if and only if
+// `local_user_name_as_bytes() == black_player_name_as_bytes()`.
+// Otherwise (local user is White, or local user is a spectator who
+// is neither player), rendered from White's perspective.
+//
+// ## Memory & Panic Policy
+//
+// No heap. No panics. Stack buffers throughout. The largest single
+// buffer is the board-rendering scratch sized to hold all board
+// output produced by `format_board_state_as_ascii`; this is split
+// into per-line emits inside the function. Status and clock lines
+// use small stack buffers sized per line.
+
+// ----------------------------------------------------------------------------
+// Section 62 Constants
+// ----------------------------------------------------------------------------
+
+/// Maximum bytes for the board's ASCII representation produced by
+/// `format_board_state_as_ascii`.
+///
+/// ## Sizing rationale
+///
+/// The board format is 8 rank lines of at most 21 bytes each
+/// (" 8  r n b q k b n r\n" = 21), plus one blank line (1), plus
+/// the file-label line "    a b c d e f g h\n" (21), plus a
+/// trailing blank line for safety. We round generously to 256 bytes
+/// to leave clear headroom for any future format adjustment.
+pub const TUI_BOARD_RENDER_BUFFER_BYTES: usize = 256;
+
+/// Maximum bytes for one TUI line.
+///
+/// Sized for the longest expected status line. The widest case is
+/// the n-move-rule message: "Draw due to {n}-move-rule" where {n}
+/// is at most five decimal digits per `MAX_N_MOVE_RULE_VALUE` (1000),
+/// so 27 bytes plus headroom. The clock lines are at most "White
+/// Time: HH:MM:SS / HH:MM:SS" plus headroom for arbitrary hour
+/// counts: ~30 bytes. We use 96 bytes as a safe ceiling.
+pub const TUI_LINE_BUFFER_BYTES: usize = 96;
+
+/// ANSI escape sequence: clear screen and move cursor to home (1,1).
+///
+/// Written directly to the terminal at the start of each frame.
+/// Not part of the content line stream, so it does not reach the
+/// log file.
+pub const ANSI_CLEAR_SCREEN_AND_HOME: &[u8] = b"\x1b[2J\x1b[H";
+
+// ----------------------------------------------------------------------------
+// Internal helper: write a literal byte slice into a buffer at a position
+// ----------------------------------------------------------------------------
+
+/// Append a literal byte slice to `output_buffer` starting at
+/// `current_position`. Returns the new position on success.
+///
+/// On overflow, returns `None`. The caller (the line-formatter
+/// helpers) treats `None` as "line will not fit; truncate and emit
+/// what we have." This is preferable to panicking at the line-
+/// formatter layer.
+fn write_literal_bytes_into_line_buffer(
+    bytes_to_write: &[u8],
+    output_buffer: &mut [u8],
+    current_position: usize,
+) -> Option<usize> {
+    let bytes_to_write_length = bytes_to_write.len();
+    let new_position = current_position.checked_add(bytes_to_write_length)?;
+
+    if new_position > output_buffer.len() {
+        return None;
+    }
+
+    let mut copy_index = 0_usize;
+    while copy_index < bytes_to_write_length {
+        output_buffer[current_position + copy_index] = bytes_to_write[copy_index];
+        copy_index += 1;
+    }
+
+    Some(new_position)
+}
+
+/// Append the decimal ASCII representation of `value` to
+/// `output_buffer` starting at `current_position`. Returns the new
+/// position on success, `None` on overflow.
+///
+/// Internal helper used by the move-number and clock-line formatters.
+fn write_u16_decimal_into_line_buffer(
+    value: u16,
+    output_buffer: &mut [u8],
+    current_position: usize,
+) -> Option<usize> {
+    // u16::MAX is 65535: at most 5 ASCII digits.
+    let mut digit_scratch_buffer: [u8; 5] = [0; 5];
+    let mut digit_count: usize = 0;
+    let mut remaining_value: u16 = value;
+
+    if remaining_value == 0 {
+        digit_scratch_buffer[0] = b'0';
+        digit_count = 1;
+    } else {
+        while remaining_value > 0 && digit_count < digit_scratch_buffer.len() {
+            digit_scratch_buffer[digit_count] = b'0' + (remaining_value % 10) as u8;
+            remaining_value /= 10;
+            digit_count += 1;
+        }
+    }
+
+    // Digits were appended least-significant first; reverse into
+    // the output buffer.
+    let new_position = current_position.checked_add(digit_count)?;
+    if new_position > output_buffer.len() {
+        return None;
+    }
+
+    let mut output_index = 0_usize;
+    while output_index < digit_count {
+        output_buffer[current_position + output_index] =
+            digit_scratch_buffer[digit_count - 1 - output_index];
+        output_index += 1;
+    }
+
+    Some(new_position)
+}
+
+// ----------------------------------------------------------------------------
+// Internal helper: emit one bounded portion of the board buffer as a line
+// ----------------------------------------------------------------------------
+
+/// Split the ASCII board rendering produced by
+/// `format_board_state_as_ascii` into individual lines, calling
+/// `emit_line` once per line.
+///
+/// The board buffer is a sequence of lines separated by `\n`.
+/// Trailing newlines on each line are stripped before the emit
+/// (the closure may add its own terminator if it wants one).
+///
+/// ## Memory & Panic Policy
+///
+/// No heap. No panics. Bounded loop (at most `board_byte_length`
+/// iterations).
+fn emit_board_lines_from_rendered_buffer(
+    rendered_board_buffer: &[u8],
+    board_byte_length: usize,
+    emit_line: &mut dyn FnMut(&[u8]),
+) {
+    let mut line_start_position: usize = 0;
+    let mut scan_position: usize = 0;
+
+    while scan_position < board_byte_length {
+        if rendered_board_buffer[scan_position] == b'\n' {
+            let line_slice = &rendered_board_buffer[line_start_position..scan_position];
+            emit_line(line_slice);
+            line_start_position = scan_position + 1;
+        }
+        scan_position += 1;
+    }
+
+    // Emit any trailing bytes after the last newline (defensive: the
+    // board format may or may not end in a newline).
+    if line_start_position < board_byte_length {
+        let trailing_slice = &rendered_board_buffer[line_start_position..board_byte_length];
+        emit_line(trailing_slice);
+    }
+}
+
+// ----------------------------------------------------------------------------
+// Internal helper: write the "Status:" line for the current GameStatus
+// ----------------------------------------------------------------------------
+
+/// Write the "Status:" line into `output_buffer`. Returns the byte
+/// length written.
+///
+/// The status text differs per `GameStatus` variant. For
+/// `DrawForcedNmoveRule`, the configured `n_move_rule` value is
+/// inlined into the message.
+///
+/// ## Returns
+///
+/// `Some(length)` on success; `None` if `output_buffer` is too small
+/// (defensive backstop — `TUI_LINE_BUFFER_BYTES` is sized to fit).
+fn write_status_line_into_buffer(
+    state: &DungeonMasterState,
+    output_buffer: &mut [u8],
+) -> Option<usize> {
+    let mut current_position: usize = 0;
+
+    current_position =
+        write_literal_bytes_into_line_buffer(b"Status: ", output_buffer, current_position)?;
+
+    match state.board.game_status {
+        GameStatus::StillPlaying => {
+            current_position =
+                write_literal_bytes_into_line_buffer(b"playing", output_buffer, current_position)?;
+        }
+        GameStatus::CheckmateWhitewin => {
+            current_position = write_literal_bytes_into_line_buffer(
+                b"Checkmate. White wins.",
+                output_buffer,
+                current_position,
+            )?;
+        }
+        GameStatus::CheckmateBlackwin => {
+            current_position = write_literal_bytes_into_line_buffer(
+                b"Checkmate. Black wins.",
+                output_buffer,
+                current_position,
+            )?;
+        }
+        GameStatus::DrawAgreed => {
+            current_position = write_literal_bytes_into_line_buffer(
+                b"Draw: Players agree to Draw.",
+                output_buffer,
+                current_position,
+            )?;
+        }
+        GameStatus::DrawByRepetition => {
+            current_position = write_literal_bytes_into_line_buffer(
+                b"Draw due to repetition",
+                output_buffer,
+                current_position,
+            )?;
+        }
+        GameStatus::DrawForcedNmoveRule => {
+            current_position = write_literal_bytes_into_line_buffer(
+                b"Draw due to ",
+                output_buffer,
+                current_position,
+            )?;
+            current_position = write_u16_decimal_into_line_buffer(
+                state.config.n_move_rule,
+                output_buffer,
+                current_position,
+            )?;
+            current_position = write_literal_bytes_into_line_buffer(
+                b"-move-rule",
+                output_buffer,
+                current_position,
+            )?;
+        }
+        GameStatus::BlackStalemated => {
+            current_position = write_literal_bytes_into_line_buffer(
+                b"Stalemate. Black is stalemated (cannot move)",
+                output_buffer,
+                current_position,
+            )?;
+        }
+        GameStatus::WhiteStalemated => {
+            current_position = write_literal_bytes_into_line_buffer(
+                b"Stalemate. White is stalemated (cannot move)",
+                output_buffer,
+                current_position,
+            )?;
+        }
+        GameStatus::WhiteResigned => {
+            current_position = write_literal_bytes_into_line_buffer(
+                b"White resigned. Black wins.",
+                output_buffer,
+                current_position,
+            )?;
+        }
+        GameStatus::BlackResigned => {
+            current_position = write_literal_bytes_into_line_buffer(
+                b"Black resigned. White wins.",
+                output_buffer,
+                current_position,
+            )?;
+        }
+        GameStatus::WhitecheeseTimeflagged => {
+            current_position = write_literal_bytes_into_line_buffer(
+                b"White flagged. Black wins.",
+                output_buffer,
+                current_position,
+            )?;
+        }
+        GameStatus::BlackcheeseTimeflagged => {
+            current_position = write_literal_bytes_into_line_buffer(
+                b"Black flagged. White wins.",
+                output_buffer,
+                current_position,
+            )?;
+        }
+    }
+
+    Some(current_position)
+}
+
+// ----------------------------------------------------------------------------
+// Internal helper: write the "Current Move:" line
+// ----------------------------------------------------------------------------
+
+/// Write the "Current Move:" line into `output_buffer`. Indicates
+/// whose turn it currently is (White or Black) based on
+/// `board.side_to_move`.
+fn write_current_move_line_into_buffer(
+    state: &DungeonMasterState,
+    output_buffer: &mut [u8],
+) -> Option<usize> {
+    let mut current_position: usize = 0;
+
+    current_position =
+        write_literal_bytes_into_line_buffer(b"Current Move: ", output_buffer, current_position)?;
+
+    let color_label: &[u8] = match state.board.side_to_move {
+        PieceColor::White => b"White",
+        PieceColor::Black => b"Black",
+    };
+
+    current_position =
+        write_literal_bytes_into_line_buffer(color_label, output_buffer, current_position)?;
+
+    Some(current_position)
+}
+
+// ----------------------------------------------------------------------------
+// Internal helper: write the "Move number:" line
+// ----------------------------------------------------------------------------
+
+/// Write the "Move number:" line into `output_buffer`. The number
+/// is the `fullmove_number` from the board state.
+fn write_move_number_line_into_buffer(
+    state: &DungeonMasterState,
+    output_buffer: &mut [u8],
+) -> Option<usize> {
+    let mut current_position: usize = 0;
+
+    current_position =
+        write_literal_bytes_into_line_buffer(b"Move number: ", output_buffer, current_position)?;
+
+    current_position = write_u16_decimal_into_line_buffer(
+        state.board.fullmove_number,
+        output_buffer,
+        current_position,
+    )?;
+
+    Some(current_position)
+}
+
+// ----------------------------------------------------------------------------
+// Internal helper: write one player's clock line
+// ----------------------------------------------------------------------------
+
+/// Write a player clock line of the form
+/// "<label>: <H:MM:SS> / <H:MM:SS>" into `output_buffer`.
+///
+/// The first H:MM:SS is the player's remaining time as of the
+/// supplied timestamp; the second is the configured per-player time
+/// budget (the "ceiling" the clock counts down from).
+fn write_clock_line_into_buffer(
+    state: &DungeonMasterState,
+    for_color: PieceColor,
+    current_unix_timestamp: u64,
+    output_buffer: &mut [u8],
+) -> Option<usize> {
+    let mut current_position: usize = 0;
+
+    let label_bytes: &[u8] = match for_color {
+        PieceColor::White => b"White Time: ",
+        PieceColor::Black => b"Black Time: ",
+    };
+
+    current_position =
+        write_literal_bytes_into_line_buffer(label_bytes, output_buffer, current_position)?;
+
+    let remaining_seconds: u32 = compute_player_time_remaining_seconds(
+        &state.game_time_state,
+        &state.board,
+        for_color,
+        current_unix_timestamp,
+    );
+
+    // format_seconds_as_hms_into_buffer writes into a sub-slice
+    // starting at current_position.
+    let remaining_hms_byte_count = format_seconds_as_hms_into_buffer(
+        remaining_seconds,
+        &mut output_buffer[current_position..],
+    )
+    .ok()?;
+    current_position = current_position.checked_add(remaining_hms_byte_count)?;
+
+    current_position =
+        write_literal_bytes_into_line_buffer(b" / ", output_buffer, current_position)?;
+
+    let max_per_player_seconds: u32 = state.config.max_time_limit_per_player_seconds;
+    let ceiling_hms_byte_count = format_seconds_as_hms_into_buffer(
+        max_per_player_seconds,
+        &mut output_buffer[current_position..],
+    )
+    .ok()?;
+    current_position = current_position.checked_add(ceiling_hms_byte_count)?;
+
+    Some(current_position)
+}
+
+// ----------------------------------------------------------------------------
+// Internal helper: write the "Total Time:" line
+// ----------------------------------------------------------------------------
+
+/// Write the "Total Time:" line into `output_buffer`. The total
+/// time is the wall-clock elapsed since the first move was processed.
+fn write_total_time_line_into_buffer(
+    state: &DungeonMasterState,
+    current_unix_timestamp: u64,
+    output_buffer: &mut [u8],
+) -> Option<usize> {
+    let mut current_position: usize = 0;
+
+    current_position =
+        write_literal_bytes_into_line_buffer(b"Total Time: ", output_buffer, current_position)?;
+
+    let total_elapsed_seconds_as_u64: u64 = compute_total_elapsed_seconds_since_game_start(
+        &state.game_time_state,
+        current_unix_timestamp,
+    );
+
+    // format_seconds_as_hms_into_buffer takes u32. Saturate the
+    // wall-clock value into u32. u32::MAX seconds is ~136 years,
+    // so saturation is purely defensive.
+    let total_elapsed_seconds_saturated_u32: u32 = if total_elapsed_seconds_as_u64 > u32::MAX as u64
+    {
+        u32::MAX
+    } else {
+        total_elapsed_seconds_as_u64 as u32
+    };
+
+    let hms_byte_count = format_seconds_as_hms_into_buffer(
+        total_elapsed_seconds_saturated_u32,
+        &mut output_buffer[current_position..],
+    )
+    .ok()?;
+    current_position = current_position.checked_add(hms_byte_count)?;
+
+    Some(current_position)
+}
+
+// ----------------------------------------------------------------------------
+// Internal helper: decide view orientation
+// ----------------------------------------------------------------------------
+
+/// Returns true if the rendered board should be shown from White's
+/// perspective.
+///
+/// Per project spec: render from Black's view only if the local
+/// user is the black player. In all other cases (White player, or
+/// a spectator who is neither player), render from White's view.
+fn should_render_from_white_view(config: &MemochessGameConfig) -> bool {
+    config.local_user_name_as_bytes() != config.black_player_name_as_bytes()
+}
+
+// ----------------------------------------------------------------------------
+// Internal helper: emit one formatted line via the closure
+// ----------------------------------------------------------------------------
+
+/// Format a single status block line into a small stack buffer
+/// using `formatter`, then call `emit_line` with the resulting
+/// content. If formatting overflows the buffer, emit a defensive
+/// fallback message instead of skipping the line silently.
+///
+/// The fallback ("(line render error)") is purely defensive: with
+/// the sizes chosen for `TUI_LINE_BUFFER_BYTES` and the bounded
+/// inputs (config values are range-checked at construction), the
+/// formatter cannot overflow in any reachable state. The fallback
+/// exists so a future change that violates that assumption produces
+/// a visible artifact rather than a silently dropped line.
+fn emit_one_formatted_line(
+    formatter: impl FnOnce(&mut [u8]) -> Option<usize>,
+    emit_line: &mut dyn FnMut(&[u8]),
+) {
+    let mut line_buffer: [u8; TUI_LINE_BUFFER_BYTES] = [0; TUI_LINE_BUFFER_BYTES];
+
+    match formatter(&mut line_buffer) {
+        Some(line_length) => {
+            emit_line(&line_buffer[..line_length]);
+        }
+        None => {
+            emit_line(b"(line render error)");
+        }
+    }
+}
+
+// ----------------------------------------------------------------------------
+// Public entry point
+// ----------------------------------------------------------------------------
+
+/// Compose the current dungeon-master state into a sequence of
+/// content lines and emit them, in order, through the supplied
+/// `emit_line` closure.
+///
+/// ## Project Context
+///
+/// Called once per refresh cycle by the outer wrapper (Section 64).
+/// In production the wrapper passes a closure that writes each line
+/// to the terminal via Buffy and appends the same line to the
+/// game-log file. In tests the closure captures emitted lines for
+/// assertion.
+///
+/// ## Side effects
+///
+/// Writes the ANSI clear-screen sequence directly to the terminal
+/// via Buffy at the start of each frame. This is NOT routed through
+/// `emit_line`, so the log file receives content lines only.
+///
+/// On Buffy write failure (unlikely; the terminal sink is typically
+/// always-writable), the clear-screen sequence is silently dropped.
+/// The rest of the frame still emits.
+///
+/// ## Arguments
+///
+/// - `state`: the dungeon-master state to render.
+/// - `current_unix_timestamp`: the wall-clock moment for the frame,
+///   used by the clock-line formatters. Per project policy the
+///   wrapper samples this once per tick and passes it in.
+/// - `emit_line`: closure invoked once per content line. The slice
+///   passed to the closure has no trailing newline; the closure is
+///   free to add one if its destination (terminal, log file)
+///   requires it.
+///
+/// ## Memory & Panic Policy
+///
+/// No heap inside this function. No panics. The board scratch
+/// buffer (256 bytes) and per-line buffer (96 bytes) are stack
+/// resident.
+pub fn write_dungeon_master_state_to_tui_and_log(
+    state: &DungeonMasterState,
+    current_unix_timestamp: u64,
+    emit_line: &mut dyn FnMut(&[u8]),
+) {
+    // ----- Step 1: clear the terminal screen directly (not via emit_line).
+    let _ = buffy_print(
+        "{}",
+        &[BuffyFormatArg::Str(
+            core::str::from_utf8(ANSI_CLEAR_SCREEN_AND_HOME).unwrap_or(""),
+        )],
+    );
+
+    // ----- Step 2: render board into a stack buffer, then emit per line.
+    let mut board_render_buffer: [u8; TUI_BOARD_RENDER_BUFFER_BYTES] =
+        [0; TUI_BOARD_RENDER_BUFFER_BYTES];
+
+    let render_from_white_view = should_render_from_white_view(&state.config);
+
+    match format_board_state_as_ascii(
+        &state.board,
+        render_from_white_view,
+        &mut board_render_buffer,
+    ) {
+        Ok(board_byte_length) => {
+            emit_board_lines_from_rendered_buffer(
+                &board_render_buffer,
+                board_byte_length,
+                emit_line,
+            );
+        }
+        Err(_) => {
+            // Defensive: format_board_state_as_ascii only fails on
+            // buffer-too-small, which is unreachable given the chosen
+            // TUI_BOARD_RENDER_BUFFER_BYTES sizing. Emit a fallback
+            // so the user sees something rather than a silent gap.
+            emit_line(b"(board render error)");
+        }
+    }
+
+    // ----- Step 3: emit the six status block lines.
+    emit_one_formatted_line(
+        |output_buffer| write_status_line_into_buffer(state, output_buffer),
+        emit_line,
+    );
+
+    emit_one_formatted_line(
+        |output_buffer| write_current_move_line_into_buffer(state, output_buffer),
+        emit_line,
+    );
+
+    emit_one_formatted_line(
+        |output_buffer| write_move_number_line_into_buffer(state, output_buffer),
+        emit_line,
+    );
+
+    emit_one_formatted_line(
+        |output_buffer| {
+            write_clock_line_into_buffer(
+                state,
+                PieceColor::White,
+                current_unix_timestamp,
+                output_buffer,
+            )
+        },
+        emit_line,
+    );
+
+    emit_one_formatted_line(
+        |output_buffer| {
+            write_clock_line_into_buffer(
+                state,
+                PieceColor::Black,
+                current_unix_timestamp,
+                output_buffer,
+            )
+        },
+        emit_line,
+    );
+
+    emit_one_formatted_line(
+        |output_buffer| {
+            write_total_time_line_into_buffer(state, current_unix_timestamp, output_buffer)
+        },
+        emit_line,
+    );
+}
+
+// ============================================================================
+// SECTION 62: Cargo Tests
+// ============================================================================
+
+#[cfg(test)]
+mod section_62_write_dungeon_master_state_to_tui_and_log_tests {
+    use super::*;
+
+    /// Helper: build a `MemochessGameConfig` for use in renderer tests.
+    fn build_test_config_for_renderer(
+        local_user_name: &[u8],
+        white_player_name: &[u8],
+        black_player_name: &[u8],
+    ) -> MemochessGameConfig {
+        MemochessGameConfig::try_construct_memochess_game_config(
+            b"/tmp/memo_chess_test_games",
+            b"/tmp/memo_chess_test_chrono",
+            b"/tmp/memo_chess_test_logs",
+            local_user_name,
+            white_player_name,
+            black_player_name,
+            600, // 10-minute per-player budget
+            10,
+            50,
+            1_000_000_000, // bootstrap_run_unix_timestamp_seconds
+        )
+        .expect("test config must construct")
+    }
+
+    /// Helper: capture emitted lines into a Vec<Vec<u8>> using a
+    /// closure. Test-only heap use, per project policy that tests
+    /// may allocate.
+    fn capture_emitted_lines<F>(invoke_renderer: F) -> Vec<Vec<u8>>
+    where
+        F: FnOnce(&mut dyn FnMut(&[u8])),
+    {
+        let mut captured_lines: Vec<Vec<u8>> = Vec::new();
+        let mut emit_line_closure = |line_bytes: &[u8]| {
+            captured_lines.push(line_bytes.to_vec());
+        };
+        invoke_renderer(&mut emit_line_closure);
+        captured_lines
+    }
+
+    #[test]
+    fn initial_state_emits_seventeen_content_lines() {
+        let config = build_test_config_for_renderer(b"tom", b"alice", b"bob");
+        let state = create_initial_dungeon_master_state(config);
+
+        let captured = capture_emitted_lines(|emit_line| {
+            write_dungeon_master_state_to_tui_and_log(&state, 1_000_000_000, emit_line);
+        });
+
+        // 8 board ranks + 1 blank line + 1 file-label line + 6 status block lines = 16
+        // OR with optional trailing blank in board format = 17.
+        // The board format produced by format_board_state_as_ascii is
+        // stable; we assert the structure is "reasonably-sized non-empty
+        // line set" rather than coupling to an exact count that the
+        // board renderer could legitimately adjust.
+        assert!(
+            captured.len() >= 14,
+            "expected at least 14 lines emitted, got {}",
+            captured.len()
+        );
+    }
+
+    #[test]
+    fn initial_state_status_line_says_playing() {
+        let config = build_test_config_for_renderer(b"tom", b"alice", b"bob");
+        let state = create_initial_dungeon_master_state(config);
+
+        let captured = capture_emitted_lines(|emit_line| {
+            write_dungeon_master_state_to_tui_and_log(&state, 0, emit_line);
+        });
+
+        let status_line_present = captured
+            .iter()
+            .any(|line| line.as_slice() == b"Status: playing");
+        assert!(
+            status_line_present,
+            "expected a 'Status: playing' line to be emitted"
+        );
+    }
+
+    #[test]
+    fn initial_state_current_move_says_white() {
+        let config = build_test_config_for_renderer(b"tom", b"alice", b"bob");
+        let state = create_initial_dungeon_master_state(config);
+
+        let captured = capture_emitted_lines(|emit_line| {
+            write_dungeon_master_state_to_tui_and_log(&state, 0, emit_line);
+        });
+
+        let line_present = captured
+            .iter()
+            .any(|line| line.as_slice() == b"Current Move: White");
+        assert!(line_present);
+    }
+
+    #[test]
+    fn initial_state_move_number_is_one() {
+        let config = build_test_config_for_renderer(b"tom", b"alice", b"bob");
+        let state = create_initial_dungeon_master_state(config);
+
+        let captured = capture_emitted_lines(|emit_line| {
+            write_dungeon_master_state_to_tui_and_log(&state, 0, emit_line);
+        });
+
+        let line_present = captured
+            .iter()
+            .any(|line| line.as_slice() == b"Move number: 1");
+        assert!(line_present);
+    }
+
+    #[test]
+    fn initial_state_white_clock_at_full_budget() {
+        let config = build_test_config_for_renderer(b"tom", b"alice", b"bob");
+        let state = create_initial_dungeon_master_state(config);
+
+        let captured = capture_emitted_lines(|emit_line| {
+            write_dungeon_master_state_to_tui_and_log(&state, 0, emit_line);
+        });
+
+        // 600 seconds = "0:10:00"; budget also 600 seconds. Both halves
+        // of the clock line should be "0:10:00".
+        let line_present = captured
+            .iter()
+            .any(|line| line.as_slice() == b"White Time: 0:10:00 / 0:10:00");
+        assert!(
+            line_present,
+            "expected 'White Time: 0:10:00 / 0:10:00' in emitted lines"
+        );
+    }
+
+    #[test]
+    fn initial_state_total_time_zero() {
+        let config = build_test_config_for_renderer(b"tom", b"alice", b"bob");
+        let state = create_initial_dungeon_master_state(config);
+
+        let captured = capture_emitted_lines(|emit_line| {
+            write_dungeon_master_state_to_tui_and_log(&state, 0, emit_line);
+        });
+
+        let line_present = captured
+            .iter()
+            .any(|line| line.as_slice() == b"Total Time: 0:00:00");
+        assert!(line_present);
+    }
+
+    #[test]
+    fn checkmate_white_wins_status_line_correct() {
+        let config = build_test_config_for_renderer(b"tom", b"alice", b"bob");
+        let mut state = create_initial_dungeon_master_state(config);
+        state.board.game_status = GameStatus::CheckmateWhitewin;
+
+        let captured = capture_emitted_lines(|emit_line| {
+            write_dungeon_master_state_to_tui_and_log(&state, 0, emit_line);
+        });
+
+        let line_present = captured
+            .iter()
+            .any(|line| line.as_slice() == b"Status: Checkmate. White wins.");
+        assert!(line_present);
+    }
+
+    #[test]
+    fn black_resigned_status_line_correct() {
+        let config = build_test_config_for_renderer(b"tom", b"alice", b"bob");
+        let mut state = create_initial_dungeon_master_state(config);
+        state.board.game_status = GameStatus::BlackResigned;
+
+        let captured = capture_emitted_lines(|emit_line| {
+            write_dungeon_master_state_to_tui_and_log(&state, 0, emit_line);
+        });
+
+        let line_present = captured
+            .iter()
+            .any(|line| line.as_slice() == b"Status: Black resigned. White wins.");
+        assert!(line_present);
+    }
+
+    #[test]
+    fn white_timeflagged_status_line_correct() {
+        let config = build_test_config_for_renderer(b"tom", b"alice", b"bob");
+        let mut state = create_initial_dungeon_master_state(config);
+        state.board.game_status = GameStatus::WhitecheeseTimeflagged;
+
+        let captured = capture_emitted_lines(|emit_line| {
+            write_dungeon_master_state_to_tui_and_log(&state, 0, emit_line);
+        });
+
+        let line_present = captured
+            .iter()
+            .any(|line| line.as_slice() == b"Status: White flagged. Black wins.");
+        assert!(line_present);
+    }
+
+    #[test]
+    fn black_stalemated_status_line_correct() {
+        let config = build_test_config_for_renderer(b"tom", b"alice", b"bob");
+        let mut state = create_initial_dungeon_master_state(config);
+        state.board.game_status = GameStatus::BlackStalemated;
+
+        let captured = capture_emitted_lines(|emit_line| {
+            write_dungeon_master_state_to_tui_and_log(&state, 0, emit_line);
+        });
+
+        let line_present = captured
+            .iter()
+            .any(|line| line.as_slice() == b"Status: Stalemate. Black is stalemated (cannot move)");
+        assert!(line_present);
+    }
+
+    #[test]
+    fn draw_n_move_rule_status_line_includes_configured_n_value() {
+        let config = build_test_config_for_renderer(b"tom", b"alice", b"bob");
+        let mut state = create_initial_dungeon_master_state(config);
+        state.board.game_status = GameStatus::DrawForcedNmoveRule;
+        // The default config has n_move_rule = 50 per build_test_config_for_renderer.
+
+        let captured = capture_emitted_lines(|emit_line| {
+            write_dungeon_master_state_to_tui_and_log(&state, 0, emit_line);
+        });
+
+        let line_present = captured
+            .iter()
+            .any(|line| line.as_slice() == b"Status: Draw due to 50-move-rule");
+        assert!(
+            line_present,
+            "expected 'Status: Draw due to 50-move-rule' in emitted lines"
+        );
+    }
+
+    #[test]
+    fn draw_by_repetition_status_line_correct() {
+        let config = build_test_config_for_renderer(b"tom", b"alice", b"bob");
+        let mut state = create_initial_dungeon_master_state(config);
+        state.board.game_status = GameStatus::DrawByRepetition;
+
+        let captured = capture_emitted_lines(|emit_line| {
+            write_dungeon_master_state_to_tui_and_log(&state, 0, emit_line);
+        });
+
+        let line_present = captured
+            .iter()
+            .any(|line| line.as_slice() == b"Status: Draw due to repetition");
+        assert!(line_present);
+    }
+
+    #[test]
+    fn draw_agreed_status_line_correct() {
+        let config = build_test_config_for_renderer(b"tom", b"alice", b"bob");
+        let mut state = create_initial_dungeon_master_state(config);
+        state.board.game_status = GameStatus::DrawAgreed;
+
+        let captured = capture_emitted_lines(|emit_line| {
+            write_dungeon_master_state_to_tui_and_log(&state, 0, emit_line);
+        });
+
+        let line_present = captured
+            .iter()
+            .any(|line| line.as_slice() == b"Status: Draw: Players agree to Draw.");
+        assert!(line_present);
+    }
+
+    #[test]
+    fn view_orientation_white_for_white_player_local_user() {
+        let config = build_test_config_for_renderer(b"alice", b"alice", b"bob");
+        // local_user_name == white_player_name, so view should be White's.
+        let from_white = should_render_from_white_view(&config);
+        assert!(from_white);
+    }
+
+    #[test]
+    fn view_orientation_black_for_black_player_local_user() {
+        let config = build_test_config_for_renderer(b"bob", b"alice", b"bob");
+        // local_user_name == black_player_name, so view should be Black's.
+        let from_white = should_render_from_white_view(&config);
+        assert!(!from_white);
+    }
+
+    #[test]
+    fn view_orientation_white_for_spectator_local_user() {
+        let config = build_test_config_for_renderer(b"carol", b"alice", b"bob");
+        // local_user_name matches neither player; default to White's view.
+        let from_white = should_render_from_white_view(&config);
+        assert!(from_white);
+    }
+}
+
+// ============================================================================
+// SECTION 63: Game-Log Writer and Terminal-Write Helper
+// ============================================================================
+//
+// ## Project Context
+//
+// This section provides the two destinations of the double-publish
+// closure that the wrapper (Section 64) will pass to
+// `write_dungeon_master_state_to_tui_and_log` (Section 62):
+//
+//   1. Terminal destination: write one content line to stdout via
+//      Buffy, with newline. Implemented by
+//      `write_one_line_to_terminal_via_buffy_best_effort`.
+//
+//   2. Log destination: open the game-log file in append mode,
+//      write one content line followed by `\n`, close. Implemented
+//      by `append_one_line_to_game_log_file_best_effort`. Mirrors
+//      the open-append-close pattern of
+//      `append_skip_event_to_log_file_best_effort` (Section 57).
+//
+// Both functions are best-effort: any I/O failure is silently
+// dropped, the game continues, and `DungeonMasterState` is never
+// touched. The double-publish is non-essential observability; a
+// dropped line is preferable to a halted game.
+//
+// ## Filename convention
+//
+// The game-log filename is
+//   `chess_game_log_<bootstrap_run_unix_timestamp>.txt`
+// produced by `build_game_log_filename_into_buffer`. The infix is
+// the bootstrap-run Unix timestamp captured at
+// `q_and_a_setup_bootstrap` entry and carried through
+// `MemochessGameConfig.bootstrap_run_unix_timestamp_seconds`. This
+// matches the bootstrap error-log filename pattern from Section 57
+// so both files from one run share the same infix.
+//
+// ## What this section does NOT do
+//
+// - Does not format any content. Content lines arrive as `&[u8]`
+//   from Section 62.
+// - Does not append metadata, timestamps, or severity levels to
+//   per-line output. The line written to the log is byte-identical
+//   to the line written to the terminal, plus a single trailing `\n`.
+// - Does not hold a file handle between calls. Each call opens,
+//   appends, closes.
+// - Does not create the log directory. The bootstrap layer ensures
+//   the directory exists (see `ensure_logging_directory_exists_best_effort`
+//   in Section 59).
+
+// ----------------------------------------------------------------------------
+// Section 63 Constants
+// ----------------------------------------------------------------------------
+
+/// Filename prefix for game-log files.
+///
+/// The complete filename is
+///   `<prefix><bootstrap_run_unix_timestamp_decimal><suffix>`
+/// where the timestamp is filled in by the filename builder.
+pub const GAME_LOG_FILENAME_PREFIX: &[u8] = b"chess_game_log_";
+
+/// Filename suffix (extension) for game-log files.
+pub const GAME_LOG_FILENAME_SUFFIX: &[u8] = b".txt";
+
+/// Stack-buffer size for assembling a game-log filename.
+///
+/// Sized to accommodate prefix (15 bytes) + maximum `u64` decimal
+/// representation (20 bytes) + suffix (4 bytes) = 39 bytes, rounded
+/// up to 48 for headroom and alignment.
+pub const MAX_GAME_LOG_FILENAME_BYTES: usize = 48;
+
+// ----------------------------------------------------------------------------
+// Internal helper: write u64 as decimal ASCII into a buffer
+// ----------------------------------------------------------------------------
+
+/// Write the decimal ASCII representation of `value` into the front
+/// of `output_buffer`. Returns the byte length written, or `None`
+/// if the buffer is too small.
+///
+/// This is a local copy of the same helper used by Section 57's
+/// filename builder. The duplication is deliberate: each section's
+/// filename builder owns its own copy so neither section depends on
+/// an internal helper from the other, and future changes to one
+/// builder's number-formatting policy do not affect the other.
+fn write_u64_decimal_into_game_log_filename_buffer(
+    value: u64,
+    output_buffer: &mut [u8],
+) -> Option<usize> {
+    // u64::MAX is 18_446_744_073_709_551_615: at most 20 ASCII digits.
+    let mut digit_scratch_buffer: [u8; 20] = [0; 20];
+    let mut digit_count: usize = 0;
+    let mut remaining_value: u64 = value;
+
+    if remaining_value == 0 {
+        digit_scratch_buffer[0] = b'0';
+        digit_count = 1;
+    } else {
+        while remaining_value > 0 && digit_count < digit_scratch_buffer.len() {
+            digit_scratch_buffer[digit_count] = b'0' + (remaining_value % 10) as u8;
+            remaining_value /= 10;
+            digit_count += 1;
+        }
+    }
+
+    if digit_count > output_buffer.len() {
+        return None;
+    }
+
+    // Reverse the digits into the output buffer (digits were
+    // produced least-significant first).
+    let mut output_index = 0_usize;
+    while output_index < digit_count {
+        output_buffer[output_index] = digit_scratch_buffer[digit_count - 1 - output_index];
+        output_index += 1;
+    }
+
+    Some(digit_count)
+}
+
+// ----------------------------------------------------------------------------
+// Game-log filename builder
+// ----------------------------------------------------------------------------
+
+/// Assemble the game-log filename
+/// `chess_game_log_<unix_timestamp_decimal>.txt` into the supplied
+/// stack buffer.
+///
+/// ## Arguments
+///
+/// - `bootstrap_run_unix_timestamp_seconds`: the timestamp infix.
+///   Taken from `MemochessGameConfig.bootstrap_run_unix_timestamp_seconds`
+///   by the wrapper.
+/// - `output_buffer`: a writable byte buffer with capacity at least
+///   `MAX_GAME_LOG_FILENAME_BYTES`.
+///
+/// ## Returns
+///
+/// `Some(filename_byte_length)` on success.
+/// `None` if `output_buffer` is too small to hold prefix + timestamp
+/// + suffix.
+///
+/// ## Memory & Panic Policy
+///
+/// No heap. No panics. Stack-only.
+pub fn build_game_log_filename_into_buffer(
+    bootstrap_run_unix_timestamp_seconds: u64,
+    output_buffer: &mut [u8],
+) -> Option<usize> {
+    let mut current_write_position: usize = 0;
+
+    // Write the prefix.
+    let prefix_byte_length = GAME_LOG_FILENAME_PREFIX.len();
+    if current_write_position + prefix_byte_length > output_buffer.len() {
+        return None;
+    }
+    let mut copy_index = 0_usize;
+    while copy_index < prefix_byte_length {
+        output_buffer[current_write_position + copy_index] = GAME_LOG_FILENAME_PREFIX[copy_index];
+        copy_index += 1;
+    }
+    current_write_position += prefix_byte_length;
+
+    // Write the timestamp infix.
+    let timestamp_byte_length = write_u64_decimal_into_game_log_filename_buffer(
+        bootstrap_run_unix_timestamp_seconds,
+        &mut output_buffer[current_write_position..],
+    )?;
+    current_write_position += timestamp_byte_length;
+
+    // Write the suffix.
+    let suffix_byte_length = GAME_LOG_FILENAME_SUFFIX.len();
+    if current_write_position + suffix_byte_length > output_buffer.len() {
+        return None;
+    }
+    let mut copy_index = 0_usize;
+    while copy_index < suffix_byte_length {
+        output_buffer[current_write_position + copy_index] = GAME_LOG_FILENAME_SUFFIX[copy_index];
+        copy_index += 1;
+    }
+    current_write_position += suffix_byte_length;
+
+    Some(current_write_position)
+}
+
+// ----------------------------------------------------------------------------
+// Terminal-write helper (best effort)
+// ----------------------------------------------------------------------------
+
+/// Write one content line to the terminal via Buffy, followed by a
+/// newline.
+///
+/// ## Project Context
+///
+/// Used by the wrapper's double-publish closure as the terminal
+/// half. The line content is whatever
+/// `write_dungeon_master_state_to_tui_and_log` (Section 62) emits;
+/// the terminator (`\n`) is added here so that Section 62 itself
+/// emits no trailing newlines.
+///
+/// ## Best-effort semantics
+///
+/// Buffy's `buffy_println` returns `io::Result<()>`. Failure paths
+/// (e.g., stdout is closed, terminal is unreachable) are silently
+/// dropped. The game continues.
+///
+/// ## Arguments
+///
+/// - `line_bytes`: the line content. May contain any ASCII or
+///   UTF-8 bytes. Non-UTF-8 sequences are written via a fallback
+///   path that emits a defensive placeholder, since `buffy_println`
+///   requires `&str`.
+///
+/// ## Memory & Panic Policy
+///
+/// No heap. No panics. Buffy is stack-only.
+pub fn write_one_line_to_terminal_via_buffy_best_effort(line_bytes: &[u8]) {
+    // Buffy requires &str; attempt UTF-8 conversion.
+    match core::str::from_utf8(line_bytes) {
+        Ok(line_as_str) => {
+            // Format string "{}" plus the line as a single Str arg.
+            // Discarding the io::Result per best-effort semantics.
+            let _ = buffy_println("{}", &[BuffyFormatArg::Str(line_as_str)]);
+        }
+        Err(_) => {
+            // Defensive fallback. The renderer in Section 62 produces
+            // ASCII-only output (ANSI escape sequences plus board
+            // characters plus status text), so this branch is
+            // unreachable in normal operation. Emit a visible marker
+            // so a future change that introduces non-UTF-8 bytes
+            // produces an observable artifact rather than a silent
+            // dropped line.
+            let _ = buffy_println("(non-utf8 line)", &[]);
+        }
+    }
+}
+
+// ----------------------------------------------------------------------------
+// Game-log append helper (best effort)
+// ----------------------------------------------------------------------------
+
+/// Append one content line to the game-log file, followed by `\n`.
+///
+/// ## Project Context
+///
+/// Used by the wrapper's double-publish closure as the log half.
+/// Each call opens the log file in append mode, writes
+/// `line_bytes` + `\n`, and closes the file. No handle is held
+/// between calls.
+///
+/// ## Best-effort semantics
+///
+/// Any I/O failure (filename overflow, directory missing, open
+/// fails, write fails) is silently dropped. The game continues.
+/// This mirrors Section 57's
+/// `append_skip_event_to_log_file_best_effort`.
+///
+/// POSIX guarantees `O_APPEND` writes are atomic at the file-system
+/// level for the short lines this function produces (typically
+/// under 100 bytes), so no locking is needed.
+///
+/// ## Arguments
+///
+/// - `memo_chess_log_directory_path`: the directory in which the
+///   log file lives. Must already exist; this function does NOT
+///   create it. (Directory creation is the bootstrap layer's
+///   responsibility per Section 59.)
+/// - `bootstrap_run_unix_timestamp_seconds`: the filename infix,
+///   taken from `state.config.bootstrap_run_unix_timestamp_seconds()`.
+/// - `line_bytes`: the content line to append. The newline is
+///   added by this function; do not include a trailing newline
+///   in `line_bytes`.
+///
+/// ## Memory & Panic Policy
+///
+/// No panics. Heap touch: one bounded `PathBuf::join` per call,
+/// freed before return (same pattern as Section 57). Stack: one
+/// `MAX_GAME_LOG_FILENAME_BYTES` filename buffer.
+pub fn append_one_line_to_game_log_file_best_effort(
+    memo_chess_log_directory_path: &Path,
+    bootstrap_run_unix_timestamp_seconds: u64,
+    line_bytes: &[u8],
+) {
+    // Step 1: assemble the filename into a stack buffer.
+    let mut filename_buffer: [u8; MAX_GAME_LOG_FILENAME_BYTES] = [0; MAX_GAME_LOG_FILENAME_BYTES];
+    let filename_byte_length = match build_game_log_filename_into_buffer(
+        bootstrap_run_unix_timestamp_seconds,
+        &mut filename_buffer,
+    ) {
+        Some(length_value) => length_value,
+        None => {
+            return;
+        }
+    };
+
+    // Step 2: convert the filename bytes to a &str for join.
+    let filename_str = match core::str::from_utf8(&filename_buffer[..filename_byte_length]) {
+        Ok(s) => s,
+        Err(_) => {
+            // Unreachable: the filename builder writes ASCII only.
+            return;
+        }
+    };
+
+    // Step 3: build the absolute path. PathBuf::join allocates;
+    // bounded by MAX_GAME_LOG_FILENAME_BYTES + directory_path.len(),
+    // and freed before return.
+    let absolute_log_file_path = memo_chess_log_directory_path.join(filename_str);
+
+    // Step 4: open in append mode, create if absent.
+    let mut file_handle = match OpenOptions::new()
+        .append(true)
+        .create(true)
+        .open(&absolute_log_file_path)
+    {
+        Ok(handle_value) => handle_value,
+        Err(_) => {
+            return;
+        }
+    };
+
+    // Step 5: write line_bytes followed by a single newline. Either
+    // write may fail (e.g., disk full); both failures are dropped.
+    if file_handle.write_all(line_bytes).is_err() {
+        return;
+    }
+    let _ = file_handle.write_all(b"\n");
+}
+
+// ============================================================================
+// SECTION 63: Cargo Tests
+// ============================================================================
+
+#[cfg(test)]
+mod section_63_game_log_writer_tests {
+    use super::*;
+
+    // -- Filename builder tests --
+
+    #[test]
+    fn game_log_filename_for_zero_timestamp() {
+        let mut buffer: [u8; MAX_GAME_LOG_FILENAME_BYTES] = [0; MAX_GAME_LOG_FILENAME_BYTES];
+        let length_written = build_game_log_filename_into_buffer(0, &mut buffer)
+            .expect("zero timestamp must produce a filename");
+        assert_eq!(&buffer[..length_written], b"chess_game_log_0.txt");
+    }
+
+    #[test]
+    fn game_log_filename_for_typical_timestamp() {
+        let mut buffer: [u8; MAX_GAME_LOG_FILENAME_BYTES] = [0; MAX_GAME_LOG_FILENAME_BYTES];
+        let length_written = build_game_log_filename_into_buffer(1_778_532_301, &mut buffer)
+            .expect("typical timestamp must produce a filename");
+        assert_eq!(&buffer[..length_written], b"chess_game_log_1778532301.txt");
+    }
+
+    #[test]
+    fn game_log_filename_for_max_u64_timestamp() {
+        let mut buffer: [u8; MAX_GAME_LOG_FILENAME_BYTES] = [0; MAX_GAME_LOG_FILENAME_BYTES];
+        let length_written = build_game_log_filename_into_buffer(u64::MAX, &mut buffer)
+            .expect("max u64 timestamp must fit in the buffer");
+        assert_eq!(
+            &buffer[..length_written],
+            b"chess_game_log_18446744073709551615.txt"
+        );
+    }
+
+    #[test]
+    fn game_log_filename_returns_none_when_buffer_too_small() {
+        // A 10-byte buffer cannot hold the 20-byte minimum
+        // ("chess_game_log_0.txt" is 20 bytes).
+        let mut too_small_buffer: [u8; 10] = [0; 10];
+        let result = build_game_log_filename_into_buffer(0, &mut too_small_buffer);
+        assert!(result.is_none(), "buffer too small must return None");
+    }
+
+    #[test]
+    fn game_log_filename_starts_with_prefix() {
+        let mut buffer: [u8; MAX_GAME_LOG_FILENAME_BYTES] = [0; MAX_GAME_LOG_FILENAME_BYTES];
+        let length_written = build_game_log_filename_into_buffer(42, &mut buffer)
+            .expect("test timestamp must build");
+        let bytes_written = &buffer[..length_written];
+        assert!(bytes_written.starts_with(GAME_LOG_FILENAME_PREFIX));
+    }
+
+    #[test]
+    fn game_log_filename_ends_with_suffix() {
+        let mut buffer: [u8; MAX_GAME_LOG_FILENAME_BYTES] = [0; MAX_GAME_LOG_FILENAME_BYTES];
+        let length_written = build_game_log_filename_into_buffer(42, &mut buffer)
+            .expect("test timestamp must build");
+        let bytes_written = &buffer[..length_written];
+        assert!(bytes_written.ends_with(GAME_LOG_FILENAME_SUFFIX));
+    }
+
+    // -- Terminal write tests --
+    //
+    // write_one_line_to_terminal_via_buffy_best_effort writes to
+    // stdout. We cannot meaningfully capture stdout in a unit test
+    // without process-level redirection, which adds infrastructure
+    // disproportionate to the value. The only properties we can
+    // verify by-construction here are:
+    //   (a) the function does not panic on any input,
+    //   (b) the function returns nothing (so cannot propagate error).
+    //
+    // The behavioral verification of "the right bytes reach stdout"
+    // is left to integration testing (running the demo main and
+    // observing output).
+
+    #[test]
+    fn terminal_write_does_not_panic_on_empty_input() {
+        write_one_line_to_terminal_via_buffy_best_effort(b"");
+        // If we reach this point, no panic occurred.
+    }
+
+    #[test]
+    fn terminal_write_does_not_panic_on_ascii_input() {
+        write_one_line_to_terminal_via_buffy_best_effort(b"hello world");
+    }
+
+    #[test]
+    fn terminal_write_does_not_panic_on_non_utf8_input() {
+        let non_utf8_bytes: [u8; 4] = [0xff, 0xfe, 0xfd, 0xfc];
+        write_one_line_to_terminal_via_buffy_best_effort(&non_utf8_bytes);
+    }
+
+    // -- Log append tests --
+    //
+    // append_one_line_to_game_log_file_best_effort touches the file
+    // system. We verify it does not panic on the failure paths (bad
+    // directory, etc.) and that on a writable temp directory it
+    // produces the expected file content. The latter uses
+    // std::env::temp_dir() and cleans up afterward.
+
+    #[test]
+    fn log_append_does_not_panic_when_directory_does_not_exist() {
+        let nonexistent_directory =
+            Path::new("/this/path/should/not/exist/anywhere/on/the/test/host");
+        append_one_line_to_game_log_file_best_effort(nonexistent_directory, 42, b"any content");
+        // If we reach this point, no panic occurred.
+    }
+
+    #[test]
+    fn log_append_writes_expected_bytes_to_writable_directory() {
+        // Build a unique subdirectory inside the system temp dir.
+        let mut test_directory = std::env::temp_dir();
+        test_directory.push(format!("memo_chess_section63_test_{}", std::process::id()));
+
+        // Ensure it exists, ignoring "already exists" outcomes.
+        let _ = std::fs::create_dir_all(&test_directory);
+
+        // Choose a distinctive timestamp so each test run uses a
+        // unique log file name.
+        let test_timestamp: u64 = 9_999_999_999;
+
+        // First append.
+        append_one_line_to_game_log_file_best_effort(
+            &test_directory,
+            test_timestamp,
+            b"line one of two",
+        );
+
+        // Second append (same call should re-open in append mode).
+        append_one_line_to_game_log_file_best_effort(
+            &test_directory,
+            test_timestamp,
+            b"line two of two",
+        );
+
+        // Read back the log file.
+        let mut expected_log_filename_buffer: [u8; MAX_GAME_LOG_FILENAME_BYTES] =
+            [0; MAX_GAME_LOG_FILENAME_BYTES];
+        let expected_log_filename_length =
+            build_game_log_filename_into_buffer(test_timestamp, &mut expected_log_filename_buffer)
+                .expect("filename must build");
+        let expected_log_filename_str =
+            core::str::from_utf8(&expected_log_filename_buffer[..expected_log_filename_length])
+                .expect("filename must be utf-8");
+        let log_file_path = test_directory.join(expected_log_filename_str);
+
+        let contents = std::fs::read(&log_file_path).expect("log file must be readable");
+        assert_eq!(contents, b"line one of two\nline two of two\n");
+
+        // Cleanup.
+        let _ = std::fs::remove_file(&log_file_path);
+        let _ = std::fs::remove_dir(&test_directory);
+    }
+}
+
+/// testing
+
+// ----------------------------------------------------------------------------
+// Public: the per-tick function
+// ----------------------------------------------------------------------------
+
+/// Perform one tick of the dungeon-master game loop.
+///
+/// ## Project Context
+///
+/// Called by the outer wrapper (Section 62, to be implemented) once
+/// per refresh cycle. Pure with respect to caller state in the sense
+/// that all internal failures map to `TickOutcome` variants rather
+/// than panics or aborts. Takes the current Unix timestamp as a
+/// parameter so the caller can sample the clock once and have all
+/// internal time computations agree on "now."
+///
+/// ## Arguments
+///
+/// - `current_state`: the dungeon-master state at the start of the
+///   tick. Immutable; the function returns a new state.
+/// - `current_unix_timestamp`: wall-clock "now" in Unix seconds.
+///
+/// ## Returns
+///
+/// A `TickResult` containing the new state and a `TickOutcome`
+/// describing what happened. See `TickOutcome` for the meanings of
+/// the variants.
+///
+/// ## Internal sequence
+///
+/// 1. Early return with `NoChange` if the game has already ended
+///    (the wrapper should not be calling the tick in this state,
+///    but defensive check costs nothing).
+/// 2. Refresh the chrono-index against the live memo directory.
+///    On failure, return `ChronoIndexUnreadable` with state unchanged.
+/// 3. Read the new total file count. Bound the scan upper limit at
+///    `MAX_GAME_FILES_FOR_BOOTSTRAP_SCAN` (reusing the bootstrap
+///    constant — the bound applies equally here).
+/// 4. If `last_known_chrono_hash_through_n` is `Some`, verify the
+///    sequence has not been retroactively reordered by calling
+///    `check_chronosort_hash_to_n` over the previously-known range.
+///    On detected reorder, return `ChronoSequenceReordered` with
+///    state unchanged.
+/// 5. Live time-flag check via `check_for_time_flag`. If the player
+///    on the clock has flagged, update `board.game_status` and
+///    return `TimeFlagged`.
+/// 6. Identify whose turn it is and the appropriate cursor.
+/// 7. Scan the chrono range for that player's next candidate file.
+/// 8. Apply whichever outcome was found:
+///      - No candidate: advance cursor to upper bound; return
+///        `NoChange`.
+///      - Move candidate: resolve and apply; on success return
+///        `MoveApplied`; on illegal-move return `NoChange` (cursor
+///        still advances).
+///      - Resignation: end game; return `PlayerResigned`.
+/// 9. Refresh the chrono-sort hash for next-tick anomaly detection.
+/// 10. Return the new state.
+///
+/// ## Memory & Panic Policy
+///
+/// No panics. The chrono-index module performs its own bounded
+/// allocations; none scale per-tick. All other I/O is via no-heap
+/// readers.
+pub fn run_one_dungeon_master_tick(
+    current_state: &DungeonMasterState,
+    current_unix_timestamp: u64,
+) -> TickResult {
+    // ----- Step 1: early return if game has already ended -----
+    if current_state.board.game_status != GameStatus::StillPlaying {
+        return TickResult {
+            new_state: *current_state,
+            outcome: TickOutcome::NoChange,
+        };
+    }
+
+    // Resolve path bytes from config into &Path values for the
+    // chrono-index module. These paths were already validated by
+    // bootstrap; UTF-8 conversion below is a defensive fallthrough.
+    let memo_toml_files_path_bytes: &[u8] = current_state
+        .config
+        .memo_toml_files_directory_path_as_bytes();
+    let chrono_sort_temp_path_bytes: &[u8] = current_state
+        .config
+        .chrono_sort_temp_directory_path_as_bytes();
+
+    let memo_toml_files_path_str: &str = match core::str::from_utf8(memo_toml_files_path_bytes) {
+        Ok(value) => value,
+        Err(_) => {
+            // Path stored in config is non-UTF-8. This should not
+            // happen given bootstrap validation, but the defensive
+            // path returns ChronoIndexUnreadable so the wrapper
+            // retries (and the situation likely persists, but the
+            // tick does not panic).
+            return TickResult {
+                new_state: *current_state,
+                outcome: TickOutcome::ChronoIndexUnreadable,
+            };
+        }
+    };
+    let chrono_sort_temp_path_str: &str = match core::str::from_utf8(chrono_sort_temp_path_bytes) {
+        Ok(value) => value,
+        Err(_) => {
+            return TickResult {
+                new_state: *current_state,
+                outcome: TickOutcome::ChronoIndexUnreadable,
+            };
+        }
+    };
+    let memo_toml_files_path: &Path = Path::new(memo_toml_files_path_str);
+    let chrono_sort_temp_path: &Path = Path::new(chrono_sort_temp_path_str);
+
+    // ----- Step 2: refresh the chrono-index -----
+    let update_result = create_or_update_chrono_index(chrono_sort_temp_path, memo_toml_files_path);
+    let total_committed_file_count: u64 = match update_result {
+        Ok(update_summary) => update_summary.final_file_count,
+        Err(_) => {
+            return TickResult {
+                new_state: *current_state,
+                outcome: TickOutcome::ChronoIndexUnreadable,
+            };
+        }
+    };
+
+    // ----- Step 3: bound the scan upper limit -----
+    let scan_upper_bound: u64 = if total_committed_file_count > MAX_GAME_FILES_FOR_BOOTSTRAP_SCAN {
+        MAX_GAME_FILES_FOR_BOOTSTRAP_SCAN
+    } else {
+        total_committed_file_count
+    };
+
+    // ----- Step 4: chrono-sort hash anomaly check -----
+    if let Some(previously_known_hash) = current_state.last_known_chrono_hash_through_n {
+        if current_state.last_known_file_count > 0 {
+            let last_indexed_position_zero_based: u64 = current_state.last_known_file_count - 1;
+            let hash_check_result = check_chronosort_hash_to_n(
+                chrono_sort_temp_path,
+                last_indexed_position_zero_based,
+                previously_known_hash,
+            );
+            match hash_check_result {
+                Ok(true) => {
+                    // Sequence intact; continue.
+                }
+                Ok(false) => {
+                    // Retroactive reorder detected; wrapper decides
+                    // recovery. State unchanged.
+                    return TickResult {
+                        new_state: *current_state,
+                        outcome: TickOutcome::ChronoSequenceReordered,
+                    };
+                }
+                Err(_) => {
+                    // Defensive: treat hash-check I/O failure as a
+                    // reorder signal (the wrapper handles both the
+                    // same way: rebuild from initial state).
+                    return TickResult {
+                        new_state: *current_state,
+                        outcome: TickOutcome::ChronoSequenceReordered,
+                    };
+                }
+            }
+        }
+    }
+
+    // ----- Step 5: live time-flag check -----
+    let mut working_state: DungeonMasterState = *current_state;
+    let flag_check_result = check_for_time_flag(
+        &mut working_state.game_time_state,
+        &working_state.board,
+        current_unix_timestamp,
+    );
+    if flag_check_result.is_some() {
+        working_state.board =
+            apply_timeflag_to_game_status(working_state.board, working_state.game_time_state);
+        // Even though no move was processed this tick, refresh the
+        // last_known fields if the file count grew. Skipping for
+        // simplicity: a terminated game does not need next-tick
+        // anomaly tracking.
+        return TickResult {
+            new_state: working_state,
+            outcome: TickOutcome::TimeFlagged,
+        };
+    }
+
+    // ----- Step 6: identify whose turn it is -----
+    let side_to_move: PieceColor = working_state.board.side_to_move;
+    let cursor_for_side_to_move: u64 = match side_to_move {
+        PieceColor::White => working_state.white_next_file_chronoindex_to_check,
+        PieceColor::Black => working_state.black_next_file_chronoindex_to_check,
+    };
+
+    // ----- Step 7: scan for the next candidate -----
+    let scan_outcome = scan_chrono_range_for_player_move(
+        chrono_sort_temp_path,
+        cursor_for_side_to_move,
+        scan_upper_bound,
+        side_to_move,
+        &working_state.config,
+    );
+
+    // ----- Step 8: act on the scan outcome -----
+    let outcome_label: TickOutcome = match scan_outcome {
+        ScanLoopOutcome::NoCandidateFound { advanced_cursor_to } => {
+            // Advance the cursor to the upper bound and return.
+            match side_to_move {
+                PieceColor::White => {
+                    working_state.white_next_file_chronoindex_to_check = advanced_cursor_to;
+                }
+                PieceColor::Black => {
+                    working_state.black_next_file_chronoindex_to_check = advanced_cursor_to;
+                }
+            }
+            TickOutcome::NoChange
+        }
+
+        ScanLoopOutcome::MoveCandidate {
+            parsed_notation,
+            move_unix_timestamp,
+            found_at_position,
+        } => {
+            // Advance the cursor past this position regardless of
+            // whether the move turns out to be legal. This is the
+            // forward-progress rule.
+            let next_position_after: u64 = found_at_position.saturating_add(1);
+            match side_to_move {
+                PieceColor::White => {
+                    working_state.white_next_file_chronoindex_to_check = next_position_after;
+                }
+                PieceColor::Black => {
+                    working_state.black_next_file_chronoindex_to_check = next_position_after;
+                }
+            }
+
+            // Try to resolve the parsed notation to a legal chess
+            // move in the current board state.
+            let resolve_result =
+                resolve_parsed_move_to_legal_chess_move(&working_state.board, &parsed_notation);
+            let resolved_move = match resolve_result {
+                Ok(chess_move_value) => chess_move_value,
+                Err(_) => {
+                    // Illegal move; the player will have to write
+                    // another memo. Cursor already advanced. No move
+                    // applied, no time charged.
+                    return TickResult {
+                        new_state: working_state,
+                        outcome: TickOutcome::NoChange,
+                    };
+                }
+            };
+
+            // Apply the move to the board.
+            let apply_result = apply_chess_move_to_state(&working_state.board, &resolved_move);
+            let new_board = match apply_result {
+                Ok(new_board_value) => new_board_value,
+                Err(_) => {
+                    // Apply rejected the move (defensive: should not
+                    // happen if resolve succeeded). Cursor already
+                    // advanced.
+                    return TickResult {
+                        new_state: working_state,
+                        outcome: TickOutcome::NoChange,
+                    };
+                }
+            };
+
+            // Charge time to the player who just moved. The
+            // GameTimeState API expects the clock-owner color
+            // (side_to_move BEFORE the move was applied), which is
+            // exactly `side_to_move` here.
+            process_move_timestamp_for_game_time(
+                &mut working_state.game_time_state,
+                side_to_move,
+                move_unix_timestamp,
+            );
+
+            // Install the new board.
+            working_state.board = new_board;
+
+            // If the time-charge caused a flag, propagate to
+            // game_status.
+            working_state.board =
+                apply_timeflag_to_game_status(working_state.board, working_state.game_time_state);
+
+            // If the timeflag was the proximate end, surface as
+            // TimeFlagged rather than MoveApplied.
+            if working_state.game_time_state.timeflagged_player.is_some() {
+                TickOutcome::TimeFlagged
+            } else {
+                TickOutcome::MoveApplied
+            }
+        }
+
+        ScanLoopOutcome::ResignationCommand {
+            command_unix_timestamp,
+            found_at_position,
+        } => {
+            // Advance the cursor past the resignation file.
+            let next_position_after: u64 = found_at_position.saturating_add(1);
+            match side_to_move {
+                PieceColor::White => {
+                    working_state.white_next_file_chronoindex_to_check = next_position_after;
+                }
+                PieceColor::Black => {
+                    working_state.black_next_file_chronoindex_to_check = next_position_after;
+                }
+            }
+
+            // Charge thinking time up to the resignation moment to
+            // the resigning player.
+            process_non_move_command_timestamp_for_game_time(
+                &mut working_state.game_time_state,
+                &working_state.board,
+                command_unix_timestamp,
+            );
+
+            // Update game status: the OPPONENT of the resigning
+            // player wins.
+            let mut updated_board = working_state.board;
+            updated_board.game_status = match side_to_move {
+                PieceColor::White => GameStatus::WhiteResigned,
+                PieceColor::Black => GameStatus::BlackResigned,
+            };
+            working_state.board = updated_board;
+
+            TickOutcome::PlayerResigned
+        }
+    };
+
+    // ----- Step 9: refresh the chrono-sort hash for next-tick check -----
+    // Only refresh if the game is still in progress and we have
+    // committed positions to hash.
+    if working_state.board.game_status == GameStatus::StillPlaying && total_committed_file_count > 0
+    {
+        let last_indexed_position_zero_based: u64 = total_committed_file_count - 1;
+        let hash_compute_result =
+            chrono_sort_hash_to_n(chrono_sort_temp_path, last_indexed_position_zero_based);
+        match hash_compute_result {
+            Ok(new_hash) => {
+                working_state.last_known_chrono_hash_through_n = Some(new_hash);
+                working_state.last_known_file_count = total_committed_file_count;
+            }
+            Err(_) => {
+                // Hash refresh failed; leave the previously-known
+                // hash and file count in place. Next tick will
+                // attempt the refresh again.
+            }
+        }
+    }
+
+    // ----- Step 10: return -----
+    TickResult {
+        new_state: working_state,
+        outcome: outcome_label,
+    }
+}
+
+// ============================================================================
+// SECTION 61: Per-Tick Function — Cargo Tests
+// ============================================================================
+
+#[cfg(test)]
+mod run_one_dungeon_master_tick_tests {
+    use super::*;
+    use std::fs;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    /// Counter used to give each test a unique temp-directory name
+    /// so parallel test execution does not collide.
+    static UNIQUE_TEST_DIRECTORY_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    /// Create a fresh trio of empty directories under the system
+    /// temp root, one for memos, one for chrono-index temp, and one
+    /// for logs. Returns `(memo_dir, chrono_dir, log_dir)`.
+    fn make_fresh_test_directories(test_label: &str) -> (PathBuf, PathBuf, PathBuf) {
+        let unique_suffix = UNIQUE_TEST_DIRECTORY_COUNTER.fetch_add(1, Ordering::SeqCst);
+        let process_id = std::process::id();
+        let base_name = format!(
+            "memo_chess_tick_test_{}_{}_{}",
+            test_label, process_id, unique_suffix
+        );
+        let base_path = std::env::temp_dir().join(&base_name);
+
+        let memo_dir = base_path.join("memos");
+        let chrono_dir = base_path.join("chrono");
+        let log_dir = base_path.join("logs");
+
+        for dir in &[&memo_dir, &chrono_dir, &log_dir] {
+            fs::create_dir_all(dir).expect("test setup: create_dir_all failed");
+        }
+        (memo_dir, chrono_dir, log_dir)
+    }
+
+    /// Build a valid `MemochessGameConfig` using the three test
+    /// directory paths.
+    fn build_test_tick_config(
+        memo_dir: &Path,
+        chrono_dir: &Path,
+        log_dir: &Path,
+    ) -> MemochessGameConfig {
+        let memo_dir_str = memo_dir.to_str().expect("test memo path must be UTF-8");
+        let chrono_dir_str = chrono_dir.to_str().expect("test chrono path must be UTF-8");
+        let log_dir_str = log_dir.to_str().expect("test log path must be UTF-8");
+
+        let result = MemochessGameConfig::try_construct_memochess_game_config(
+            memo_dir_str.as_bytes(),
+            chrono_dir_str.as_bytes(),
+            log_dir_str.as_bytes(),
+            b"tester",
+            b"alice",
+            b"bob",
+            600u32,
+            10u8,
+            50u16,
+            1_000_000_000,
+        );
+        match result {
+            Ok(config) => config,
+            Err(e) => panic!("test setup: config construction failed: {:?}", e),
+        }
+    }
+
+    /// Write a memo TOML file into `memo_dir` with the given
+    /// filename, owner, text_message, and timestamp.
+    fn write_memo_file(
+        memo_dir: &Path,
+        filename: &str,
+        owner: &str,
+        text_message: &str,
+        updated_at_unix_timestamp: u64,
+    ) {
+        let contents = format!(
+            "owner = \"{}\"\ntext_message = \"{}\"\nupdated_at_timestamp = \"{}\"\n",
+            owner, text_message, updated_at_unix_timestamp
+        );
+        let file_path = memo_dir.join(filename);
+        fs::write(&file_path, contents).expect("test setup: write memo file failed");
+    }
+
+    #[test]
+    fn empty_directory_yields_no_change() {
+        let (memo_dir, chrono_dir, log_dir) = make_fresh_test_directories("empty_directory");
+        let config = build_test_tick_config(&memo_dir, &chrono_dir, &log_dir);
+        let initial_state = create_initial_dungeon_master_state(config);
+
+        let current_unix_timestamp: u64 = 1_700_000_000;
+        let tick_result = run_one_dungeon_master_tick(&initial_state, current_unix_timestamp);
+
+        assert_eq!(tick_result.outcome, TickOutcome::NoChange);
+        assert_eq!(tick_result.new_state.board.side_to_move, PieceColor::White);
+        assert_eq!(
+            tick_result.new_state.board.game_status,
+            GameStatus::StillPlaying
+        );
+        assert_eq!(
+            tick_result.new_state.white_next_file_chronoindex_to_check,
+            0
+        );
+        assert_eq!(
+            tick_result.new_state.black_next_file_chronoindex_to_check,
+            0
+        );
+    }
+
+    #[test]
+    fn valid_white_opening_move_is_applied() {
+        let (memo_dir, chrono_dir, log_dir) = make_fresh_test_directories("white_opening");
+        let config = build_test_tick_config(&memo_dir, &chrono_dir, &log_dir);
+        let initial_state = create_initial_dungeon_master_state(config);
+
+        write_memo_file(&memo_dir, "00001.toml", "alice", "e4", 1_700_000_100);
+
+        let current_unix_timestamp: u64 = 1_700_000_200;
+        let tick_result = run_one_dungeon_master_tick(&initial_state, current_unix_timestamp);
+
+        assert_eq!(tick_result.outcome, TickOutcome::MoveApplied);
+        assert_eq!(tick_result.new_state.board.side_to_move, PieceColor::Black);
+        assert_eq!(
+            tick_result.new_state.board.game_status,
+            GameStatus::StillPlaying
+        );
+        // e4 means the pawn is now on e4 (index 28) and e2 (index 12) is empty.
+        assert!(
+            tick_result.new_state.board.board_squares[12].is_none(),
+            "e2 should be empty"
+        );
+        match tick_result.new_state.board.board_squares[28] {
+            Some(piece) => {
+                assert_eq!(piece.piece_color, PieceColor::White);
+                assert_eq!(piece.piece_kind, PieceKind::Pawn);
+            }
+            None => panic!("e4 should hold a white pawn"),
+        }
+        assert_eq!(
+            tick_result.new_state.white_next_file_chronoindex_to_check,
+            1
+        );
+    }
+
+    #[test]
+    fn file_owned_by_off_turn_player_is_ignored() {
+        let (memo_dir, chrono_dir, log_dir) = make_fresh_test_directories("off_turn");
+        let config = build_test_tick_config(&memo_dir, &chrono_dir, &log_dir);
+        let initial_state = create_initial_dungeon_master_state(config);
+
+        // It is White's turn at the start. Write a file from Black.
+        write_memo_file(&memo_dir, "00001.toml", "bob", "e5", 1_700_000_100);
+
+        let current_unix_timestamp: u64 = 1_700_000_200;
+        let tick_result = run_one_dungeon_master_tick(&initial_state, current_unix_timestamp);
+
+        assert_eq!(tick_result.outcome, TickOutcome::NoChange);
+        assert_eq!(tick_result.new_state.board.side_to_move, PieceColor::White);
+        // White's cursor advanced past the file because we examined it
+        // and found it was not White's file. The forward-progress rule
+        // ensures the cursor moves.
+        assert_eq!(
+            tick_result.new_state.white_next_file_chronoindex_to_check,
+            1
+        );
+        // Black's cursor stayed at 0 because we are not scanning for Black.
+        assert_eq!(
+            tick_result.new_state.black_next_file_chronoindex_to_check,
+            0
+        );
+    }
+
+    #[test]
+    fn illegal_move_advances_cursor_without_applying() {
+        let (memo_dir, chrono_dir, log_dir) = make_fresh_test_directories("illegal_move");
+        let config = build_test_tick_config(&memo_dir, &chrono_dir, &log_dir);
+        let initial_state = create_initial_dungeon_master_state(config);
+
+        // Write a move that parses syntactically but is illegal in the
+        // starting position: "e5" cannot be played by White on move 1
+        // (the e-pawn cannot move two squares forward to e5, only to e4).
+        write_memo_file(&memo_dir, "00001.toml", "alice", "e5", 1_700_000_100);
+
+        let current_unix_timestamp: u64 = 1_700_000_200;
+        let tick_result = run_one_dungeon_master_tick(&initial_state, current_unix_timestamp);
+
+        assert_eq!(tick_result.outcome, TickOutcome::NoChange);
+        assert_eq!(tick_result.new_state.board.side_to_move, PieceColor::White);
+        // Cursor still advances past the bad file (forward-progress rule).
+        assert_eq!(
+            tick_result.new_state.white_next_file_chronoindex_to_check,
+            1
+        );
+        // No time charged.
+        assert_eq!(
+            tick_result
+                .new_state
+                .game_time_state
+                .white_cumulative_seconds,
+            0
+        );
+    }
+
+    #[test]
+    fn resignation_ends_the_game() {
+        let (memo_dir, chrono_dir, log_dir) = make_fresh_test_directories("resignation");
+        let config = build_test_tick_config(&memo_dir, &chrono_dir, &log_dir);
+        let initial_state = create_initial_dungeon_master_state(config);
+
+        // White (whose turn it is at the start) resigns immediately.
+        write_memo_file(&memo_dir, "00001.toml", "alice", "resign", 1_700_000_100);
+
+        let current_unix_timestamp: u64 = 1_700_000_200;
+        let tick_result = run_one_dungeon_master_tick(&initial_state, current_unix_timestamp);
+
+        assert_eq!(tick_result.outcome, TickOutcome::PlayerResigned);
+        assert_eq!(
+            tick_result.new_state.board.game_status,
+            GameStatus::WhiteResigned,
+        );
+        assert_eq!(
+            tick_result.new_state.white_next_file_chronoindex_to_check,
+            1
+        );
     }
 }
