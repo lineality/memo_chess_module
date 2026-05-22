@@ -23043,7 +23043,7 @@ fn apply_timeflag_to_game_status(board: BoardState, game_time: GameTimeState) ->
 //   2. Eight board rank lines, plus a blank line, plus the file-label
 //      line, plus a blank line. Each emitted as one `emit_line` call.
 //
-//   3. Six status block lines: Status, Current Move, Move Number,
+//   3. Six status block lines: Status, Whose turn is next, Current move-pair,
 //      White Time, Black Time, Total Time. Each emitted as one
 //      `emit_line` call.
 //
@@ -23342,20 +23342,23 @@ fn write_status_line_into_buffer(
 }
 
 // ----------------------------------------------------------------------------
-// Internal helper: write the "Current Move:" line
+// Internal helper: write the "Whose turn is next:" line
 // ----------------------------------------------------------------------------
 
-/// Write the "Current Move:" line into `output_buffer`. Indicates
+/// Write the "Whose turn is next:" line into `output_buffer`. Indicates
 /// whose turn it currently is (White or Black) based on
 /// `board.side_to_move`.
-fn write_current_move_line_into_buffer(
+fn write_whole_move_is_next_line_into_buffer(
     state: &DungeonMasterState,
     output_buffer: &mut [u8],
 ) -> Option<usize> {
     let mut current_position: usize = 0;
 
-    current_position =
-        write_literal_bytes_into_line_buffer(b"Current Move: ", output_buffer, current_position)?;
+    current_position = write_literal_bytes_into_line_buffer(
+        b"Whose turn is next: ",
+        output_buffer,
+        current_position,
+    )?;
 
     let color_label: &[u8] = match state.board.side_to_move {
         PieceColor::White => b"White",
@@ -23369,10 +23372,10 @@ fn write_current_move_line_into_buffer(
 }
 
 // ----------------------------------------------------------------------------
-// Internal helper: write the "Move number:" line
+// Internal helper: write the "Current move-pair:" line
 // ----------------------------------------------------------------------------
 
-/// Write the "Move number:" line into `output_buffer`. The number
+/// Write the "Current move-pair:" line into `output_buffer`. The number
 /// is the `fullmove_number` from the board state.
 fn write_move_number_line_into_buffer(
     state: &DungeonMasterState,
@@ -23380,8 +23383,11 @@ fn write_move_number_line_into_buffer(
 ) -> Option<usize> {
     let mut current_position: usize = 0;
 
-    current_position =
-        write_literal_bytes_into_line_buffer(b"Move number: ", output_buffer, current_position)?;
+    current_position = write_literal_bytes_into_line_buffer(
+        b"Current move-pair: ",
+        output_buffer,
+        current_position,
+    )?;
 
     current_position = write_u16_decimal_into_line_buffer(
         state.board.fullmove_number,
@@ -23623,7 +23629,7 @@ pub fn write_dungeon_master_state_to_tui_and_log(
     );
 
     emit_one_formatted_line(
-        |output_buffer| write_current_move_line_into_buffer(state, output_buffer),
+        |output_buffer| write_whole_move_is_next_line_into_buffer(state, output_buffer),
         emit_line,
     );
 
@@ -23759,7 +23765,7 @@ mod section_62_write_dungeon_master_state_to_tui_and_log_tests {
 
         let line_present = captured
             .iter()
-            .any(|line| line.as_slice() == b"Current Move: White");
+            .any(|line| line.as_slice() == b"Whose turn is next: White");
         assert!(line_present);
     }
 
@@ -23774,7 +23780,7 @@ mod section_62_write_dungeon_master_state_to_tui_and_log_tests {
 
         let line_present = captured
             .iter()
-            .any(|line| line.as_slice() == b"Move number: 1");
+            .any(|line| line.as_slice() == b"Current move-pair: 1");
         assert!(line_present);
     }
 

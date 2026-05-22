@@ -172,7 +172,14 @@ fn main() {
     // // The directory where bootstrap error logs and game logs are written.
     // let memochess_logging_directory = std::env::temp_dir().join("memo_chess_demo_logs");
 
-    let game_files_directory = Path::new("./test_game_files_1").to_path_buf();
+    //  ─────────────
+    //   Select Game
+    //  ─────────────
+    // let game_files_directory = Path::new("./test_game_files_1_prawntakespawn").to_path_buf(); // pawn takes pawn
+    // let game_files_directory = Path::new("./test_game_files_2_whitetime_test").to_path_buf(); // testing white clock
+    // let game_files_directory = Path::new("./test_game_files_4_whitetime_test2").to_path_buf(); // pawn takes pawn
+    let game_files_directory = Path::new("./test_game_files_3_foolmates").to_path_buf(); // pawn takes pawn
+
     let chrono_sort_temp_directory = Path::new("./test_chrono_temp").to_path_buf();
     let memochess_logging_directory = Path::new("./test_logs").to_path_buf();
 
