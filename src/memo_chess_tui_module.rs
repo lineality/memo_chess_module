@@ -20162,6 +20162,7 @@ pub fn buffy_print(template: &str, args: &[BuffyFormatArg]) -> io::Result<()> {
         }
     }
 
+    stdout.flush()?;
     Ok(())
 }
 
@@ -21472,15 +21473,18 @@ fn append_skip_event_to_log_file_best_effort(
     // to inline three times.
 
     // "BS skip "
-    let prefix_bytes = b"BS skip ";
-    let mut prefix_index = 0;
-    while prefix_index < prefix_bytes.len() {
-        if write_cursor >= log_line_buffer.len() {
-            return;
+    #[cfg(debug_assertions)]
+    {
+        let prefix_bytes = b"BS skip ";
+        let mut prefix_index = 0;
+        while prefix_index < prefix_bytes.len() {
+            if write_cursor >= log_line_buffer.len() {
+                return;
+            }
+            log_line_buffer[write_cursor] = prefix_bytes[prefix_index];
+            write_cursor += 1;
+            prefix_index += 1;
         }
-        log_line_buffer[write_cursor] = prefix_bytes[prefix_index];
-        write_cursor += 1;
-        prefix_index += 1;
     }
 
     // Tag (ASCII)
@@ -21601,6 +21605,7 @@ pub fn emit_bootstrap_skip_event(
 
     // buffy_println returns io::Result; drop the result silently.
     // The orchestrator does not recurse on terminal-print failure.
+    #[cfg(debug_assertions)]
     let _print_result = buffy_println(
         "BS skip {} pos {}",
         &[
@@ -21930,12 +21935,12 @@ fn process_one_chrono_position_during_bootstrap(
     bootstrap_run_unix_timestamp: u64,
     partial_config: &mut PartialBootstrapConfig,
 ) {
-    #[cfg(debug_assertions)]
-    eprintln!(
-        "[BOOTSTRAP DBG] enter process_one_chrono_position_during_bootstrap \
-         chrono_position={} chrono_dir={:?}",
-        chrono_position, chrono_sort_temp_directory_path
-    );
+    // #[cfg(debug_assertions)]
+    // eprintln!(
+    //     "[BOOTSTRAP DBG] enter process_one_chrono_position_during_bootstrap \
+    //      chrono_position={} chrono_dir={:?}",
+    //     chrono_position, chrono_sort_temp_directory_path
+    // );
 
     // ----- Step a: resolve absolute path bytes -----
     let mut absolute_path_buffer: [u8; MAX_FULL_PATH_LEN] = [0; MAX_FULL_PATH_LEN];
@@ -21946,12 +21951,12 @@ fn process_one_chrono_position_during_bootstrap(
     );
     let lookup_outcome = match lookup_result {
         Ok(option_value) => option_value,
-        Err(io_error) => {
+        Err(_io_error) => {
             #[cfg(debug_assertions)]
             eprintln!(
                 "[BOOTSTRAP DBG] step-a lookup_abs_file_path_at_mtime_chronological_index \
                  returned Err at chrono_position={}: {:?}",
-                chrono_position, io_error
+                chrono_position, _io_error
             );
             emit_bootstrap_skip_event(
                 BootstrapSkipReason::FileIoFailure,
@@ -21965,32 +21970,32 @@ fn process_one_chrono_position_during_bootstrap(
     let lookup_payload = match lookup_outcome {
         Some(payload_value) => payload_value,
         None => {
-            #[cfg(debug_assertions)]
-            eprintln!(
-                "[BOOTSTRAP DBG] step-a chrono_position={} past end of index (None); \
-                 silent skip",
-                chrono_position
-            );
+            // #[cfg(debug_assertions)]
+            // eprintln!(
+            //     "[BOOTSTRAP DBG] step-a chrono_position={} past end of index (None); \
+            //      silent skip",
+            //     chrono_position
+            // );
             return;
         }
     };
     let path_byte_slice = &absolute_path_buffer[..lookup_payload.path_byte_length];
 
-    #[cfg(debug_assertions)]
-    eprintln!(
-        "[BOOTSTRAP DBG] step-a resolved path_byte_length={} path_lossy={:?}",
-        lookup_payload.path_byte_length,
-        core::str::from_utf8(path_byte_slice).unwrap_or("<non-utf8>")
-    );
+    // #[cfg(debug_assertions)]
+    // eprintln!(
+    //     "[BOOTSTRAP DBG] step-a resolved path_byte_length={} path_lossy={:?}",
+    //     lookup_payload.path_byte_length,
+    //     core::str::from_utf8(path_byte_slice).unwrap_or("<non-utf8>")
+    // );
 
     // ----- Step b: UTF-8 validate the path bytes -----
     let absolute_path_str = match core::str::from_utf8(path_byte_slice) {
         Ok(string_value) => string_value,
-        Err(utf8_error) => {
+        Err(_utf8_error) => {
             #[cfg(debug_assertions)]
             eprintln!(
                 "[BOOTSTRAP DBG] step-b path not valid UTF-8 at chrono_position={}: {:?}",
-                chrono_position, utf8_error
+                chrono_position, _utf8_error
             );
             emit_bootstrap_skip_event(
                 BootstrapSkipReason::PathNotUtf8,
@@ -22006,12 +22011,12 @@ fn process_one_chrono_position_during_bootstrap(
     let read_result = read_memo_config_file(absolute_path_str);
     let memo_contents_option = match read_result {
         Ok(option_value) => option_value,
-        Err(read_error) => {
+        Err(_read_error) => {
             #[cfg(debug_assertions)]
             eprintln!(
                 "[BOOTSTRAP DBG] step-c read_memo_config_file returned Err \
                  for path={:?}: {:?}",
-                absolute_path_str, read_error
+                absolute_path_str, _read_error
             );
             emit_bootstrap_skip_event(
                 BootstrapSkipReason::FileIoFailure,
@@ -22025,11 +22030,11 @@ fn process_one_chrono_position_during_bootstrap(
     let memo_contents = match memo_contents_option {
         Some(contents_value) => contents_value,
         None => {
-            #[cfg(debug_assertions)]
-            eprintln!(
-                "[BOOTSTRAP DBG] step-c path={:?} has no text_message field; silent skip",
-                absolute_path_str
-            );
+            // #[cfg(debug_assertions)]
+            // eprintln!(
+            //     "[BOOTSTRAP DBG] step-c path={:?} has no text_message field; silent skip",
+            //     absolute_path_str
+            // );
             return;
         }
     };
@@ -22037,31 +22042,31 @@ fn process_one_chrono_position_during_bootstrap(
     // ----- Step d: parse the text_message as a config line -----
     let text_message_bytes = memo_contents.text_message_as_bytes();
 
-    #[cfg(debug_assertions)]
-    eprintln!(
-        "[BOOTSTRAP DBG] step-d text_message_len={} text_message_lossy={:?}",
-        text_message_bytes.len(),
-        core::str::from_utf8(text_message_bytes).unwrap_or("<non-utf8>")
-    );
+    // #[cfg(debug_assertions)]
+    // eprintln!(
+    //     "[BOOTSTRAP DBG] step-d text_message_len={} text_message_lossy={:?}",
+    //     text_message_bytes.len(),
+    //     core::str::from_utf8(text_message_bytes).unwrap_or("<non-utf8>")
+    // );
 
     let parse_result = parse_config_line_text_message(text_message_bytes);
     let parsed_line = match parse_result {
         Ok(parsed_value) => parsed_value,
         Err(parse_error) => match parse_error {
             ConfigLineParseError::NoColonSeparator => {
-                #[cfg(debug_assertions)]
-                eprintln!(
-                    "[BOOTSTRAP DBG] step-d no colon separator (probable move-notation \
-                         memo); silent skip"
-                );
+                // #[cfg(debug_assertions)]
+                // eprintln!(
+                //     "[BOOTSTRAP DBG] step-d no colon separator (probable move-notation \
+                //          memo); silent skip"
+                // );
                 return;
             }
-            other_parse_error => {
-                #[cfg(debug_assertions)]
-                eprintln!(
-                    "[BOOTSTRAP DBG] step-d parse error at chrono_position={}: {:?}",
-                    chrono_position, other_parse_error
-                );
+            _other_parse_error => {
+                // #[cfg(debug_assertions)]
+                // eprintln!(
+                //     "[BOOTSTRAP DBG] step-d parse error at chrono_position={}: {:?}",
+                //     chrono_position, _other_parse_error
+                // );
                 emit_bootstrap_skip_event(
                     BootstrapSkipReason::ConfigLineMalformed,
                     chrono_position,
@@ -22073,17 +22078,17 @@ fn process_one_chrono_position_during_bootstrap(
         },
     };
 
-    #[cfg(debug_assertions)]
-    eprintln!("[BOOTSTRAP DBG] step-d parsed_line={:?}", parsed_line);
+    // #[cfg(debug_assertions)]
+    // eprintln!("[BOOTSTRAP DBG] step-d parsed_line={:?}", parsed_line);
 
     // ----- Step e: apply parsed line to the partial config -----
     let apply_outcome = apply_parsed_config_line_to_partial_config(&parsed_line, partial_config);
 
-    #[cfg(debug_assertions)]
-    eprintln!(
-        "[BOOTSTRAP DBG] step-e apply_outcome={:?} at chrono_position={}",
-        apply_outcome, chrono_position
-    );
+    // #[cfg(debug_assertions)]
+    // eprintln!(
+    //     "[BOOTSTRAP DBG] step-e apply_outcome={:?} at chrono_position={}",
+    //     apply_outcome, chrono_position
+    // );
 
     match apply_outcome {
         ApplyConfigLineOutcome::FieldNewlySet => {
@@ -22199,123 +22204,413 @@ fn process_one_chrono_position_during_bootstrap(
 use std::thread::sleep;
 use std::time::Duration;
 
+// // ----------------------------------------------------------------------------
+// // TUI prompt rendering: one function per missing-field case
+// // ----------------------------------------------------------------------------
+// //
+// // The prompts are emitted via `buffy_println` so they are stack-only
+// // and never panic. Each prompt is a fixed multi-line string built
+// // from string-literal arguments. Errors from `buffy_println` are
+// // dropped silently (the orchestrator does not recurse).
+
+// /// Emit the prompt for the missing `plays_white` config item.
+// fn render_prompt_plays_white() {
+//     let _print_result = buffy_println(
+//         "{}",
+//         &[BuffyFormatArg::Str(
+//             "memo_chess bootstrap:\n\
+//              1. Who plays white?\n\
+//              Write a memo with text_message:\n\
+//              plays_white:<player_name>\n\
+//              (example: plays_white:alice)\n",
+//         )],
+//     );
+
+//     #[cfg(debug_assertions)]
+//     eprintln!(
+//         "render_prompt_plays_white _print_result: {:?}",
+//         _print_result
+//     );
+// }
+
+// /// Emit the prompt for the missing `plays_black` config item.
+// fn render_prompt_plays_black() {
+//     let _print_result = buffy_println(
+//         "{}",
+//         &[BuffyFormatArg::Str(
+//             "memo_chess bootstrap:\n\
+//              2. Who plays black?\n\
+//              Write a memo with text_message:\n\
+//              plays_black:<player_name>\n\
+//              (example: plays_black:bob)\n",
+//         )],
+//     );
+
+//     #[cfg(debug_assertions)]
+//     eprintln!(
+//         "render_prompt_plays_black _print_result: {:?}",
+//         _print_result
+//     );
+// }
+
+// /// Emit the prompt for the missing per-player time config item.
+// fn render_prompt_player_time() {
+//     let _print_result = buffy_println(
+//         "{}",
+//         &[BuffyFormatArg::Str(
+//             "memo_chess bootstrap:\n\
+//              3. Per-player time limit in minutes.\n\
+//              Write a memo with text_message:\n\
+//              player_time:<minutes>\n\
+//              (example: player_time:10)\n",
+//         )],
+//     );
+
+//     #[cfg(debug_assertions)]
+//     eprintln!(
+//         "render_prompt_player_time _print_result: {:?}",
+//         _print_result
+//     );
+// }
+
+// /// Emit the prompt for the missing refresh-rate config item.
+// fn render_prompt_refresh_rate() {
+//     let _print_result = buffy_println(
+//         "{}",
+//         &[BuffyFormatArg::Str(
+//             "memo_chess bootstrap:\n\
+//              4. Screen refresh rate in seconds.\n\
+//              Write a memo with text_message:\n\
+//              refresh_rate:<seconds>\n\
+//              (example: refresh_rate:10)\n",
+//         )],
+//     );
+
+//     #[cfg(debug_assertions)]
+//     eprintln!(
+//         "render_prompt_refresh_rate _print_result: {:?}",
+//         _print_result
+//     );
+// }
+
+// /// Emit the prompt for the missing n-move-rule config item.
+// fn render_prompt_n_move_rule() {
+//     let _print_result = buffy_println(
+//         "{}",
+//         &[BuffyFormatArg::Str(
+//             "memo_chess bootstrap:\n\
+//              5. N-move rule.\n\
+//              Write a memo with text_message:\n\
+//              n_move_rule:<integer>\n\
+//              (example: n_move_rule:50)\n",
+//         )],
+//     );
+
+//     #[cfg(debug_assertions)]
+//     eprintln!(
+//         "render_prompt_n_move_rule _print_result: {:?}",
+//         _print_result
+//     );
+// }
+
+// fn render_prompt_tui_render_mode() {
+//     let _print_result = buffy_println("{}", &[BuffyFormatArg::Str("memo_chess bootstrap:")]);
+
+//     #[cfg(debug_assertions)]
+//     eprintln!(
+//         "render_prompt_tui_render_mode _print_result: {:?}",
+//         _print_result
+//     );
+
+//     let _print_result = buffy_println(
+//         "{}",
+//         &[BuffyFormatArg::Str(
+//             "6. TUI Mode: Text User Interface: simple ascii vs. unicode + ansi",
+//         )],
+//     );
+
+//     #[cfg(debug_assertions)]
+//     eprintln!(
+//         "render_prompt_tui_render_mode _print_result: {:?}",
+//         _print_result
+//     );
+
+//     let _print_result = buffy_println(
+//         "{}",
+//         &[BuffyFormatArg::Str(
+//             "Write a memo with text_message:\n\
+//              tui_mode:<mode>",
+//         )],
+//     );
+
+//     #[cfg(debug_assertions)]
+//     eprintln!(
+//         "render_prompt_tui_render_mode _print_result: {:?}",
+//         _print_result
+//     );
+
+//     let _print_result = buffy_println(
+//         "{}",
+//         &[BuffyFormatArg::Str(
+//             "(Write one of:\n  tui_mode:ascii\n  tui_mode:unicode)\n",
+//         )],
+//     );
+
+//     #[cfg(debug_assertions)]
+//     eprintln!(
+//         "render_prompt_tui_render_mode _print_result: {:?}",
+//         _print_result
+//     );
+// }
+
 // ----------------------------------------------------------------------------
 // TUI prompt rendering: one function per missing-field case
 // ----------------------------------------------------------------------------
 //
-// The prompts are emitted via `buffy_println` so they are stack-only
-// and never panic. Each prompt is a fixed multi-line string built
-// from string-literal arguments. Errors from `buffy_println` are
-// dropped silently (the orchestrator does not recurse).
+// Each prompt is emitted as a sequence of short single-line
+// `buffy_println` calls. Each call passes one line of text with no
+// embedded newline; `buffy_println` appends the trailing newline.
+// This keeps each call's value-string well under the stack buffer
+// sizes inside `buffy_print` (no multi-line "blob" passed through
+// the alignment buffer in a single call).
+//
+// Return values from `buffy_println` are intentionally discarded
+// in production (the prompt loop must not abort on a transient
+// stdout error). In debug builds the result of each call is
+// printed to stderr to aid diagnosis.
 
 /// Emit the prompt for the missing `plays_white` config item.
 fn render_prompt_plays_white() {
-    let _print_result = buffy_println(
+    let r1 = buffy_println("{}", &[BuffyFormatArg::Str("memo_chess bootstrap:")]);
+    #[cfg(debug_assertions)]
+    eprintln!("render_prompt_plays_white line1: {:?}", r1);
+
+    let r2 = buffy_println("{}", &[BuffyFormatArg::Str("1. Who plays white?")]);
+    #[cfg(debug_assertions)]
+    eprintln!("render_prompt_plays_white line2: {:?}", r2);
+
+    let r3 = buffy_println(
         "{}",
-        &[BuffyFormatArg::Str(
-            "memo_chess bootstrap:\n\
-             1. Who plays white?\n\
-             Write a memo with text_message:\n\
-             plays_white:<player_name>\n\
-             (example: plays_white:alice)\n",
-        )],
+        &[BuffyFormatArg::Str("Write a memo with text_message:")],
     );
+    #[cfg(debug_assertions)]
+    eprintln!("render_prompt_plays_white line3: {:?}", r3);
+
+    let r4 = buffy_println("{}", &[BuffyFormatArg::Str("plays_white:<player_name>")]);
+    #[cfg(debug_assertions)]
+    eprintln!("render_prompt_plays_white line4: {:?}", r4);
+
+    let r5 = buffy_println("{}", &[BuffyFormatArg::Str("(example: plays_white:alice)")]);
+    #[cfg(debug_assertions)]
+    eprintln!("render_prompt_plays_white line5: {:?}", r5);
 }
 
 /// Emit the prompt for the missing `plays_black` config item.
 fn render_prompt_plays_black() {
-    let _print_result = buffy_println(
+    let r1 = buffy_println("{}", &[BuffyFormatArg::Str("memo_chess bootstrap:")]);
+    #[cfg(debug_assertions)]
+    eprintln!("render_prompt_plays_black line1: {:?}", r1);
+
+    let r2 = buffy_println("{}", &[BuffyFormatArg::Str("2. Who plays black?")]);
+    #[cfg(debug_assertions)]
+    eprintln!("render_prompt_plays_black line2: {:?}", r2);
+
+    let r3 = buffy_println(
         "{}",
-        &[BuffyFormatArg::Str(
-            "memo_chess bootstrap:\n\
-             2. Who plays black?\n\
-             Write a memo with text_message:\n\
-             plays_black:<player_name>\n\
-             (example: plays_black:bob)\n",
-        )],
+        &[BuffyFormatArg::Str("Write a memo with text_message:")],
     );
+    #[cfg(debug_assertions)]
+    eprintln!("render_prompt_plays_black line3: {:?}", r3);
+
+    let r4 = buffy_println("{}", &[BuffyFormatArg::Str("plays_black:<player_name>")]);
+    #[cfg(debug_assertions)]
+    eprintln!("render_prompt_plays_black line4: {:?}", r4);
+
+    let r5 = buffy_println("{}", &[BuffyFormatArg::Str("(example: plays_black:bob)")]);
+    #[cfg(debug_assertions)]
+    eprintln!("render_prompt_plays_black line5: {:?}", r5);
 }
 
 /// Emit the prompt for the missing per-player time config item.
 fn render_prompt_player_time() {
-    let _print_result = buffy_println(
+    let r1 = buffy_println("{}", &[BuffyFormatArg::Str("memo_chess bootstrap:")]);
+    #[cfg(debug_assertions)]
+    eprintln!("render_prompt_player_time line1: {:?}", r1);
+
+    let r2 = buffy_println(
         "{}",
-        &[BuffyFormatArg::Str(
-            "memo_chess bootstrap:\n\
-             3. Per-player time limit in minutes.\n\
-             Write a memo with text_message:\n\
-             player_time:<minutes>\n\
-             (example: player_time:10)\n",
-        )],
+        &[BuffyFormatArg::Str("3. Per-player time limit in minutes.")],
     );
+    #[cfg(debug_assertions)]
+    eprintln!("render_prompt_player_time line2: {:?}", r2);
+
+    let r3 = buffy_println(
+        "{}",
+        &[BuffyFormatArg::Str("Write a memo with text_message:")],
+    );
+    #[cfg(debug_assertions)]
+    eprintln!("render_prompt_player_time line3: {:?}", r3);
+
+    let r4 = buffy_println("{}", &[BuffyFormatArg::Str("player_time:<minutes>")]);
+    #[cfg(debug_assertions)]
+    eprintln!("render_prompt_player_time line4: {:?}", r4);
+
+    let r5 = buffy_println("{}", &[BuffyFormatArg::Str("(example: player_time:10)")]);
+    #[cfg(debug_assertions)]
+    eprintln!("render_prompt_player_time line5: {:?}", r5);
 }
 
 /// Emit the prompt for the missing refresh-rate config item.
 fn render_prompt_refresh_rate() {
-    let _print_result = buffy_println(
+    let r1 = buffy_println("{}", &[BuffyFormatArg::Str("memo_chess bootstrap:")]);
+    #[cfg(debug_assertions)]
+    eprintln!("render_prompt_refresh_rate line1: {:?}", r1);
+
+    let r2 = buffy_println(
         "{}",
-        &[BuffyFormatArg::Str(
-            "memo_chess bootstrap:\n\
-             4. Screen refresh rate in seconds.\n\
-             Write a memo with text_message:\n\
-             refresh_rate:<seconds>\n\
-             (example: refresh_rate:10)\n",
-        )],
+        &[BuffyFormatArg::Str("4. Screen refresh rate in seconds.")],
     );
+    #[cfg(debug_assertions)]
+    eprintln!("render_prompt_refresh_rate line2: {:?}", r2);
+
+    let r3 = buffy_println(
+        "{}",
+        &[BuffyFormatArg::Str("Write a memo with text_message:")],
+    );
+    #[cfg(debug_assertions)]
+    eprintln!("render_prompt_refresh_rate line3: {:?}", r3);
+
+    let r4 = buffy_println("{}", &[BuffyFormatArg::Str("refresh_rate:<seconds>")]);
+    #[cfg(debug_assertions)]
+    eprintln!("render_prompt_refresh_rate line4: {:?}", r4);
+
+    let r5 = buffy_println("{}", &[BuffyFormatArg::Str("(example: refresh_rate:10)")]);
+    #[cfg(debug_assertions)]
+    eprintln!("render_prompt_refresh_rate line5: {:?}", r5);
 }
 
 /// Emit the prompt for the missing n-move-rule config item.
 fn render_prompt_n_move_rule() {
-    let _print_result = buffy_println(
+    let r1 = buffy_println("{}", &[BuffyFormatArg::Str("memo_chess bootstrap:")]);
+    #[cfg(debug_assertions)]
+    eprintln!("render_prompt_n_move_rule line1: {:?}", r1);
+
+    let r2 = buffy_println("{}", &[BuffyFormatArg::Str("5. N-move rule.")]);
+    #[cfg(debug_assertions)]
+    eprintln!("render_prompt_n_move_rule line2: {:?}", r2);
+
+    let r3 = buffy_println(
         "{}",
-        &[BuffyFormatArg::Str(
-            "memo_chess bootstrap:\n\
-             5. N-move rule.\n\
-             Write a memo with text_message:\n\
-             n_move_rule:<integer>\n\
-             (example: n_move_rule:50)\n",
-        )],
+        &[BuffyFormatArg::Str("Write a memo with text_message:")],
     );
+    #[cfg(debug_assertions)]
+    eprintln!("render_prompt_n_move_rule line3: {:?}", r3);
+
+    let r4 = buffy_println("{}", &[BuffyFormatArg::Str("n_move_rule:<integer>")]);
+    #[cfg(debug_assertions)]
+    eprintln!("render_prompt_n_move_rule line4: {:?}", r4);
+
+    let r5 = buffy_println("{}", &[BuffyFormatArg::Str("(example: n_move_rule:50)")]);
+    #[cfg(debug_assertions)]
+    eprintln!("render_prompt_n_move_rule line5: {:?}", r5);
 }
 
+/// Emit the prompt for the missing TUI-render-mode config item.
 fn render_prompt_tui_render_mode() {
-    let _print_result = buffy_println(
+    let r1 = buffy_println("{}", &[BuffyFormatArg::Str("memo_chess bootstrap:")]);
+    #[cfg(debug_assertions)]
+    eprintln!("render_prompt_tui_render_mode line1: {:?}", r1);
+
+    let r2 = buffy_println(
         "{}",
         &[BuffyFormatArg::Str(
-            "memo_chess bootstrap:\n\
-             6. TUI Mode: Text User Interface: simple ascii vs. unicode + ansi\n\
-             Write a memo with text_message:\n\
-             tui_mode:<mode>\n\
-             (Write one of:\n  tui_mode:ascii\n  tui_mode:unicode)\n",
+            "6. TUI Mode: simple ascii vs. unicode + ansi",
         )],
     );
+    #[cfg(debug_assertions)]
+    eprintln!("render_prompt_tui_render_mode line2: {:?}", r2);
+
+    let r3 = buffy_println(
+        "{}",
+        &[BuffyFormatArg::Str("Write a memo with text_message:")],
+    );
+    #[cfg(debug_assertions)]
+    eprintln!("render_prompt_tui_render_mode line3: {:?}", r3);
+
+    let r4 = buffy_println("{}", &[BuffyFormatArg::Str("tui_mode:<mode>")]);
+    #[cfg(debug_assertions)]
+    eprintln!("render_prompt_tui_render_mode line4: {:?}", r4);
+
+    let r5 = buffy_println("{}", &[BuffyFormatArg::Str("(Write one of:)")]);
+    #[cfg(debug_assertions)]
+    eprintln!("render_prompt_tui_render_mode line5: {:?}", r5);
+
+    let r6 = buffy_println("{}", &[BuffyFormatArg::Str("  tui_mode:ascii")]);
+    #[cfg(debug_assertions)]
+    eprintln!("render_prompt_tui_render_mode line6: {:?}", r6);
+
+    let r7 = buffy_println("{}", &[BuffyFormatArg::Str("  tui_mode:unicode")]);
+    #[cfg(debug_assertions)]
+    eprintln!("render_prompt_tui_render_mode line7: {:?}", r7);
 }
 
-/// Emit a generic prompt when all required fields are set but
-/// finalization is still failing.
-///
-/// This case occurs when a recognized field has a value that
-/// individually parsed as the right shape but was rejected by
-/// `try_construct_memochess_game_config`, e.g.:
-///   - white and black player names are byte-identical,
-///   - refresh rate is out of the [MIN, MAX] range,
-///   - n-move rule is out of range,
-///   - per-player time in minutes overflows when multiplied by 60.
-///
-/// Per the no-data-in-output policy of this module, we cannot point
-/// the user at the specific offending field. The user is invited to
-/// inspect their config memos.
+/// Emit the prompt shown when all required fields are set but the
+/// configuration constructor rejected the values.
 fn render_prompt_configuration_rejected() {
-    let _print_result = buffy_println(
+    let r1 = buffy_println("{}", &[BuffyFormatArg::Str("memo_chess bootstrap:")]);
+    #[cfg(debug_assertions)]
+    eprintln!("render_prompt_configuration_rejected line1: {:?}", r1);
+
+    let r2 = buffy_println(
         "{}",
         &[BuffyFormatArg::Str(
-            "memo_chess bootstrap:\n\
-             All required fields are present but one or more values\n\
-             were rejected (out of range, identical names, or overflow).\n\
-             Please review your config memos and correct as needed.\n",
+            "Configuration values were rejected by the validator.",
         )],
     );
+    #[cfg(debug_assertions)]
+    eprintln!("render_prompt_configuration_rejected line2: {:?}", r2);
+
+    let r3 = buffy_println(
+        "{}",
+        &[BuffyFormatArg::Str(
+            "Re-write any memo with corrected values and try again.",
+        )],
+    );
+    #[cfg(debug_assertions)]
+    eprintln!("render_prompt_configuration_rejected line3: {:?}", r3);
 }
+
+// /// Emit a generic prompt when all required fields are set but
+// /// finalization is still failing.
+// ///
+// /// This case occurs when a recognized field has a value that
+// /// individually parsed as the right shape but was rejected by
+// /// `try_construct_memochess_game_config`, e.g.:
+// ///   - white and black player names are byte-identical,
+// ///   - refresh rate is out of the [MIN, MAX] range,
+// ///   - n-move rule is out of range,
+// ///   - per-player time in minutes overflows when multiplied by 60.
+// ///
+// /// Per the no-data-in-output policy of this module, we cannot point
+// /// the user at the specific offending field. The user is invited to
+// /// inspect their config memos.
+// fn render_prompt_configuration_rejected() {
+//     let _print_result = buffy_println(
+//         "{}",
+//         &[BuffyFormatArg::Str(
+//             "memo_chess bootstrap:\n\
+//              All required fields are present but one or more values\n\
+//              were rejected (out of range, identical names, or overflow).\n\
+//              Please review your config memos and correct as needed.\n",
+//         )],
+//     );
+
+//     #[cfg(debug_assertions)]
+//     eprintln!(
+//         "render_prompt_configuration_rejected _print_result: {:?}",
+//         _print_result
+//     );
+// }
 
 /// Render the prompt for the first missing required field in
 /// display order.
@@ -22481,6 +22776,9 @@ pub fn q_and_a_setup_bootstrap(
     chrono_sort_temp_directory_path: &Path,
     memochess_logging_directory_path: &Path,
 ) -> Result<MemochessGameConfig, MemochessBootstrapError> {
+    // inspection
+    println!("starting q_and_a_setup_bootstrap");
+
     // ----- Root input validation -----
     validate_bootstrap_root_inputs(
         game_files_directory_path,
