@@ -47,7 +47,9 @@
 //! paths. `debug_assert!` is used under `#[cfg(all(debug_assertions,
 //! not(test)))]` for invariant checking during development. `assert!` is
 //! used only inside `#[cfg(test)]` test functions.
-
+//!
+//! for debugging:
+//! ./target/release-performance/memo_chess > unicode_output.txt 2>&1
 /*
 
 - The chess engine (Sections 1–14) (complete and tested)
@@ -797,7 +799,7 @@ pub fn create_initial_board_state() -> BoardState {
 }
 
 // ============================================================================
-// SECTION 12: ASCII Rendering
+// SECTION 12: ASCII & Unicode-ANSI Rendering
 // ============================================================================
 
 /// Returns the ASCII character used to display a given piece.
@@ -854,7 +856,8 @@ fn write_bytes_to_buffer(
     Ok(new_position)
 }
 
-/// Renders the given `BoardState` as ASCII text into the provided buffer.
+/// Renders the given `BoardState` as ASCII text, emitting one line at a
+/// time through the supplied `emit_line` closure.
 ///
 /// ## Output Format
 ///
@@ -867,47 +870,64 @@ fn write_bytes_to_buffer(
 ///  3  . . . . . . . .
 ///  2  P P P P P P P P
 ///  1  R N B Q K B N R
-///
+///                       (blank line: emit_line called with empty slice)
 ///     a b c d e f g h
 /// ```
+///
+/// Lines emitted: 8 rank lines + 1 blank line + 1 file-label line = 10.
+///
+/// Each line is passed to `emit_line` WITHOUT a trailing newline. The
+/// closure is responsible for adding a terminator if its destination
+/// requires one (terminal, log file, etc.).
+///
+/// ## Project Context — why per-line emit
+///
+/// This function previously built the entire board into one ~256-byte
+/// buffer and returned a length; a separate splitter scanned the buffer
+/// for `\n` to chop it back into lines for the double-publish closure
+/// (terminal + log). For ASCII the buffer size happened to fit, but
+/// the same pattern applied to the Unicode+ANSI renderer would have
+/// required a much larger scratch buffer (because each square carries
+/// ANSI SGR sequences). Switching to per-line emit means the scratch
+/// buffer only needs to hold ONE line — the same 256 bytes is now
+/// generous for both renderers.
 ///
 /// ## Arguments
 ///
 /// - `state`: the board state to render.
 /// - `render_from_white_view`: if true, rank 8 is at the top and rank 1
 ///   is at the bottom (standard White orientation). If false, the board
-///   is flipped so rank 1 is at the top (Black's perspective).
-/// - `output_buffer`: a caller-provided stack buffer to write into. No
-///   allocation occurs.
+///   is flipped so rank 1 is at the top (Black's perspective). When
+///   flipped, file order is also flipped (h-file at left) so the board
+///   mirrors correctly.
+/// - `line_scratch_buffer`: caller-provided stack buffer for assembling
+///   one line at a time. Must be at least `TUI_BOARD_LINE_BUFFER_BYTES`
+///   for the Unicode+ANSI renderer; the ASCII renderer's lines are
+///   much shorter but the same buffer is reused for symmetry.
+/// - `emit_line`: closure invoked once per emitted line. The slice
+///   passed has no trailing newline.
 ///
 /// ## Returns
 ///
-/// On success, `Ok(bytes_written)`: the number of bytes filled at the
-/// start of `output_buffer`. The caller writes `&output_buffer[..n]` to
-/// the terminal.
+/// `Ok(())` after all 10 lines are emitted.
 ///
-/// On failure, `Err(MoveValidationError::InternalIndexOutOfBounds)` if
-/// the buffer was too small. The caller should treat this as a
-/// programming error (buffer-sizing bug) rather than a user error.
+/// `Err(MoveValidationError::InternalIndexOutOfBounds)` if any line's
+/// bytes do not fit into `line_scratch_buffer`. With a properly sized
+/// buffer (>= 256 bytes) this cannot occur in any reachable state;
+/// the error path is a backstop for future format changes that violate
+/// the sizing assumption.
 ///
-/// ## Project Note
+/// ## Memory & Panic Policy
 ///
-/// This renderer outputs only the board grid and file labels. Status
-/// lines (turn, time, etc.) are the responsibility of the TUI layer,
-/// which will compose this board rendering with status text from the
-/// clock, file ingestion, and game-status layers. Keeping this function
-/// focused on the board alone keeps it stable as those upper layers
-/// evolve.
+/// No heap. No panics. The scratch buffer is reused across all 10
+/// lines — total stack cost is one buffer, not ten.
 pub fn format_board_state_as_ascii(
     state: &BoardState,
     render_from_white_view: bool,
-    output_buffer: &mut [u8],
-) -> Result<usize, MoveValidationError> {
-    let mut write_position: usize = 0;
-
-    // Iterate ranks. White view goes 7 down to 0; Black view goes 0 up to 7.
-    // We use an explicit, bounded loop counter rather than a Rust range-rev
-    // chain to keep the iteration order trivially auditable.
+    line_scratch_buffer: &mut [u8],
+    emit_line: &mut dyn FnMut(&[u8]),
+) -> Result<(), MoveValidationError> {
+    // ----- Step 1: emit the 8 rank lines.
     let mut rank_iteration_step: u8 = 0;
     while rank_iteration_step < BOARD_RANK_COUNT {
         let actual_rank_index: u8 = if render_from_white_view {
@@ -918,21 +938,23 @@ pub fn format_board_state_as_ascii(
             rank_iteration_step
         };
 
-        // Leading space + rank number + two spaces.
-        write_position = write_byte_to_buffer(output_buffer, write_position, b' ')?;
-        // Rank label: '1' + rank index. Always a single ASCII digit.
-        let rank_label_byte: u8 = b'1' + actual_rank_index;
-        write_position = write_byte_to_buffer(output_buffer, write_position, rank_label_byte)?;
-        write_position = write_byte_to_buffer(output_buffer, write_position, b' ')?;
-        write_position = write_byte_to_buffer(output_buffer, write_position, b' ')?;
+        // Fill this rank's bytes into the scratch buffer starting at 0.
+        let mut write_position: usize = 0;
 
-        // Iterate files for this rank.
+        // Leading space + rank number + two spaces.
+        write_position = write_byte_to_buffer(line_scratch_buffer, write_position, b' ')?;
+        let rank_label_byte: u8 = b'1' + actual_rank_index;
+        write_position =
+            write_byte_to_buffer(line_scratch_buffer, write_position, rank_label_byte)?;
+        write_position = write_byte_to_buffer(line_scratch_buffer, write_position, b' ')?;
+        write_position = write_byte_to_buffer(line_scratch_buffer, write_position, b' ')?;
+
+        // Eight squares + trailing space after each.
         let mut file_iteration_step: u8 = 0;
         while file_iteration_step < BOARD_FILE_COUNT {
             let actual_file_index: u8 = if render_from_white_view {
                 file_iteration_step
             } else {
-                // Flip files for Black view so the board mirrors correctly.
                 BOARD_FILE_COUNT - 1 - file_iteration_step
             };
 
@@ -945,22 +967,31 @@ pub fn format_board_state_as_ascii(
                 None => b'.',
             };
 
-            write_position =
-                write_byte_to_buffer(output_buffer, write_position, character_for_this_square)?;
-            // Separating space after each square except possibly the last.
-            write_position = write_byte_to_buffer(output_buffer, write_position, b' ')?;
+            write_position = write_byte_to_buffer(
+                line_scratch_buffer,
+                write_position,
+                character_for_this_square,
+            )?;
+            write_position = write_byte_to_buffer(line_scratch_buffer, write_position, b' ')?;
 
             file_iteration_step += 1;
         }
 
-        // End of rank: newline.
-        write_position = write_byte_to_buffer(output_buffer, write_position, b'\n')?;
+        // Emit this rank's line (no trailing newline).
+        emit_line(&line_scratch_buffer[..write_position]);
+
         rank_iteration_step += 1;
     }
 
-    // Blank line and file labels.
-    write_position = write_byte_to_buffer(output_buffer, write_position, b'\n')?;
-    write_position = write_bytes_to_buffer(output_buffer, write_position, b"    ")?;
+    // ----- Step 2: emit the blank separator line.
+    // The closure adds its own newline to whichever sink it serves;
+    // an empty slice + newline produces a blank line in the terminal
+    // and a blank line in the log file.
+    emit_line(&[]);
+
+    // ----- Step 3: emit the file-label line.
+    let mut write_position: usize = 0;
+    write_position = write_bytes_to_buffer(line_scratch_buffer, write_position, b"    ")?;
 
     let mut file_label_step: u8 = 0;
     while file_label_step < BOARD_FILE_COUNT {
@@ -970,13 +1001,255 @@ pub fn format_board_state_as_ascii(
             BOARD_FILE_COUNT - 1 - file_label_step
         };
         let file_label_byte: u8 = b'a' + actual_file_index;
-        write_position = write_byte_to_buffer(output_buffer, write_position, file_label_byte)?;
-        write_position = write_byte_to_buffer(output_buffer, write_position, b' ')?;
+        write_position =
+            write_byte_to_buffer(line_scratch_buffer, write_position, file_label_byte)?;
+        write_position = write_byte_to_buffer(line_scratch_buffer, write_position, b' ')?;
         file_label_step += 1;
     }
-    write_position = write_byte_to_buffer(output_buffer, write_position, b'\n')?;
 
-    Ok(write_position)
+    emit_line(&line_scratch_buffer[..write_position]);
+
+    Ok(())
+}
+
+// /// Renders the given `BoardState` as ASCII text into the provided buffer.
+// ///
+// /// ## Output Format
+// ///
+// /// ```text
+// ///  8  r n b q k b n r
+// ///  7  p p p p p p p p
+// ///  6  . . . . . . . .
+// ///  5  . . . . . . . .
+// ///  4  . . . . . . . .
+// ///  3  . . . . . . . .
+// ///  2  P P P P P P P P
+// ///  1  R N B Q K B N R
+// ///
+// ///     a b c d e f g h
+// /// ```
+// ///
+// /// ## Arguments
+// ///
+// /// - `state`: the board state to render.
+// /// - `render_from_white_view`: if true, rank 8 is at the top and rank 1
+// ///   is at the bottom (standard White orientation). If false, the board
+// ///   is flipped so rank 1 is at the top (Black's perspective).
+// /// - `output_buffer`: a caller-provided stack buffer to write into. No
+// ///   allocation occurs.
+// ///
+// /// ## Returns
+// ///
+// /// On success, `Ok(bytes_written)`: the number of bytes filled at the
+// /// start of `output_buffer`. The caller writes `&output_buffer[..n]` to
+// /// the terminal.
+// ///
+// /// On failure, `Err(MoveValidationError::InternalIndexOutOfBounds)` if
+// /// the buffer was too small. The caller should treat this as a
+// /// programming error (buffer-sizing bug) rather than a user error.
+// ///
+// /// ## Project Note
+// ///
+// /// This renderer outputs only the board grid and file labels. Status
+// /// lines (turn, time, etc.) are the responsibility of the TUI layer,
+// /// which will compose this board rendering with status text from the
+// /// clock, file ingestion, and game-status layers. Keeping this function
+// /// focused on the board alone keeps it stable as those upper layers
+// /// evolve.
+// pub fn format_board_state_as_ascii(
+//     state: &BoardState,
+//     render_from_white_view: bool,
+//     output_buffer: &mut [u8],
+// ) -> Result<usize, MoveValidationError> {
+//     let mut write_position: usize = 0;
+
+//     // Iterate ranks. White view goes 7 down to 0; Black view goes 0 up to 7.
+//     // We use an explicit, bounded loop counter rather than a Rust range-rev
+//     // chain to keep the iteration order trivially auditable.
+//     let mut rank_iteration_step: u8 = 0;
+//     while rank_iteration_step < BOARD_RANK_COUNT {
+//         let actual_rank_index: u8 = if render_from_white_view {
+//             // Top row first: rank 7, then 6, ..., then 0.
+//             BOARD_RANK_COUNT - 1 - rank_iteration_step
+//         } else {
+//             // Top row first: rank 0, then 1, ..., then 7.
+//             rank_iteration_step
+//         };
+
+//         // Leading space + rank number + two spaces.
+//         write_position = write_byte_to_buffer(output_buffer, write_position, b' ')?;
+//         // Rank label: '1' + rank index. Always a single ASCII digit.
+//         let rank_label_byte: u8 = b'1' + actual_rank_index;
+//         write_position = write_byte_to_buffer(output_buffer, write_position, rank_label_byte)?;
+//         write_position = write_byte_to_buffer(output_buffer, write_position, b' ')?;
+//         write_position = write_byte_to_buffer(output_buffer, write_position, b' ')?;
+
+//         // Iterate files for this rank.
+//         let mut file_iteration_step: u8 = 0;
+//         while file_iteration_step < BOARD_FILE_COUNT {
+//             let actual_file_index: u8 = if render_from_white_view {
+//                 file_iteration_step
+//             } else {
+//                 // Flip files for Black view so the board mirrors correctly.
+//                 BOARD_FILE_COUNT - 1 - file_iteration_step
+//             };
+
+//             let square_index =
+//                 square_index_from_file_and_rank(actual_file_index, actual_rank_index)?;
+//             let square_contents = state.board_squares[square_index as usize];
+
+//             let character_for_this_square: u8 = match square_contents {
+//                 Some(piece_here) => ascii_character_for_piece(piece_here),
+//                 None => b'.',
+//             };
+
+//             write_position =
+//                 write_byte_to_buffer(output_buffer, write_position, character_for_this_square)?;
+//             // Separating space after each square except possibly the last.
+//             write_position = write_byte_to_buffer(output_buffer, write_position, b' ')?;
+
+//             file_iteration_step += 1;
+//         }
+
+//         // End of rank: newline.
+//         write_position = write_byte_to_buffer(output_buffer, write_position, b'\n')?;
+//         rank_iteration_step += 1;
+//     }
+
+//     // Blank line and file labels.
+//     write_position = write_byte_to_buffer(output_buffer, write_position, b'\n')?;
+//     write_position = write_bytes_to_buffer(output_buffer, write_position, b"    ")?;
+
+//     let mut file_label_step: u8 = 0;
+//     while file_label_step < BOARD_FILE_COUNT {
+//         let actual_file_index: u8 = if render_from_white_view {
+//             file_label_step
+//         } else {
+//             BOARD_FILE_COUNT - 1 - file_label_step
+//         };
+//         let file_label_byte: u8 = b'a' + actual_file_index;
+//         write_position = write_byte_to_buffer(output_buffer, write_position, file_label_byte)?;
+//         write_position = write_byte_to_buffer(output_buffer, write_position, b' ')?;
+//         file_label_step += 1;
+//     }
+//     write_position = write_byte_to_buffer(output_buffer, write_position, b'\n')?;
+
+//     Ok(write_position)
+// }
+
+// ============================================================================
+// Tests for format_board_state_as_ascii (per-line emit version)
+// ============================================================================
+//
+// These tests capture every emitted line into a Vec<Vec<u8>> via the
+// closure. Heap use is acceptable in tests; per project policy heap is
+// only banned in production code paths.
+
+#[cfg(test)]
+mod format_board_state_as_ascii_per_line_tests {
+    use super::*;
+
+    /// Collect the lines emitted by `format_board_state_as_ascii` into
+    /// an owned vector of owned line bytes, for test assertions.
+    ///
+    /// Returns the captured lines and the renderer's `Result`. Tests
+    /// assert on both: the result should be `Ok(())` and the line
+    /// count/contents should match the expected output.
+    fn capture_lines_from_ascii_renderer(
+        state: &BoardState,
+        render_from_white_view: bool,
+    ) -> (Vec<Vec<u8>>, Result<(), MoveValidationError>) {
+        let mut captured_lines: Vec<Vec<u8>> = Vec::new();
+        let mut scratch_buffer: [u8; TUI_BOARD_LINE_BUFFER_BYTES] =
+            [0u8; TUI_BOARD_LINE_BUFFER_BYTES];
+
+        let result = {
+            let mut emit_line_closure = |line_bytes: &[u8]| {
+                captured_lines.push(line_bytes.to_vec());
+            };
+            format_board_state_as_ascii(
+                state,
+                render_from_white_view,
+                &mut scratch_buffer,
+                &mut emit_line_closure,
+            )
+        };
+
+        (captured_lines, result)
+    }
+
+    /// Starting position, White's view, exact line-by-line content.
+    #[test]
+    fn ascii_starting_position_white_view_exact_lines() {
+        let state = create_initial_board_state();
+        let (lines, result) = capture_lines_from_ascii_renderer(&state, true);
+
+        assert_eq!(result, Ok(()));
+        assert_eq!(lines.len(), 10, "expected 8 ranks + blank + file labels");
+
+        // Rank 8 (top, black back rank).
+        assert_eq!(lines[0].as_slice(), b" 8  r n b q k b n r ");
+        // Rank 7 (black pawns).
+        assert_eq!(lines[1].as_slice(), b" 7  p p p p p p p p ");
+        // Empty ranks 6..3.
+        assert_eq!(lines[2].as_slice(), b" 6  . . . . . . . . ");
+        assert_eq!(lines[3].as_slice(), b" 5  . . . . . . . . ");
+        assert_eq!(lines[4].as_slice(), b" 4  . . . . . . . . ");
+        assert_eq!(lines[5].as_slice(), b" 3  . . . . . . . . ");
+        // White pawns.
+        assert_eq!(lines[6].as_slice(), b" 2  P P P P P P P P ");
+        // White back rank.
+        assert_eq!(lines[7].as_slice(), b" 1  R N B Q K B N R ");
+        // Blank separator.
+        assert_eq!(lines[8].as_slice(), b"");
+        // File labels (a..h, left to right).
+        assert_eq!(lines[9].as_slice(), b"    a b c d e f g h ");
+    }
+
+    /// Sanity check: no emitted line exceeds the scratch buffer size,
+    /// for either view orientation. This is the test that would have
+    /// caught the original "buffer too small" symptom had it existed
+    /// for the ASCII path.
+    #[test]
+    fn ascii_no_line_exceeds_scratch_buffer() {
+        let state = create_initial_board_state();
+
+        for render_from_white_view in [true, false] {
+            let (lines, result) = capture_lines_from_ascii_renderer(&state, render_from_white_view);
+            assert_eq!(result, Ok(()));
+            for (line_index, line_bytes) in lines.iter().enumerate() {
+                assert!(
+                    line_bytes.len() <= TUI_BOARD_LINE_BUFFER_BYTES,
+                    "line {} length {} exceeds buffer {} (view white={})",
+                    line_index,
+                    line_bytes.len(),
+                    TUI_BOARD_LINE_BUFFER_BYTES,
+                    render_from_white_view
+                );
+            }
+        }
+    }
+
+    /// Backstop test: an undersized scratch buffer must produce
+    /// `Err(InternalIndexOutOfBounds)` rather than a panic. This
+    /// confirms the function's "no panic" property under a buffer
+    /// violation.
+    #[test]
+    fn ascii_undersized_buffer_returns_err_not_panic() {
+        let state = create_initial_board_state();
+        // 4 bytes is well under any rank line's length (~20 bytes).
+        let mut tiny_scratch: [u8; 4] = [0u8; 4];
+
+        let mut captured_lines: Vec<Vec<u8>> = Vec::new();
+        let mut emit_line_closure = |line_bytes: &[u8]| {
+            captured_lines.push(line_bytes.to_vec());
+        };
+
+        let result =
+            format_board_state_as_ascii(&state, true, &mut tiny_scratch, &mut emit_line_closure);
+
+        assert_eq!(result, Err(MoveValidationError::InternalIndexOutOfBounds));
+    }
 }
 
 // ============================================================================
@@ -1230,6 +1503,7 @@ mod tests_part_1_data_types_and_initial_state {
             MAX_LEGAL_MOVES_PER_POSITION
         );
     }
+
     /// Verifies the ASCII renderer produces the exact expected output for
     /// the starting position in White view.
     ///
@@ -1240,44 +1514,63 @@ mod tests_part_1_data_types_and_initial_state {
     /// then the rank digit, then two spaces, then the eight square
     /// characters each followed by a single trailing space.
     ///
-    /// ## Implementation Note on the Expected String
+    /// ## Implementation Note on the Expected Lines
     ///
-    /// The expected string is built with the `concat!` macro, which
-    /// joins string literals at compile time with no runtime cost and
-    /// (critically) no whitespace stripping. We avoid the `\` line-
-    /// continuation escape because it consumes the leading whitespace of
-    /// the next line, which would silently strip our intentional leading
-    /// spaces.
+    /// Each expected line is a single byte-string literal with no
+    /// trailing newline. The renderer emits one line at a time via the
+    /// `emit_line` closure; the closure here captures each line into a
+    /// `Vec<Vec<u8>>` for ordered comparison. Heap use is acceptable
+    /// in tests; per project policy heap is banned only in production
+    /// code paths.
     ///
-    /// Any future change to the renderer must update this expected
-    /// string deliberately.
+    /// Any future change to the renderer must update these expected
+    /// lines deliberately.
     #[test]
     fn ascii_render_initial_position_white_view() {
         let state = create_initial_board_state();
-        let mut render_buffer: [u8; 1024] = [0u8; 1024];
-        let bytes_written = format_board_state_as_ascii(&state, true, &mut render_buffer)
-            .expect("test: 1024 bytes is more than enough for the board");
+        let mut scratch_buffer: [u8; TUI_BOARD_LINE_BUFFER_BYTES] =
+            [0u8; TUI_BOARD_LINE_BUFFER_BYTES];
+        let mut captured_lines: Vec<Vec<u8>> = Vec::new();
 
-        let rendered_text = std::str::from_utf8(&render_buffer[..bytes_written])
-            .expect("test: renderer must produce valid UTF-8 (ASCII subset)");
-
-        let expected_text = concat!(
-            " 8  r n b q k b n r \n",
-            " 7  p p p p p p p p \n",
-            " 6  . . . . . . . . \n",
-            " 5  . . . . . . . . \n",
-            " 4  . . . . . . . . \n",
-            " 3  . . . . . . . . \n",
-            " 2  P P P P P P P P \n",
-            " 1  R N B Q K B N R \n",
-            "\n",
-            "    a b c d e f g h \n",
-        );
+        let render_result = {
+            let mut emit_line_closure = |line_bytes: &[u8]| {
+                captured_lines.push(line_bytes.to_vec());
+            };
+            format_board_state_as_ascii(&state, true, &mut scratch_buffer, &mut emit_line_closure)
+        };
 
         assert_eq!(
-            rendered_text, expected_text,
-            "ASCII rendering of initial position (White view) must match the documented format"
+            render_result,
+            Ok(()),
+            "renderer must succeed with a sufficient scratch buffer"
         );
+        assert_eq!(
+            captured_lines.len(),
+            10,
+            "expected 8 rank lines + 1 blank + 1 file-label line = 10"
+        );
+
+        let expected_lines: [&[u8]; 10] = [
+            b" 8  r n b q k b n r ",
+            b" 7  p p p p p p p p ",
+            b" 6  . . . . . . . . ",
+            b" 5  . . . . . . . . ",
+            b" 4  . . . . . . . . ",
+            b" 3  . . . . . . . . ",
+            b" 2  P P P P P P P P ",
+            b" 1  R N B Q K B N R ",
+            b"",
+            b"    a b c d e f g h ",
+        ];
+
+        for (line_index, expected_bytes) in expected_lines.iter().enumerate() {
+            assert_eq!(
+                captured_lines[line_index].as_slice(),
+                *expected_bytes,
+                "ASCII White-view line {} did not match expected bytes",
+                line_index
+            );
+        }
     }
 
     /// Verifies the ASCII renderer produces the correctly mirrored output
@@ -1293,34 +1586,46 @@ mod tests_part_1_data_types_and_initial_state {
     ///
     /// ## Implementation Note
     ///
-    /// See the white-view test for an explanation of `concat!` usage.
+    /// See the white-view test for an explanation of the `Vec<Vec<u8>>`
+    /// capture pattern.
     #[test]
     fn ascii_render_initial_position_black_view() {
         let state = create_initial_board_state();
-        let mut render_buffer: [u8; 1024] = [0u8; 1024];
-        let bytes_written = format_board_state_as_ascii(&state, false, &mut render_buffer)
-            .expect("test: 1024 bytes is more than enough for the board");
+        let mut scratch_buffer: [u8; TUI_BOARD_LINE_BUFFER_BYTES] =
+            [0u8; TUI_BOARD_LINE_BUFFER_BYTES];
+        let mut captured_lines: Vec<Vec<u8>> = Vec::new();
 
-        let rendered_text = std::str::from_utf8(&render_buffer[..bytes_written])
-            .expect("test: renderer must produce valid UTF-8 (ASCII subset)");
+        let render_result = {
+            let mut emit_line_closure = |line_bytes: &[u8]| {
+                captured_lines.push(line_bytes.to_vec());
+            };
+            format_board_state_as_ascii(&state, false, &mut scratch_buffer, &mut emit_line_closure)
+        };
 
-        let expected_text = concat!(
-            " 1  R N B K Q B N R \n",
-            " 2  P P P P P P P P \n",
-            " 3  . . . . . . . . \n",
-            " 4  . . . . . . . . \n",
-            " 5  . . . . . . . . \n",
-            " 6  . . . . . . . . \n",
-            " 7  p p p p p p p p \n",
-            " 8  r n b k q b n r \n",
-            "\n",
-            "    h g f e d c b a \n",
-        );
+        assert_eq!(render_result, Ok(()));
+        assert_eq!(captured_lines.len(), 10);
 
-        assert_eq!(
-            rendered_text, expected_text,
-            "ASCII rendering of initial position (Black view) must match the mirrored format"
-        );
+        let expected_lines: [&[u8]; 10] = [
+            b" 1  R N B K Q B N R ",
+            b" 2  P P P P P P P P ",
+            b" 3  . . . . . . . . ",
+            b" 4  . . . . . . . . ",
+            b" 5  . . . . . . . . ",
+            b" 6  . . . . . . . . ",
+            b" 7  p p p p p p p p ",
+            b" 8  r n b k q b n r ",
+            b"",
+            b"    h g f e d c b a ",
+        ];
+
+        for (line_index, expected_bytes) in expected_lines.iter().enumerate() {
+            assert_eq!(
+                captured_lines[line_index].as_slice(),
+                *expected_bytes,
+                "ASCII Black-view line {} did not match expected bytes",
+                line_index
+            );
+        }
     }
 
     /// Verifies the ASCII renderer returns an error rather than corrupting
@@ -1333,18 +1638,25 @@ mod tests_part_1_data_types_and_initial_state {
     fn ascii_render_rejects_undersized_buffer() {
         let state = create_initial_board_state();
 
-        // A 16-byte buffer cannot hold even one rendered rank.
+        // A 16-byte buffer cannot hold even one rendered rank
+        // (~20 bytes in ASCII).
         let mut tiny_buffer: [u8; 16] = [0u8; 16];
-        let result = format_board_state_as_ascii(&state, true, &mut tiny_buffer);
+        let tiny_result = {
+            let mut emit_line_closure = |_line_bytes: &[u8]| {};
+            format_board_state_as_ascii(&state, true, &mut tiny_buffer, &mut emit_line_closure)
+        };
         assert_eq!(
-            result,
+            tiny_result,
             Err(MoveValidationError::InternalIndexOutOfBounds),
             "renderer must refuse to write past the end of a tiny buffer"
         );
 
         // A zero-byte buffer is the extreme case.
         let mut zero_buffer: [u8; 0] = [];
-        let zero_result = format_board_state_as_ascii(&state, true, &mut zero_buffer);
+        let zero_result = {
+            let mut emit_line_closure = |_line_bytes: &[u8]| {};
+            format_board_state_as_ascii(&state, true, &mut zero_buffer, &mut emit_line_closure)
+        };
         assert_eq!(
             zero_result,
             Err(MoveValidationError::InternalIndexOutOfBounds),
@@ -11437,7 +11749,7 @@ pub const fn recognized_config_key_as_bytes(key: RecognizedConfigKey) -> &'stati
         RecognizedConfigKey::RefreshRateSeconds => b"refresh_rate",
         RecognizedConfigKey::NMoveRule => b"n_move_rule",
         RecognizedConfigKey::ThreeTimeRepetition => b"3_time_rep",
-        RecognizedConfigKey::TuiRenderMode => b"tui_mode",
+        RecognizedConfigKey::TuiRenderMode => b"tui",
     }
 }
 
@@ -11450,13 +11762,14 @@ pub const fn recognized_config_key_as_bytes(key: RecognizedConfigKey) -> &'stati
 /// Returns `Some(variant)` on exact match, `None` otherwise.
 fn recognized_config_key_from_bytes(stripped_key_bytes: &[u8]) -> Option<RecognizedConfigKey> {
     // Bounded loop over the small fixed table of recognized keys.
-    let recognized_keys: [RecognizedConfigKey; 6] = [
+    let recognized_keys: [RecognizedConfigKey; 7] = [
         RecognizedConfigKey::PlaysWhite,
         RecognizedConfigKey::PlaysBlack,
         RecognizedConfigKey::PlayerTimeMinutes,
         RecognizedConfigKey::RefreshRateSeconds,
         RecognizedConfigKey::NMoveRule,
         RecognizedConfigKey::ThreeTimeRepetition,
+        RecognizedConfigKey::TuiRenderMode,
     ];
     let mut index: usize = 0;
     while index < recognized_keys.len() {
@@ -12185,7 +12498,7 @@ pub fn parse_n_move_rule_value(value_bytes: &[u8]) -> Option<u16> {
     Some(accumulator)
 }
 
-/// Parse a `tui_mode` value into a `TuiRenderMode`.
+/// Parse a `tui` value into a `TuiRenderMode`.
 ///
 /// Accepted input: `"ascii"` or `"unicode"` (case-insensitive after pre-screen
 /// lowercasing).
@@ -19950,9 +20263,13 @@ pub fn buffy_print(template: &str, args: &[BuffyFormatArg]) -> io::Result<()> {
     let mut pos = 0;
 
     // Stack buffers for conversions
+    // let mut num_buf = [0u8; 20];
+    // let mut style_buf = [0u8; 64];
+    // let mut align_buf = [0u8; 128];
+
     let mut num_buf = [0u8; 20];
     let mut style_buf = [0u8; 64];
-    let mut align_buf = [0u8; 128];
+    let mut align_buf = [0u8; 132]; //4 bytes boost fixes ANSI print
 
     while pos < template.len() {
         // Find next placeholder
@@ -22339,7 +22656,7 @@ use std::time::Duration;
 //         "{}",
 //         &[BuffyFormatArg::Str(
 //             "Write a memo with text_message:\n\
-//              tui_mode:<mode>",
+//              tui:<mode>",
 //         )],
 //     );
 
@@ -22352,7 +22669,7 @@ use std::time::Duration;
 //     let _print_result = buffy_println(
 //         "{}",
 //         &[BuffyFormatArg::Str(
-//             "(Write one of:\n  tui_mode:ascii\n  tui_mode:unicode)\n",
+//             "(Write one of:\n  tui:ascii\n  tui:unicode)\n",
 //         )],
 //     );
 
@@ -22519,7 +22836,6 @@ fn render_prompt_n_move_rule() {
 
 /// Emit the prompt for the missing TUI-render-mode config item.
 fn render_prompt_tui_render_mode() {
-
     // ----- Step 1: clear the terminal screen directly (not via emit_line).
     // The clear-screen sequence is a terminal control operation, not
     // content; it must not appear in the log file.
@@ -22550,7 +22866,7 @@ fn render_prompt_tui_render_mode() {
     #[cfg(debug_assertions)]
     eprintln!("render_prompt_tui_render_mode line3: {:?}", r3);
 
-    let r4 = buffy_println("{}", &[BuffyFormatArg::Str("tui_mode:<mode>")]);
+    let r4 = buffy_println("{}", &[BuffyFormatArg::Str("tui:<mode>")]);
     #[cfg(debug_assertions)]
     eprintln!("render_prompt_tui_render_mode line4: {:?}", r4);
 
@@ -22558,11 +22874,11 @@ fn render_prompt_tui_render_mode() {
     #[cfg(debug_assertions)]
     eprintln!("render_prompt_tui_render_mode line5: {:?}", r5);
 
-    let r6 = buffy_println("{}", &[BuffyFormatArg::Str("  tui_mode:ascii")]);
+    let r6 = buffy_println("{}", &[BuffyFormatArg::Str("  tui:ascii")]);
     #[cfg(debug_assertions)]
     eprintln!("render_prompt_tui_render_mode line6: {:?}", r6);
 
-    let r7 = buffy_println("{}", &[BuffyFormatArg::Str("  tui_mode:unicode")]);
+    let r7 = buffy_println("{}", &[BuffyFormatArg::Str("  tui:unicode")]);
     #[cfg(debug_assertions)]
     eprintln!("render_prompt_tui_render_mode line7: {:?}", r7);
 }
@@ -22835,7 +23151,6 @@ pub fn q_and_a_setup_bootstrap(
 
     // ----- Main loop -----
     loop {
-
         // Step 1: run one directory-scan pass.
         run_one_bootstrap_scan_pass(
             game_files_directory_path,
@@ -23716,17 +24031,46 @@ fn apply_timeflag_to_game_status(board: BoardState, game_time: GameTimeState) ->
 // Section 62 Constants
 // ----------------------------------------------------------------------------
 
-/// Maximum bytes for the board's ASCII representation produced by
-/// `format_board_state_as_ascii`.
+// ============================================================================
+// SECTION 62 (TUI constants — buffer sizing)
+// ============================================================================
+
+/// Maximum bytes for ONE rendered TUI board line.
+///
+/// ## What this buffer holds
+///
+/// One line of board output, reused per rank. The renderer writes a
+/// rank's bytes into this buffer starting at position 0, calls the
+/// per-line emit closure with the filled slice, then resets to
+/// position 0 and reuses the buffer for the next rank.
+///
+/// This is a LINE buffer, not a BOARD buffer. An earlier design held
+/// the entire rendered board in one buffer and post-split on newlines,
+/// which forced an unrealistic buffer size (1+ KB) for the Unicode+ANSI
+/// renderer. The per-line design needs only enough room for one rank.
 ///
 /// ## Sizing rationale
 ///
-/// The board format is 8 rank lines of at most 21 bytes each
-/// (" 8  r n b q k b n r\n" = 21), plus one blank line (1), plus
-/// the file-label line "    a b c d e f g h\n" (21), plus a
-/// trailing blank line for safety. We round generously to 256 bytes
-/// to leave clear headroom for any future format adjustment.
-pub const TUI_BOARD_RENDER_BUFFER_BYTES: usize = 256;
+/// Worst case is one Unicode+ANSI rank:
+///
+///   - rank label "  N  " : 4 bytes
+///   - 8 squares, each worst case:
+///         background-on \x1b[100m : 6 bytes
+///         foreground    \x1b[97m  : 5 bytes
+///         glyph         (UTF-8)    : 3 bytes
+///         reset         \x1b[0m   : 4 bytes
+///         separator space          : 1 byte
+///                            total : 19 bytes per square
+///   - 8 * 19 = 152 bytes for squares
+///   - line total: 4 + 152 = 156 bytes
+///
+/// ASCII rank lines are far shorter (~20 bytes). The file-label line
+/// is ~24 bytes. The blank-line emit is zero bytes.
+///
+/// 256 bytes gives ~100 bytes of headroom above the worst case for
+/// future SGR additions (e.g., per-square highlight for the last
+/// move played) without exceeding a quarter-KB of stack per call.
+pub const TUI_BOARD_LINE_BUFFER_BYTES: usize = 256;
 
 /// Maximum bytes for one TUI line.
 ///
@@ -23824,6 +24168,7 @@ fn write_u16_decimal_into_line_buffer(
 // Internal helper: emit one bounded portion of the board buffer as a line
 // ----------------------------------------------------------------------------
 
+// TODO: also no good error messages! needs fixing
 /// Split the ASCII board rendering produced by
 /// `format_board_state_as_ascii` into individual lines, calling
 /// `emit_line` once per line.
@@ -24185,144 +24530,6 @@ fn emit_one_formatted_line(
 // Public entry point
 // ----------------------------------------------------------------------------
 
-// /// Compose the current dungeon-master state into a sequence of
-// /// content lines and emit them, in order, through the supplied
-// /// `emit_line` closure.
-// ///
-// /// ## Project Context
-// ///
-// /// Called once per refresh cycle by the outer wrapper (Section 64).
-// /// In production the wrapper passes a closure that writes each line
-// /// to the terminal via Buffy and appends the same line to the
-// /// game-log file. In tests the closure captures emitted lines for
-// /// assertion.
-// ///
-// /// ## Side effects
-// ///
-// /// Writes the ANSI clear-screen sequence directly to the terminal
-// /// via Buffy at the start of each frame. This is NOT routed through
-// /// `emit_line`, so the log file receives content lines only.
-// ///
-// /// On Buffy write failure (unlikely; the terminal sink is typically
-// /// always-writable), the clear-screen sequence is silently dropped.
-// /// The rest of the frame still emits.
-// ///
-// /// ## Arguments
-// ///
-// /// - `state`: the dungeon-master state to render.
-// /// - `current_unix_timestamp`: the wall-clock moment for the frame,
-// ///   used by the clock-line formatters. Per project policy the
-// ///   wrapper samples this once per tick and passes it in.
-// /// - `emit_line`: closure invoked once per content line. The slice
-// ///   passed to the closure has no trailing newline; the closure is
-// ///   free to add one if its destination (terminal, log file)
-// ///   requires it.
-// ///
-// /// ## Render mode
-// ///
-// /// `state.config.tui_render_mode` selects the board renderer:
-// ///   - `TuiRenderMode::Ascii`: uppercase/lowercase letter pieces,
-// ///     no ANSI codes. Works on any terminal.
-// ///   - `TuiRenderMode::UnicodeAnsi`: Unicode chess symbols with
-// ///     ANSI color. Requires a Unicode+ANSI-capable terminal.
-// ///
-// /// The selection is made once per frame, before the board buffer is
-// /// filled. The rest of the frame (status lines, clock lines) is the
-// /// same regardless of render mode.
-// ///
-// /// ## Memory & Panic Policy
-// ///
-// /// No heap inside this function. No panics. The board scratch
-// /// buffer (256 bytes) and per-line buffer (96 bytes) are stack
-// /// resident.
-// pub fn write_dungeon_master_state_to_tui_and_log(
-//     state: &DungeonMasterState,
-//     current_unix_timestamp: u64,
-//     emit_line: &mut dyn FnMut(&[u8]),
-// ) {
-//     // ----- Step 1: clear the terminal screen directly (not via emit_line).
-//     let _ = buffy_print(
-//         "{}",
-//         &[BuffyFormatArg::Str(
-//             core::str::from_utf8(ANSI_CLEAR_SCREEN_AND_HOME).unwrap_or(""),
-//         )],
-//     );
-
-//     // ----- Step 2: render board into a stack buffer, then emit per line.
-//     let mut board_render_buffer: [u8; TUI_BOARD_RENDER_BUFFER_BYTES] =
-//         [0; TUI_BOARD_RENDER_BUFFER_BYTES];
-
-//     let render_from_white_view = should_render_from_white_view(&state.config);
-
-//     match format_board_state_as_ascii(
-//         &state.board,
-//         render_from_white_view,
-//         &mut board_render_buffer,
-//     ) {
-//         Ok(board_byte_length) => {
-//             emit_board_lines_from_rendered_buffer(
-//                 &board_render_buffer,
-//                 board_byte_length,
-//                 emit_line,
-//             );
-//         }
-//         Err(_) => {
-//             // Defensive: format_board_state_as_ascii only fails on
-//             // buffer-too-small, which is unreachable given the chosen
-//             // TUI_BOARD_RENDER_BUFFER_BYTES sizing. Emit a fallback
-//             // so the user sees something rather than a silent gap.
-//             emit_line(b"(board render error)");
-//         }
-//     }
-
-//     // ----- Step 3: emit the six status block lines.
-//     emit_one_formatted_line(
-//         |output_buffer| write_status_line_into_buffer(state, output_buffer),
-//         emit_line,
-//     );
-
-//     emit_one_formatted_line(
-//         |output_buffer| write_whole_move_is_next_line_into_buffer(state, output_buffer),
-//         emit_line,
-//     );
-
-//     emit_one_formatted_line(
-//         |output_buffer| write_move_number_line_into_buffer(state, output_buffer),
-//         emit_line,
-//     );
-
-//     emit_one_formatted_line(
-//         |output_buffer| {
-//             write_clock_line_into_buffer(
-//                 state,
-//                 PieceColor::White,
-//                 current_unix_timestamp,
-//                 output_buffer,
-//             )
-//         },
-//         emit_line,
-//     );
-
-//     emit_one_formatted_line(
-//         |output_buffer| {
-//             write_clock_line_into_buffer(
-//                 state,
-//                 PieceColor::Black,
-//                 current_unix_timestamp,
-//                 output_buffer,
-//             )
-//         },
-//         emit_line,
-//     );
-
-//     emit_one_formatted_line(
-//         |output_buffer| {
-//             write_total_time_line_into_buffer(state, current_unix_timestamp, output_buffer)
-//         },
-//         emit_line,
-//     );
-// }
-
 // ============================================================================
 // ANSI escape sequence constants for Unicode board rendering.
 // ============================================================================
@@ -24422,8 +24629,326 @@ fn unicode_bytes_for_piece(piece_value: Piece) -> &'static [u8] {
     }
 }
 
+// /// Renders the given `BoardState` as Unicode chess symbols with ANSI
+// /// color codes into the provided buffer.
+// ///
+// /// ## Piece encoding
+// ///
+// /// White pieces: ♔ ♕ ♖ ♗ ♘ ♙  rendered with ANSI bright-white foreground.
+// /// Black pieces: ♚ ♛ ♜ ♝ ♞ ♟  rendered with ANSI yellow foreground.
+// /// Empty squares: · (U+00B7 MIDDLE DOT), no color code.
+// ///
+// /// ## Square shading
+// ///
+// /// Light squares (where `file + rank` is odd, with a1 = file 0, rank 0
+// /// being a dark square per standard chess convention) receive an ANSI
+// /// bright-black ("gray") background. Dark squares receive no
+// /// background SGR. This was chosen to keep dark squares as the
+// /// terminal default and only paint the light squares.
+// ///
+// /// ## Output format
+// ///
+// /// Identical grid layout to `format_board_state_as_ascii`:
+// /// rank labels on the left, file labels on the bottom. Each piece
+// /// glyph (or empty-square dot) is bracketed by ANSI SGR sequences
+// /// for color and background, followed by an SGR reset.
+// ///
+// /// ## Buffer sizing
+// ///
+// /// Per-square worst-case byte cost:
+// ///   background-on (6) + foreground (5) + glyph (3) + reset (4) +
+// ///   trailing space (1) = 19 bytes.
+// /// Board grid total: 64 * 19 = 1216 bytes.
+// /// Rank labels, newlines, and the file-label footer add ~100 bytes.
+// /// Recommended `TUI_BOARD_LINE_BUFFER_BYTES` for this renderer:
+// /// 2048 bytes. The constant must be raised from its current 256
+// /// before this function is wired into the TUI; otherwise the
+// /// renderer returns `Err(InternalIndexOutOfBounds)` and the TUI
+// /// shows its fallback message ("(board render error)").
+// ///
+// /// ## Arguments
+// ///
+// /// - `state`: the board state to render.
+// /// - `render_from_white_view`: if true, rank 8 is at the top (White
+// ///   orientation). If false, the board is flipped (Black view).
+// /// - `output_buffer`: caller-provided stack buffer. No allocation.
+// ///
+// /// ## Returns
+// ///
+// /// On success, `Ok(bytes_written)`. On insufficient buffer space,
+// /// `Err(MoveValidationError::InternalIndexOutOfBounds)`.
+// ///
+// /// ## Memory & Panic Policy
+// ///
+// /// No heap. No panics. All writes go through `write_byte_to_buffer`
+// /// and `write_bytes_to_buffer`, which bounds-check on every write.
+// pub fn format_board_state_as_unicode_ansi(
+//     state: &BoardState,
+//     render_from_white_view: bool,
+//     output_buffer: &mut [u8],
+// ) -> Result<usize, MoveValidationError> {
+//     let mut write_position: usize = 0;
+
+//     // Iterate ranks in display order. White view: rank 7 first.
+//     // Black view: rank 0 first. Bounded loop, no recursion.
+//     let mut rank_iteration_step: u8 = 0;
+//     while rank_iteration_step < BOARD_RANK_COUNT {
+//         let actual_rank_index: u8 = if render_from_white_view {
+//             BOARD_RANK_COUNT - 1 - rank_iteration_step
+//         } else {
+//             rank_iteration_step
+//         };
+
+//         // Rank label: leading space, digit, two spaces.
+//         write_position = write_byte_to_buffer(output_buffer, write_position, b' ')?;
+//         let rank_label_byte: u8 = b'1' + actual_rank_index;
+//         write_position = write_byte_to_buffer(output_buffer, write_position, rank_label_byte)?;
+//         write_position = write_byte_to_buffer(output_buffer, write_position, b' ')?;
+//         write_position = write_byte_to_buffer(output_buffer, write_position, b' ')?;
+
+//         // Iterate files left to right in display order.
+//         let mut file_iteration_step: u8 = 0;
+//         while file_iteration_step < BOARD_FILE_COUNT {
+//             let actual_file_index: u8 = if render_from_white_view {
+//                 file_iteration_step
+//             } else {
+//                 BOARD_FILE_COUNT - 1 - file_iteration_step
+//             };
+
+//             let square_index =
+//                 square_index_from_file_and_rank(actual_file_index, actual_rank_index)?;
+//             let square_contents = state.board_squares[square_index as usize];
+
+//             // Light squares: (file + rank) odd. a1 (0,0) is dark.
+//             let square_is_light: bool =
+//                 (actual_file_index as u16 + actual_rank_index as u16) % 2 == 1;
+
+//             // ----- Emit background SGR for light squares only.
+//             if square_is_light {
+//                 write_position = write_bytes_to_buffer(
+//                     output_buffer,
+//                     write_position,
+//                     ANSI_SGR_BACKGROUND_LIGHT_SQUARE,
+//                 )?;
+//             }
+
+//             // ----- Emit foreground SGR (for pieces only; empty squares
+//             //       use whatever foreground is currently active, which
+//             //       is the terminal default since we reset after each
+//             //       square).
+//             match square_contents {
+//                 Some(piece_here) => {
+//                     let foreground_bytes: &[u8] = match piece_here.piece_color {
+//                         PieceColor::White => ANSI_SGR_FOREGROUND_BRIGHT_WHITE,
+//                         PieceColor::Black => ANSI_SGR_FOREGROUND_YELLOW,
+//                     };
+//                     write_position =
+//                         write_bytes_to_buffer(output_buffer, write_position, foreground_bytes)?;
+
+//                     let glyph_bytes = unicode_bytes_for_piece(piece_here);
+//                     write_position =
+//                         write_bytes_to_buffer(output_buffer, write_position, glyph_bytes)?;
+//                 }
+//                 None => {
+//                     write_position = write_bytes_to_buffer(
+//                         output_buffer,
+//                         write_position,
+//                         UNICODE_GLYPH_EMPTY_SQUARE,
+//                     )?;
+//                 }
+//             }
+
+//             // ----- Always reset SGR after each square so background and
+//             //       foreground do not leak into the trailing separator
+//             //       space or the next square. This costs 4 bytes per
+//             //       square but keeps state explicit and auditable.
+//             write_position = write_bytes_to_buffer(output_buffer, write_position, ANSI_SGR_RESET)?;
+
+//             // Separating space after each square.
+//             write_position = write_byte_to_buffer(output_buffer, write_position, b' ')?;
+
+//             file_iteration_step += 1;
+//         }
+
+//         // End of rank: newline.
+//         write_position = write_byte_to_buffer(output_buffer, write_position, b'\n')?;
+//         rank_iteration_step += 1;
+//     }
+
+//     // Blank line and file labels (uncolored, ASCII only).
+//     write_position = write_byte_to_buffer(output_buffer, write_position, b'\n')?;
+//     write_position = write_bytes_to_buffer(output_buffer, write_position, b"    ")?;
+
+//     let mut file_label_step: u8 = 0;
+//     while file_label_step < BOARD_FILE_COUNT {
+//         let actual_file_index: u8 = if render_from_white_view {
+//             file_label_step
+//         } else {
+//             BOARD_FILE_COUNT - 1 - file_label_step
+//         };
+//         let file_label_byte: u8 = b'a' + actual_file_index;
+//         write_position = write_byte_to_buffer(output_buffer, write_position, file_label_byte)?;
+//         write_position = write_byte_to_buffer(output_buffer, write_position, b' ')?;
+//         file_label_step += 1;
+//     }
+//     write_position = write_byte_to_buffer(output_buffer, write_position, b'\n')?;
+
+//     Ok(write_position)
+// }
+
+// /// Compose the current dungeon-master state into a sequence of
+// /// content lines and emit them, in order, through the supplied
+// /// `emit_line` closure.
+// ///
+// /// ## Project Context
+// ///
+// /// Called once per refresh cycle by the outer wrapper (Section 64).
+// /// In production the wrapper passes a closure that writes each line
+// /// to the terminal via Buffy and appends the same line to the
+// /// game-log file. In tests the closure captures emitted lines for
+// /// assertion.
+// ///
+// /// ## Side effects
+// ///
+// /// Writes the ANSI clear-screen sequence directly to the terminal
+// /// via Buffy at the start of each frame. This is NOT routed through
+// /// `emit_line`, so the log file receives content lines only.
+// ///
+// /// On Buffy write failure (unlikely; the terminal sink is typically
+// /// always-writable), the clear-screen sequence is silently dropped.
+// /// The rest of the frame still emits.
+// ///
+// /// ## Arguments
+// ///
+// /// - `state`: the dungeon-master state to render.
+// /// - `current_unix_timestamp`: the wall-clock moment for the frame,
+// ///   used by the clock-line formatters. Per project policy the
+// ///   wrapper samples this once per tick and passes it in.
+// /// - `emit_line`: closure invoked once per content line. The slice
+// ///   passed to the closure has no trailing newline; the closure is
+// ///   free to add one if its destination (terminal, log file)
+// ///   requires it.
+// ///
+// /// ## Rendering mode
+// ///
+// /// The board is rendered in ASCII or Unicode+ANSI depending on
+// /// `state.config.tui_render_mode`. All other output (status lines,
+// /// clock lines) is unaffected by this setting.
+// ///
+// /// ## Memory & Panic Policy
+// ///
+// /// No heap inside this function. No panics. The board scratch
+// /// buffer (`TUI_BOARD_LINE_BUFFER_BYTES` = 256 bytes) and per-line
+// /// buffer (`TUI_LINE_BUFFER_BYTES` = 96 bytes) are stack resident.
+// pub fn write_dungeon_master_state_to_tui_and_log(
+//     state: &DungeonMasterState,
+//     current_unix_timestamp: u64,
+//     emit_line: &mut dyn FnMut(&[u8]),
+// ) {
+//     // ----- Step 1: clear the terminal screen directly (not via emit_line).
+//     // The clear-screen sequence is a terminal control operation, not
+//     // content; it must not appear in the log file.
+//     let _ = buffy_print(
+//         "{}",
+//         &[BuffyFormatArg::Str(
+//             core::str::from_utf8(ANSI_CLEAR_SCREEN_AND_HOME).unwrap_or(""),
+//         )],
+//     );
+
+//     // ----- Step 2: render board into a stack buffer, then emit per line.
+//     // The rendering function is selected by tui_render_mode. Both
+//     // functions share the same signature and write into the same buffer,
+//     // so the rest of this function is identical for both modes.
+//     let mut board_render_buffer: [u8; TUI_BOARD_LINE_BUFFER_BYTES] =
+//         [0u8; TUI_BOARD_LINE_BUFFER_BYTES];
+
+//     let render_from_white_view: bool = should_render_from_white_view(&state.config);
+
+//     let board_render_result: Result<usize, MoveValidationError> = match state.config.tui_render_mode
+//     {
+//         TuiRenderMode::Ascii => format_board_state_as_ascii(
+//             &state.board,
+//             render_from_white_view,
+//             &mut board_render_buffer,
+//         ),
+//         TuiRenderMode::UnicodeAnsi => format_board_state_as_unicode_ansi(
+//             &state.board,
+//             render_from_white_view,
+//             &mut board_render_buffer,
+//         ),
+//     };
+
+//     match board_render_result {
+//         Ok(board_byte_length) => {
+//             emit_board_lines_from_rendered_buffer(
+//                 &board_render_buffer,
+//                 board_byte_length,
+//                 emit_line,
+//             );
+//         }
+//         Err(_) => {
+//             // Defensive: both render functions only fail on
+//             // buffer-too-small, which is unreachable given the chosen
+//             // TUI_BOARD_LINE_BUFFER_BYTES sizing. Emit a visible
+//             // placeholder so the user sees something rather than a
+//             // silent gap.
+//             emit_line(b"(board render error)");
+//         }
+//     }
+
+//     // ----- Step 3: emit the six status block lines.
+//     // These are mode-independent: clock values and status text are
+//     // plain ASCII regardless of tui_render_mode.
+//     emit_one_formatted_line(
+//         |output_buffer| write_status_line_into_buffer(state, output_buffer),
+//         emit_line,
+//     );
+
+//     emit_one_formatted_line(
+//         |output_buffer| write_whole_move_is_next_line_into_buffer(state, output_buffer),
+//         emit_line,
+//     );
+
+//     emit_one_formatted_line(
+//         |output_buffer| write_move_number_line_into_buffer(state, output_buffer),
+//         emit_line,
+//     );
+
+//     emit_one_formatted_line(
+//         |output_buffer| {
+//             write_clock_line_into_buffer(
+//                 state,
+//                 PieceColor::White,
+//                 current_unix_timestamp,
+//                 output_buffer,
+//             )
+//         },
+//         emit_line,
+//     );
+
+//     emit_one_formatted_line(
+//         |output_buffer| {
+//             write_clock_line_into_buffer(
+//                 state,
+//                 PieceColor::Black,
+//                 current_unix_timestamp,
+//                 output_buffer,
+//             )
+//         },
+//         emit_line,
+//     );
+
+//     emit_one_formatted_line(
+//         |output_buffer| {
+//             write_total_time_line_into_buffer(state, current_unix_timestamp, output_buffer)
+//         },
+//         emit_line,
+//     );
+// }
+
 /// Renders the given `BoardState` as Unicode chess symbols with ANSI
-/// color codes into the provided buffer.
+/// color codes, emitting one line at a time through the supplied
+/// `emit_line` closure.
 ///
 /// ## Piece encoding
 ///
@@ -24441,49 +24966,61 @@ fn unicode_bytes_for_piece(piece_value: Piece) -> &'static [u8] {
 ///
 /// ## Output format
 ///
-/// Identical grid layout to `format_board_state_as_ascii`:
-/// rank labels on the left, file labels on the bottom. Each piece
-/// glyph (or empty-square dot) is bracketed by ANSI SGR sequences
-/// for color and background, followed by an SGR reset.
+/// Same line structure as `format_board_state_as_ascii`: 8 rank
+/// lines, then one blank line, then a file-label line, for 10 lines
+/// total. Each rank line consists of the rank label followed by the
+/// eight squares (each square bracketed by ANSI SGR sequences for
+/// color/background, followed by an SGR reset and a separating
+/// space). The blank line and the file-label line are pure ASCII.
 ///
-/// ## Buffer sizing
+/// Lines are emitted via `emit_line` WITHOUT a trailing newline.
+/// The closure is responsible for adding a terminator if its
+/// destination requires one (terminal, log file).
 ///
-/// Per-square worst-case byte cost:
-///   background-on (6) + foreground (5) + glyph (3) + reset (4) +
-///   trailing space (1) = 19 bytes.
-/// Board grid total: 64 * 19 = 1216 bytes.
-/// Rank labels, newlines, and the file-label footer add ~100 bytes.
-/// Recommended `TUI_BOARD_RENDER_BUFFER_BYTES` for this renderer:
-/// 2048 bytes. The constant must be raised from its current 256
-/// before this function is wired into the TUI; otherwise the
-/// renderer returns `Err(InternalIndexOutOfBounds)` and the TUI
-/// shows its fallback message ("(board render error)").
+/// ## Buffer sizing (per LINE, not per board)
+///
+/// Worst case per rank line: rank label (~4 bytes) + 8 squares *
+/// 19 bytes (background SGR 6 + foreground SGR 5 + UTF-8 glyph 3 +
+/// reset SGR 4 + separator space 1) = 156 bytes. The 256-byte
+/// `TUI_BOARD_LINE_BUFFER_BYTES` provides ~100 bytes of headroom
+/// above this worst case. The same buffer is reused for every line.
 ///
 /// ## Arguments
 ///
 /// - `state`: the board state to render.
-/// - `render_from_white_view`: if true, rank 8 is at the top (White
-///   orientation). If false, the board is flipped (Black view).
-/// - `output_buffer`: caller-provided stack buffer. No allocation.
+/// - `render_from_white_view`: if true, rank 8 is at the top
+///   (White orientation). If false, the board is flipped (Black
+///   view) and files are mirrored so the board reads correctly
+///   from Black's side.
+/// - `line_scratch_buffer`: caller-provided stack buffer for
+///   assembling one line at a time. Must be at least
+///   `TUI_BOARD_LINE_BUFFER_BYTES` bytes.
+/// - `emit_line`: closure invoked once per emitted line. The slice
+///   passed has no trailing newline.
 ///
 /// ## Returns
 ///
-/// On success, `Ok(bytes_written)`. On insufficient buffer space,
-/// `Err(MoveValidationError::InternalIndexOutOfBounds)`.
+/// `Ok(())` after all 10 lines are emitted.
+///
+/// `Err(MoveValidationError::InternalIndexOutOfBounds)` if any line
+/// would not fit into `line_scratch_buffer`. With a properly sized
+/// buffer this cannot occur in any reachable state; the error path
+/// is a backstop for future format changes that violate the sizing
+/// assumption.
 ///
 /// ## Memory & Panic Policy
 ///
 /// No heap. No panics. All writes go through `write_byte_to_buffer`
 /// and `write_bytes_to_buffer`, which bounds-check on every write.
+/// The scratch buffer is reused across all 10 lines — total stack
+/// cost is one buffer, not ten.
 pub fn format_board_state_as_unicode_ansi(
     state: &BoardState,
     render_from_white_view: bool,
-    output_buffer: &mut [u8],
-) -> Result<usize, MoveValidationError> {
-    let mut write_position: usize = 0;
-
-    // Iterate ranks in display order. White view: rank 7 first.
-    // Black view: rank 0 first. Bounded loop, no recursion.
+    line_scratch_buffer: &mut [u8],
+    emit_line: &mut dyn FnMut(&[u8]),
+) -> Result<(), MoveValidationError> {
+    // ----- Step 1: emit the 8 rank lines.
     let mut rank_iteration_step: u8 = 0;
     while rank_iteration_step < BOARD_RANK_COUNT {
         let actual_rank_index: u8 = if render_from_white_view {
@@ -24492,12 +25029,16 @@ pub fn format_board_state_as_unicode_ansi(
             rank_iteration_step
         };
 
+        // Fill this rank's bytes into the scratch buffer starting at 0.
+        let mut write_position: usize = 0;
+
         // Rank label: leading space, digit, two spaces.
-        write_position = write_byte_to_buffer(output_buffer, write_position, b' ')?;
+        write_position = write_byte_to_buffer(line_scratch_buffer, write_position, b' ')?;
         let rank_label_byte: u8 = b'1' + actual_rank_index;
-        write_position = write_byte_to_buffer(output_buffer, write_position, rank_label_byte)?;
-        write_position = write_byte_to_buffer(output_buffer, write_position, b' ')?;
-        write_position = write_byte_to_buffer(output_buffer, write_position, b' ')?;
+        write_position =
+            write_byte_to_buffer(line_scratch_buffer, write_position, rank_label_byte)?;
+        write_position = write_byte_to_buffer(line_scratch_buffer, write_position, b' ')?;
+        write_position = write_byte_to_buffer(line_scratch_buffer, write_position, b' ')?;
 
         // Iterate files left to right in display order.
         let mut file_iteration_step: u8 = 0;
@@ -24516,61 +25057,70 @@ pub fn format_board_state_as_unicode_ansi(
             let square_is_light: bool =
                 (actual_file_index as u16 + actual_rank_index as u16) % 2 == 1;
 
-            // ----- Emit background SGR for light squares only.
+            // Emit background SGR for light squares only.
             if square_is_light {
                 write_position = write_bytes_to_buffer(
-                    output_buffer,
+                    line_scratch_buffer,
                     write_position,
                     ANSI_SGR_BACKGROUND_LIGHT_SQUARE,
                 )?;
             }
 
-            // ----- Emit foreground SGR (for pieces only; empty squares
-            //       use whatever foreground is currently active, which
-            //       is the terminal default since we reset after each
-            //       square).
+            // Emit foreground SGR (for pieces only; empty squares
+            // use whatever foreground is currently active, which is
+            // the terminal default since we reset after each square).
             match square_contents {
                 Some(piece_here) => {
                     let foreground_bytes: &[u8] = match piece_here.piece_color {
                         PieceColor::White => ANSI_SGR_FOREGROUND_BRIGHT_WHITE,
                         PieceColor::Black => ANSI_SGR_FOREGROUND_YELLOW,
                     };
-                    write_position =
-                        write_bytes_to_buffer(output_buffer, write_position, foreground_bytes)?;
+                    write_position = write_bytes_to_buffer(
+                        line_scratch_buffer,
+                        write_position,
+                        foreground_bytes,
+                    )?;
 
                     let glyph_bytes = unicode_bytes_for_piece(piece_here);
                     write_position =
-                        write_bytes_to_buffer(output_buffer, write_position, glyph_bytes)?;
+                        write_bytes_to_buffer(line_scratch_buffer, write_position, glyph_bytes)?;
                 }
                 None => {
                     write_position = write_bytes_to_buffer(
-                        output_buffer,
+                        line_scratch_buffer,
                         write_position,
                         UNICODE_GLYPH_EMPTY_SQUARE,
                     )?;
                 }
             }
 
-            // ----- Always reset SGR after each square so background and
-            //       foreground do not leak into the trailing separator
-            //       space or the next square. This costs 4 bytes per
-            //       square but keeps state explicit and auditable.
-            write_position = write_bytes_to_buffer(output_buffer, write_position, ANSI_SGR_RESET)?;
+            // Always reset SGR after each square so background and
+            // foreground do not leak into the trailing separator
+            // space or the next square. 4 bytes per square keeps the
+            // state explicit and auditable.
+            write_position =
+                write_bytes_to_buffer(line_scratch_buffer, write_position, ANSI_SGR_RESET)?;
 
             // Separating space after each square.
-            write_position = write_byte_to_buffer(output_buffer, write_position, b' ')?;
+            write_position = write_byte_to_buffer(line_scratch_buffer, write_position, b' ')?;
 
             file_iteration_step += 1;
         }
 
-        // End of rank: newline.
-        write_position = write_byte_to_buffer(output_buffer, write_position, b'\n')?;
+        // Emit this rank's line (no trailing newline).
+        emit_line(&line_scratch_buffer[..write_position]);
+
         rank_iteration_step += 1;
     }
 
-    // Blank line and file labels (uncolored, ASCII only).
-    write_position = write_byte_to_buffer(output_buffer, write_position, b'\n')?;
-    write_position = write_bytes_to_buffer(output_buffer, write_position, b"    ")?;
+    // ----- Step 2: emit the blank separator line.
+    // The closure adds its own newline to whichever sink it serves;
+    // an empty slice + newline produces a blank line.
+    emit_line(&[]);
+
+    // ----- Step 3: emit the file-label line (uncolored, ASCII only).
+    let mut write_position: usize = 0;
+    write_position = write_bytes_to_buffer(line_scratch_buffer, write_position, b"    ")?;
 
     let mut file_label_step: u8 = 0;
     while file_label_step < BOARD_FILE_COUNT {
@@ -24580,13 +25130,15 @@ pub fn format_board_state_as_unicode_ansi(
             BOARD_FILE_COUNT - 1 - file_label_step
         };
         let file_label_byte: u8 = b'a' + actual_file_index;
-        write_position = write_byte_to_buffer(output_buffer, write_position, file_label_byte)?;
-        write_position = write_byte_to_buffer(output_buffer, write_position, b' ')?;
+        write_position =
+            write_byte_to_buffer(line_scratch_buffer, write_position, file_label_byte)?;
+        write_position = write_byte_to_buffer(line_scratch_buffer, write_position, b' ')?;
         file_label_step += 1;
     }
-    write_position = write_byte_to_buffer(output_buffer, write_position, b'\n')?;
 
-    Ok(write_position)
+    emit_line(&line_scratch_buffer[..write_position]);
+
+    Ok(())
 }
 
 /// Compose the current dungeon-master state into a sequence of
@@ -24631,8 +25183,10 @@ pub fn format_board_state_as_unicode_ansi(
 /// ## Memory & Panic Policy
 ///
 /// No heap inside this function. No panics. The board scratch
-/// buffer (`TUI_BOARD_RENDER_BUFFER_BYTES` = 256 bytes) and per-line
+/// buffer (`TUI_BOARD_LINE_BUFFER_BYTES` = 256 bytes) and per-line
 /// buffer (`TUI_LINE_BUFFER_BYTES` = 96 bytes) are stack resident.
+/// The board scratch buffer is a per-LINE buffer reused across all
+/// rank/label lines, not a whole-board buffer.
 pub fn write_dungeon_master_state_to_tui_and_log(
     state: &DungeonMasterState,
     current_unix_timestamp: u64,
@@ -24648,45 +25202,40 @@ pub fn write_dungeon_master_state_to_tui_and_log(
         )],
     );
 
-    // ----- Step 2: render board into a stack buffer, then emit per line.
-    // The rendering function is selected by tui_render_mode. Both
-    // functions share the same signature and write into the same buffer,
-    // so the rest of this function is identical for both modes.
-    let mut board_render_buffer: [u8; TUI_BOARD_RENDER_BUFFER_BYTES] =
-        [0u8; TUI_BOARD_RENDER_BUFFER_BYTES];
+    // ----- Step 2: render board one line at a time via the renderer's
+    // emit_line callback. The renderer fills a stack scratch buffer
+    // with a single line's bytes, calls emit_line, then reuses the
+    // buffer for the next line. No whole-board buffer is built.
+    let mut board_line_scratch_buffer: [u8; TUI_BOARD_LINE_BUFFER_BYTES] =
+        [0u8; TUI_BOARD_LINE_BUFFER_BYTES];
 
     let render_from_white_view: bool = should_render_from_white_view(&state.config);
 
-    let board_render_result: Result<usize, MoveValidationError> = match state.config.tui_render_mode
-    {
+    let board_render_result: Result<(), MoveValidationError> = match state.config.tui_render_mode {
         TuiRenderMode::Ascii => format_board_state_as_ascii(
             &state.board,
             render_from_white_view,
-            &mut board_render_buffer,
+            &mut board_line_scratch_buffer,
+            emit_line,
         ),
         TuiRenderMode::UnicodeAnsi => format_board_state_as_unicode_ansi(
             &state.board,
             render_from_white_view,
-            &mut board_render_buffer,
+            &mut board_line_scratch_buffer,
+            emit_line,
         ),
     };
 
-    match board_render_result {
-        Ok(board_byte_length) => {
-            emit_board_lines_from_rendered_buffer(
-                &board_render_buffer,
-                board_byte_length,
-                emit_line,
-            );
-        }
-        Err(_) => {
-            // Defensive: both render functions only fail on
-            // buffer-too-small, which is unreachable given the chosen
-            // TUI_BOARD_RENDER_BUFFER_BYTES sizing. Emit a visible
-            // placeholder so the user sees something rather than a
-            // silent gap.
-            emit_line(b"(board render error)");
-        }
+    if board_render_result.is_err() {
+        // Defensive: both render functions return Err only on a
+        // per-LINE buffer-too-small condition. With
+        // TUI_BOARD_LINE_BUFFER_BYTES = 256 and the documented
+        // worst-case ~156 bytes/line (Unicode+ANSI), this is
+        // unreachable in any normal configuration. Emit a visible
+        // placeholder so the user sees something rather than a
+        // silent gap, and so a future format change that violates
+        // the sizing assumption produces a visible artifact.
+        emit_line(b"(WDMSTAL board render error)");
     }
 
     // ----- Step 3: emit the six status block lines.
