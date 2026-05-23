@@ -22385,7 +22385,7 @@ fn render_prompt_plays_white() {
     #[cfg(debug_assertions)]
     eprintln!("render_prompt_plays_white line1: {:?}", r1);
 
-    let r2 = buffy_println("{}", &[BuffyFormatArg::Str("1. Who plays white?")]);
+    let r2 = buffy_println("{}", &[BuffyFormatArg::Str("\n1. Who plays white?")]);
     #[cfg(debug_assertions)]
     eprintln!("render_prompt_plays_white line2: {:?}", r2);
 
@@ -22411,7 +22411,7 @@ fn render_prompt_plays_black() {
     #[cfg(debug_assertions)]
     eprintln!("render_prompt_plays_black line1: {:?}", r1);
 
-    let r2 = buffy_println("{}", &[BuffyFormatArg::Str("2. Who plays black?")]);
+    let r2 = buffy_println("{}", &[BuffyFormatArg::Str("\n2. Who plays black?")]);
     #[cfg(debug_assertions)]
     eprintln!("render_prompt_plays_black line2: {:?}", r2);
 
@@ -22439,7 +22439,9 @@ fn render_prompt_player_time() {
 
     let r2 = buffy_println(
         "{}",
-        &[BuffyFormatArg::Str("3. Per-player time limit in minutes.")],
+        &[BuffyFormatArg::Str(
+            "\n3. Per-player time limit in minutes.",
+        )],
     );
     #[cfg(debug_assertions)]
     eprintln!("render_prompt_player_time line2: {:?}", r2);
@@ -22468,7 +22470,7 @@ fn render_prompt_refresh_rate() {
 
     let r2 = buffy_println(
         "{}",
-        &[BuffyFormatArg::Str("4. Screen refresh rate in seconds.")],
+        &[BuffyFormatArg::Str("\n4. Screen refresh rate in seconds.")],
     );
     #[cfg(debug_assertions)]
     eprintln!("render_prompt_refresh_rate line2: {:?}", r2);
@@ -22495,7 +22497,7 @@ fn render_prompt_n_move_rule() {
     #[cfg(debug_assertions)]
     eprintln!("render_prompt_n_move_rule line1: {:?}", r1);
 
-    let r2 = buffy_println("{}", &[BuffyFormatArg::Str("5. N-move rule.")]);
+    let r2 = buffy_println("{}", &[BuffyFormatArg::Str("\n5. N-move rule.")]);
     #[cfg(debug_assertions)]
     eprintln!("render_prompt_n_move_rule line2: {:?}", r2);
 
@@ -22517,6 +22519,17 @@ fn render_prompt_n_move_rule() {
 
 /// Emit the prompt for the missing TUI-render-mode config item.
 fn render_prompt_tui_render_mode() {
+
+    // ----- Step 1: clear the terminal screen directly (not via emit_line).
+    // The clear-screen sequence is a terminal control operation, not
+    // content; it must not appear in the log file.
+    let _ = buffy_print(
+        "{}",
+        &[BuffyFormatArg::Str(
+            core::str::from_utf8(ANSI_CLEAR_SCREEN_AND_HOME).unwrap_or(""),
+        )],
+    );
+
     let r1 = buffy_println("{}", &[BuffyFormatArg::Str("memo_chess bootstrap:")]);
     #[cfg(debug_assertions)]
     eprintln!("render_prompt_tui_render_mode line1: {:?}", r1);
@@ -22524,7 +22537,7 @@ fn render_prompt_tui_render_mode() {
     let r2 = buffy_println(
         "{}",
         &[BuffyFormatArg::Str(
-            "6. TUI Mode: simple ascii vs. unicode + ansi",
+            "\n6. TUI Mode: simple ascii vs. unicode + ansi",
         )],
     );
     #[cfg(debug_assertions)]
@@ -22541,7 +22554,7 @@ fn render_prompt_tui_render_mode() {
     #[cfg(debug_assertions)]
     eprintln!("render_prompt_tui_render_mode line4: {:?}", r4);
 
-    let r5 = buffy_println("{}", &[BuffyFormatArg::Str("(Write one of:)")]);
+    let r5 = buffy_println("{}", &[BuffyFormatArg::Str("Select & write one of these:")]);
     #[cfg(debug_assertions)]
     eprintln!("render_prompt_tui_render_mode line5: {:?}", r5);
 
@@ -22776,9 +22789,6 @@ pub fn q_and_a_setup_bootstrap(
     chrono_sort_temp_directory_path: &Path,
     memochess_logging_directory_path: &Path,
 ) -> Result<MemochessGameConfig, MemochessBootstrapError> {
-    // inspection
-    println!("starting q_and_a_setup_bootstrap");
-
     // ----- Root input validation -----
     validate_bootstrap_root_inputs(
         game_files_directory_path,
