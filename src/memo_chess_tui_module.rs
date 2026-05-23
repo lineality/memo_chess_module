@@ -9041,21 +9041,21 @@ impl MemochessGameConfig {
         })
     }
 
-    /// Borrow the directory-path bytes as a slice.
-    ///
-    /// The returned slice references only the meaningful prefix
-    /// (`..directory_path_length`). It is not null-terminated.
-    pub fn directory_path_as_bytes(&self) -> &[u8] {
-        let length_as_usize = self.memo_toml_files_directory_path_length as usize;
-        // Defensive clamp: in case length ever exceeded buffer size
-        // (it cannot via the public API), avoid panicking on slice.
-        let safe_length = if length_as_usize > MAX_DIRECTORY_PATH_BYTES {
-            MAX_DIRECTORY_PATH_BYTES
-        } else {
-            length_as_usize
-        };
-        &self.memo_toml_files_directory_path_buffer[..safe_length]
-    }
+    // /// Borrow the directory-path bytes as a slice.
+    // ///
+    // /// The returned slice references only the meaningful prefix
+    // /// (`..directory_path_length`). It is not null-terminated.
+    // pub fn directory_pathasbytes(&self) -> &[u8] {
+    //     let length_as_usize = self.memo_toml_files_directory_path_length as usize;
+    //     // Defensive clamp: in case length ever exceeded buffer size
+    //     // (it cannot via the public API), avoid panicking on slice.
+    //     let safe_length = if length_as_usize > MAX_DIRECTORY_PATH_BYTES {
+    //         MAX_DIRECTORY_PATH_BYTES
+    //     } else {
+    //         length_as_usize
+    //     };
+    //     &self.memo_toml_files_directory_path_buffer[..safe_length]
+    // }
 }
 
 // ============================================================================
@@ -9112,7 +9112,7 @@ fn copy_bytes_into_fixed_buffer(
 //     #[test]
 //     fn valid_config_constructs_successfully() {
 //         let config = build_valid_test_config().expect("test: valid inputs must construct");
-//         assert_eq!(config.directory_path_as_bytes(), b"/tmp/memo_chess_demo");
+//         assert_eq!(config.directory_pathasbytes(), b"/tmp/memo_chess_demo");
 //         assert_eq!(config.local_user_name_as_bytes(), b"tom");
 //         assert_eq!(config.white_player_name_as_bytes(), b"alice");
 //         assert_eq!(config.black_player_name_as_bytes(), b"bob");
@@ -9167,7 +9167,7 @@ fn copy_bytes_into_fixed_buffer(
 //         )
 //         .expect("test: exactly max-length path must be accepted");
 //         assert_eq!(
-//             config.directory_path_as_bytes().len(),
+//             config.directory_pathasbytes().len(),
 //             MAX_DIRECTORY_PATH_BYTES
 //         );
 //     }
@@ -9299,8 +9299,8 @@ fn copy_bytes_into_fixed_buffer(
 //         let copied = original; // would move if not Copy
 //         // Both must remain usable.
 //         assert_eq!(
-//             original.directory_path_as_bytes(),
-//             copied.directory_path_as_bytes()
+//             original.directory_pathasbytes(),
+//             copied.directory_pathasbytes()
 //         );
 //         assert_eq!(
 //             original.white_player_name_as_bytes(),
@@ -13204,7 +13204,7 @@ pub fn build_memochess_config_if_complete(
 //         assert_eq!(config.white_player_name_as_bytes(), b"alice");
 //         assert_eq!(config.black_player_name_as_bytes(), b"bob");
 //         assert_eq!(config.local_user_name_as_bytes(), b"tom");
-//         assert_eq!(config.directory_path_as_bytes(), b"/tmp/game_dir");
+//         assert_eq!(config.directory_pathasbytes(), b"/tmp/game_dir");
 //         assert_eq!(config.max_time_limit_per_player_seconds, 600);
 //         assert_eq!(config.refresh_rate_seconds, 10);
 //         assert_eq!(config.n_move_rule, 50);
@@ -13793,26 +13793,27 @@ pub enum ChronoIndexError {
     LookupIo,
 }
 
-impl ChronoIndexError {
-    /// Returns the stable diagnostic code string. Safe for production logs.
-    /// Never includes paths, names, mtimes, or other content.
-    pub fn code(self) -> &'static str {
-        match self {
-            ChronoIndexError::IndexDirIo => "CIDX-01",
-            ChronoIndexError::HeaderReadIo => "CIDX-02",
-            ChronoIndexError::HeaderWriteIo => "CIDX-03",
-            ChronoIndexError::HeaderBadMagic => "CIDX-04",
-            ChronoIndexError::HeaderBadVersion => "CIDX-05",
-            ChronoIndexError::HeaderBadSize => "CIDX-06",
-            ChronoIndexError::ParentPathTooLong => "CIDX-07",
-            ChronoIndexError::ParentPathInvalid => "CIDX-08",
-            ChronoIndexError::RenameIo => "CIDX-09",
-            ChronoIndexError::BuildIo => "CIDX-10",
-            ChronoIndexError::AppendIo => "CIDX-11",
-            ChronoIndexError::LookupIo => "CIDX-12",
-        }
-    }
-}
+// /// ?
+// impl ChronoIndexError {
+//     /// Returns the stable diagnostic code string. Safe for production logs.
+//     /// Never includes paths, names, mtimes, or other content.
+//     pub fn code(self) -> &'static str {
+//         match self {
+//             ChronoIndexError::IndexDirIo => "CIDX-01",
+//             ChronoIndexError::HeaderReadIo => "CIDX-02",
+//             ChronoIndexError::HeaderWriteIo => "CIDX-03",
+//             ChronoIndexError::HeaderBadMagic => "CIDX-04",
+//             ChronoIndexError::HeaderBadVersion => "CIDX-05",
+//             ChronoIndexError::HeaderBadSize => "CIDX-06",
+//             ChronoIndexError::ParentPathTooLong => "CIDX-07",
+//             ChronoIndexError::ParentPathInvalid => "CIDX-08",
+//             ChronoIndexError::RenameIo => "CIDX-09",
+//             ChronoIndexError::BuildIo => "CIDX-10",
+//             ChronoIndexError::AppendIo => "CIDX-11",
+//             ChronoIndexError::LookupIo => "CIDX-12",
+//         }
+//     }
+// }
 
 // =========================================================================
 // In-memory header representation
@@ -14024,44 +14025,44 @@ impl ChronoIndexHeader {
 // Pearson Salt Hash Functions
 // =========================================================================
 
-/// Computes the per-basename hash used by Role 1 (signal_hash fold)
-/// and Role 2 (name_hashes.bin sidecar entry). Role 1 and Role 2 use
-/// independent salt arrays so their outputs are not correlated.
-fn pearson_hash_basename_for_signal(
-    basename_bytes: &[u8],
-) -> Result<[u8; PEARSON_SALT_ARRAY_SIZE], ChronoIndexError> {
-    match pearson_hash_salt_array::<PEARSON_SALT_ARRAY_SIZE>(
-        basename_bytes,
-        &SIGNAL_HASH_SALTS,
-        &GENERATED_TABLE,
-    ) {
-        Ok(hash_bytes) => Ok(hash_bytes),
-        Err(_) => Err(ChronoIndexError::BuildIo),
-    }
-}
+// /// Computes the per-basename hash used by Role 1 (signal_hash fold)
+// /// and Role 2 (name_hashes.bin sidecar entry). Role 1 and Role 2 use
+// /// independent salt arrays so their outputs are not correlated.
+// fn pearson_hash_basename_for_signal(
+//     basename_bytes: &[u8],
+// ) -> Result<[u8; PEARSON_SALT_ARRAY_SIZE], ChronoIndexError> {
+//     match pearson_hash_salt_array::<PEARSON_SALT_ARRAY_SIZE>(
+//         basename_bytes,
+//         &SIGNAL_HASH_SALTS,
+//         &GENERATED_TABLE,
+//     ) {
+//         Ok(hash_bytes) => Ok(hash_bytes),
+//         Err(_) => Err(ChronoIndexError::BuildIo),
+//     }
+// }
 
-fn pearson_hash_basename_for_name_sidecar(
-    basename_bytes: &[u8],
-) -> Result<[u8; PEARSON_SALT_ARRAY_SIZE], ChronoIndexError> {
-    match pearson_hash_salt_array::<PEARSON_SALT_ARRAY_SIZE>(
-        basename_bytes,
-        &NAME_HASH_SALTS,
-        &GENERATED_TABLE,
-    ) {
-        Ok(hash_bytes) => Ok(hash_bytes),
-        Err(_) => Err(ChronoIndexError::AppendIo),
-    }
-}
+// fn pearson_hash_basename_for_name_sidecar(
+//     basename_bytes: &[u8],
+// ) -> Result<[u8; PEARSON_SALT_ARRAY_SIZE], ChronoIndexError> {
+//     match pearson_hash_salt_array::<PEARSON_SALT_ARRAY_SIZE>(
+//         basename_bytes,
+//         &NAME_HASH_SALTS,
+//         &GENERATED_TABLE,
+//     ) {
+//         Ok(hash_bytes) => Ok(hash_bytes),
+//         Err(_) => Err(ChronoIndexError::AppendIo),
+//     }
+// }
 
-/// In-place XOR: accumulator ^= addend, lane by lane.
-fn xor_into_accumulator(
-    accumulator: &mut [u8; PEARSON_SALT_ARRAY_SIZE],
-    addend: &[u8; PEARSON_SALT_ARRAY_SIZE],
-) {
-    for lane_index in 0..PEARSON_SALT_ARRAY_SIZE {
-        accumulator[lane_index] ^= addend[lane_index];
-    }
-}
+// /// In-place XOR: accumulator ^= addend, lane by lane.
+// fn xor_into_accumulator(
+//     accumulator: &mut [u8; PEARSON_SALT_ARRAY_SIZE],
+//     addend: &[u8; PEARSON_SALT_ARRAY_SIZE],
+// ) {
+//     for lane_index in 0..PEARSON_SALT_ARRAY_SIZE {
+//         accumulator[lane_index] ^= addend[lane_index];
+//     }
+// }
 
 // =============================================================================
 // SECTION 2: Generated Permutation Table (compile-time Fisher-Yates)
@@ -14207,101 +14208,101 @@ pub const fn generate_table_fisher_yates_const(seed: u64) -> [u8; 256] {
 // SECTION 3: Base Pearson Hash (production function)
 // =============================================================================
 
-/// Compute the 8-bit Pearson hash of `input` using `table`.
-///
-/// ## Project-Level Context
-///
-/// This is the core building block of the entire module. The
-/// salt-array variant is implemented in terms of the same inner loop,
-/// inlined for stack-only operation. External callers typically use
-/// this directly when an 8-bit hash is sufficient (e.g. selecting one
-/// of 256 hash buckets).
-///
-/// ## Algorithm
-///
-/// ```text
-///     hash = 0
-///     for byte in input:
-///         hash = table[hash XOR byte]
-///     return hash
-/// ```
-///
-/// The table indexing is always in-bounds because `hash` and `byte`
-/// are both `u8`, so `hash ^ byte` is a `u8` in `0..=255`, and
-/// `table.len() == 256`.
-///
-/// ## Arguments
-///
-/// * `input` — Slice of bytes to hash. Must be non-empty.
-/// * `table` — Reference to a 256-byte permutation table. The caller
-///   chooses which table (`PEARSON_1990_TABLE`, `GENERATED_TABLE`, or
-///   a custom one).
-///
-/// ## Returns
-///
-/// * `Ok(u8)` — the Pearson hash of `input`.
-/// * `Err(std::io::Error)` with `ErrorKind::InvalidInput` and message
-///   `"PHB: empty input"` — if `input` is empty.
-///
-/// ## Why Reject Empty Input?
-///
-/// Mathematically the Pearson hash of an empty string is the initial
-/// value of `hash`, which is `0`. But returning `0` for empty input
-/// is a silent failure mode: it collides with every legitimate input
-/// that happens to hash to `0`. Per project rules ("check returns,
-/// check bounds"), we surface this case as an explicit error so the
-/// caller decides how to handle it.
-///
-/// ## Error Message Convention
-///
-/// All error messages from this function are prefixed `"PHB:"`
-/// (Pearson Hash Base) so log readers can identify the source
-/// function without leaking source paths.
-///
-/// ## Examples
-///
-/// ```ignore
-/// use pearson_hash_salt_array_rust::{pearson_hash_base, PEARSON_1990_TABLE};
-///
-/// let h = pearson_hash_base(b"hello", &PEARSON_1990_TABLE)?;
-/// assert!(h <= 255); // always true, h is u8
-/// # Ok::<(), std::io::Error>(())
-/// ```
-pub fn pearson_hash_base(input: &[u8], table: &[u8; 256]) -> Result<u8, Error> {
-    // =========================================================
-    // Debug-Assert, Test-Assert, Production-Catch-Handle
-    // =========================================================
+// /// Compute the 8-bit Pearson hash of `input` using `table`.
+// ///
+// /// ## Project-Level Context
+// ///
+// /// This is the core building block of the entire module. The
+// /// salt-array variant is implemented in terms of the same inner loop,
+// /// inlined for stack-only operation. External callers typically use
+// /// this directly when an 8-bit hash is sufficient (e.g. selecting one
+// /// of 256 hash buckets).
+// ///
+// /// ## Algorithm
+// ///
+// /// ```text
+// ///     hash = 0
+// ///     for byte in input:
+// ///         hash = table[hash XOR byte]
+// ///     return hash
+// /// ```
+// ///
+// /// The table indexing is always in-bounds because `hash` and `byte`
+// /// are both `u8`, so `hash ^ byte` is a `u8` in `0..=255`, and
+// /// `table.len() == 256`.
+// ///
+// /// ## Arguments
+// ///
+// /// * `input` — Slice of bytes to hash. Must be non-empty.
+// /// * `table` — Reference to a 256-byte permutation table. The caller
+// ///   chooses which table (`PEARSON_1990_TABLE`, `GENERATED_TABLE`, or
+// ///   a custom one).
+// ///
+// /// ## Returns
+// ///
+// /// * `Ok(u8)` — the Pearson hash of `input`.
+// /// * `Err(std::io::Error)` with `ErrorKind::InvalidInput` and message
+// ///   `"PHB: empty input"` — if `input` is empty.
+// ///
+// /// ## Why Reject Empty Input?
+// ///
+// /// Mathematically the Pearson hash of an empty string is the initial
+// /// value of `hash`, which is `0`. But returning `0` for empty input
+// /// is a silent failure mode: it collides with every legitimate input
+// /// that happens to hash to `0`. Per project rules ("check returns,
+// /// check bounds"), we surface this case as an explicit error so the
+// /// caller decides how to handle it.
+// ///
+// /// ## Error Message Convention
+// ///
+// /// All error messages from this function are prefixed `"PHB:"`
+// /// (Pearson Hash Base) so log readers can identify the source
+// /// function without leaking source paths.
+// ///
+// /// ## Examples
+// ///
+// /// ```ignore
+// /// use pearson_hash_salt_array_rust::{pearson_hash_base, PEARSON_1990_TABLE};
+// ///
+// /// let h = pearson_hash_base(b"hello", &PEARSON_1990_TABLE)?;
+// /// assert!(h <= 255); // always true, h is u8
+// /// # Ok::<(), std::io::Error>(())
+// /// ```
+// fn pearson_hash_base(input: &[u8], table: &[u8; 256]) -> Result<u8, Error> {
+//     // =========================================================
+//     // Debug-Assert, Test-Assert, Production-Catch-Handle
+//     // =========================================================
 
-    // Debug-only invariant: table length is enforced by the type
-    // `&[u8; 256]`, so it cannot be wrong, but we assert it during
-    // debug builds (not test builds) as a tripwire against future
-    // refactors that might loosen the type.
-    #[cfg(all(debug_assertions, not(test)))]
-    debug_assert!(table.len() == 256, "PHB: table length invariant");
+//     // Debug-only invariant: table length is enforced by the type
+//     // `&[u8; 256]`, so it cannot be wrong, but we assert it during
+//     // debug builds (not test builds) as a tripwire against future
+//     // refactors that might loosen the type.
+//     #[cfg(all(debug_assertions, not(test)))]
+//     debug_assert!(table.len() == 256, "PHB: table length invariant");
 
-    // Test-only assertion mirroring the production check below.
-    // Kept here so `cargo test --release` still exercises it.
-    #[cfg(test)]
-    assert!(table.len() == 256, "PHB: table length invariant");
+//     // Test-only assertion mirroring the production check below.
+//     // Kept here so `cargo test --release` still exercises it.
+//     #[cfg(test)]
+//     assert!(table.len() == 256, "PHB: table length invariant");
 
-    // Production check: never panic, return Err and let the caller
-    // decide. Empty-input handling per docstring above.
-    if input.is_empty() {
-        return Err(Error::new(ErrorKind::InvalidInput, "PHB: empty input"));
-    }
+//     // Production check: never panic, return Err and let the caller
+//     // decide. Empty-input handling per docstring above.
+//     if input.is_empty() {
+//         return Err(Error::new(ErrorKind::InvalidInput, "PHB: empty input"));
+//     }
 
-    // Core Pearson loop. Bounded by `input.len()`, which is finite.
-    // No heap, no recursion, no panics: index is always in-bounds
-    // because `(hash ^ byte) as usize` is in `0..=255` and
-    // `table` is `[u8; 256]`.
-    let mut running_hash: u8 = 0;
-    for &current_byte in input {
-        let table_index: usize = (running_hash ^ current_byte) as usize;
-        running_hash = table[table_index];
-    }
+//     // Core Pearson loop. Bounded by `input.len()`, which is finite.
+//     // No heap, no recursion, no panics: index is always in-bounds
+//     // because `(hash ^ byte) as usize` is in `0..=255` and
+//     // `table` is `[u8; 256]`.
+//     let mut running_hash: u8 = 0;
+//     for &current_byte in input {
+//         let table_index: usize = (running_hash ^ current_byte) as usize;
+//         running_hash = table[table_index];
+//     }
 
-    Ok(running_hash)
-}
+//     Ok(running_hash)
+// }
 
 // =============================================================================
 // SECTION 4: Salt-Array Pearson Hash (production function, stack-only)
@@ -14496,6 +14497,7 @@ pub fn pearson_hash_salt_array<const N: usize>(
 // SECTION 5: Internal utility — permutation validity check
 // =============================================================================
 
+// TODO add as check
 /// Verify that `table` is a valid permutation of `0..=255`.
 ///
 /// ## Project-Level Context
@@ -14900,13 +14902,13 @@ mod chrono_index_part_a_tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    #[test]
-    fn error_codes_are_stable_and_terse() {
-        // Production logs must be able to depend on these strings.
-        assert_eq!(ChronoIndexError::IndexDirIo.code(), "CIDX-01");
-        assert_eq!(ChronoIndexError::HeaderBadMagic.code(), "CIDX-04");
-        assert_eq!(ChronoIndexError::ParentPathTooLong.code(), "CIDX-07");
-    }
+    // #[test]
+    // fn error_codes_are_stable_and_terse() {
+    //     // Production logs must be able to depend on these strings.
+    //     assert_eq!(ChronoIndexError::IndexDirIo.code(), "CIDX-01");
+    //     assert_eq!(ChronoIndexError::HeaderBadMagic.code(), "CIDX-04");
+    //     assert_eq!(ChronoIndexError::ParentPathTooLong.code(), "CIDX-07");
+    // }
 }
 
 // =========================================================================
@@ -18013,6 +18015,7 @@ pub enum UpdateOutcome {
     IncrementalAppendCompleted,
 }
 
+// TODO why are these not used?
 /// Aggregate summary returned by `create_or_update_chrono_index`. The numeric fields are
 /// 0 for outcomes that did not exercise the corresponding path.
 #[derive(Clone, Copy, Debug)]
@@ -18662,6 +18665,7 @@ mod chrono_index_part_d_tests {
 // =========================================================================
 // Part (e): Cleanup and inspection helpers
 // =========================================================================
+// TODO: Maybe use these in error-fail cleanup?
 
 /// Removes ONLY the index state files under `<temp_root_dir>/chrono_index/`
 /// — the `chrono_index/` subdirectory itself and everything inside it.
@@ -19785,7 +19789,6 @@ pub enum BuffyFormatArg<'a> {
     // U32(u32),
     // U64(u64),
     Usize(usize),
-
     // Signed integers
     // I8(i8),
     // I16(i16),
@@ -19801,11 +19804,11 @@ pub enum BuffyFormatArg<'a> {
     // // Other types
     // Bool(bool),
     // Char(char),
-    Path(&'a Path),
+    // Path(&'a Path),
 
     // Styled variants (adds ANSI codes)
-    CharStyled(char, BuffyStyles),
-    StrStyled(&'a str, BuffyStyles),
+    // CharStyled(char, BuffyStyles),
+    // StrStyled(&'a str, BuffyStyles),
     // U8Styled(u8, BuffyStyles),
     // U64Styled(u64, BuffyStyles),
     // UsizeStyled(usize, BuffyStyles),
@@ -20209,113 +20212,112 @@ pub fn buffy_print(template: &str, args: &[BuffyFormatArg]) -> io::Result<()> {
                             io::Error::new(io::ErrorKind::Other, "Number conversion failed")
                         })?;
                         (s, false, BuffyStyles::default())
-                    }
-                    // BuffyFormatArg::I8(n) => {
-                    //     let s = format_i64_to_buffer(*n as i64, &mut num_buf).ok_or_else(|| {
-                    //         io::Error::new(io::ErrorKind::Other, "Number conversion failed")
-                    //     })?;
-                    //     (s, false, BuffyStyles::default())
-                    // }
-                    // BuffyFormatArg::I16(n) => {
-                    //     let s = format_i64_to_buffer(*n as i64, &mut num_buf).ok_or_else(|| {
-                    //         io::Error::new(io::ErrorKind::Other, "Number conversion failed")
-                    //     })?;
-                    //     (s, false, BuffyStyles::default())
-                    // }
-                    // BuffyFormatArg::I32(n) => {
-                    //     let s = format_i64_to_buffer(*n as i64, &mut num_buf).ok_or_else(|| {
-                    //         io::Error::new(io::ErrorKind::Other, "Number conversion failed")
-                    //     })?;
-                    //     (s, false, BuffyStyles::default())
-                    // }
-                    // BuffyFormatArg::I64(n) => {
-                    //     let s = format_i64_to_buffer(*n, &mut num_buf).ok_or_else(|| {
-                    //         io::Error::new(io::ErrorKind::Other, "Number conversion failed")
-                    //     })?;
-                    //     (s, false, BuffyStyles::default())
-                    // }
-                    // BuffyFormatArg::Isize(n) => {
-                    //     let s = format_i64_to_buffer(*n as i64, &mut num_buf).ok_or_else(|| {
-                    //         io::Error::new(io::ErrorKind::Other, "Number conversion failed")
-                    //     })?;
-                    //     (s, false, BuffyStyles::default())
-                    // }
-                    // BuffyFormatArg::U8Hex(n) => {
-                    //     let s = format_u8_hex_to_buffer(*n, &mut num_buf).ok_or_else(|| {
-                    //         io::Error::new(io::ErrorKind::Other, "Hex conversion failed")
-                    //     })?;
-                    //     (s, false, BuffyStyles::default())
-                    // }
-                    // BuffyFormatArg::U16Hex(n) => {
-                    //     let s = format_u16_hex_to_buffer(*n, &mut num_buf).ok_or_else(|| {
-                    //         io::Error::new(io::ErrorKind::Other, "Hex conversion failed")
-                    //     })?;
-                    //     (s, false, BuffyStyles::default())
-                    // }
-                    // BuffyFormatArg::U32Hex(n) => {
-                    //     let s = format_u32_hex_to_buffer(*n, &mut num_buf).ok_or_else(|| {
-                    //         io::Error::new(io::ErrorKind::Other, "Hex conversion failed")
-                    //     })?;
-                    //     (s, false, BuffyStyles::default())
-                    // }
-                    // BuffyFormatArg::Bool(b) => (
-                    //     if *b { "true" } else { "false" },
-                    //     false,
-                    //     BuffyStyles::default(),
-                    // ),
-                    // BuffyFormatArg::Char(c) => {
-                    //     let mut char_buf = [0u8; 4];
-                    //     let char_str = c.encode_utf8(&mut char_buf);
-                    //     let len = char_str.len();
-                    //     num_buf[..len].copy_from_slice(char_str.as_bytes());
-                    //     let s = std::str::from_utf8(&num_buf[..len]).map_err(|_| {
-                    //         io::Error::new(io::ErrorKind::Other, "Char conversion failed")
-                    //     })?;
-                    //     (s, false, BuffyStyles::default())
-                    // }
-                    BuffyFormatArg::Path(p) => {
-                        let s = p.to_str().ok_or_else(|| {
-                            io::Error::new(io::ErrorKind::Other, "Path conversion failed")
-                        })?;
-                        (s, false, BuffyStyles::default())
-                    }
+                    } // BuffyFormatArg::I8(n) => {
+                      //     let s = format_i64_to_buffer(*n as i64, &mut num_buf).ok_or_else(|| {
+                      //         io::Error::new(io::ErrorKind::Other, "Number conversion failed")
+                      //     })?;
+                      //     (s, false, BuffyStyles::default())
+                      // }
+                      // BuffyFormatArg::I16(n) => {
+                      //     let s = format_i64_to_buffer(*n as i64, &mut num_buf).ok_or_else(|| {
+                      //         io::Error::new(io::ErrorKind::Other, "Number conversion failed")
+                      //     })?;
+                      //     (s, false, BuffyStyles::default())
+                      // }
+                      // BuffyFormatArg::I32(n) => {
+                      //     let s = format_i64_to_buffer(*n as i64, &mut num_buf).ok_or_else(|| {
+                      //         io::Error::new(io::ErrorKind::Other, "Number conversion failed")
+                      //     })?;
+                      //     (s, false, BuffyStyles::default())
+                      // }
+                      // BuffyFormatArg::I64(n) => {
+                      //     let s = format_i64_to_buffer(*n, &mut num_buf).ok_or_else(|| {
+                      //         io::Error::new(io::ErrorKind::Other, "Number conversion failed")
+                      //     })?;
+                      //     (s, false, BuffyStyles::default())
+                      // }
+                      // BuffyFormatArg::Isize(n) => {
+                      //     let s = format_i64_to_buffer(*n as i64, &mut num_buf).ok_or_else(|| {
+                      //         io::Error::new(io::ErrorKind::Other, "Number conversion failed")
+                      //     })?;
+                      //     (s, false, BuffyStyles::default())
+                      // }
+                      // BuffyFormatArg::U8Hex(n) => {
+                      //     let s = format_u8_hex_to_buffer(*n, &mut num_buf).ok_or_else(|| {
+                      //         io::Error::new(io::ErrorKind::Other, "Hex conversion failed")
+                      //     })?;
+                      //     (s, false, BuffyStyles::default())
+                      // }
+                      // BuffyFormatArg::U16Hex(n) => {
+                      //     let s = format_u16_hex_to_buffer(*n, &mut num_buf).ok_or_else(|| {
+                      //         io::Error::new(io::ErrorKind::Other, "Hex conversion failed")
+                      //     })?;
+                      //     (s, false, BuffyStyles::default())
+                      // }
+                      // BuffyFormatArg::U32Hex(n) => {
+                      //     let s = format_u32_hex_to_buffer(*n, &mut num_buf).ok_or_else(|| {
+                      //         io::Error::new(io::ErrorKind::Other, "Hex conversion failed")
+                      //     })?;
+                      //     (s, false, BuffyStyles::default())
+                      // }
+                      // BuffyFormatArg::Bool(b) => (
+                      //     if *b { "true" } else { "false" },
+                      //     false,
+                      //     BuffyStyles::default(),
+                      // ),
+                      // BuffyFormatArg::Char(c) => {
+                      //     let mut char_buf = [0u8; 4];
+                      //     let char_str = c.encode_utf8(&mut char_buf);
+                      //     let len = char_str.len();
+                      //     num_buf[..len].copy_from_slice(char_str.as_bytes());
+                      //     let s = std::str::from_utf8(&num_buf[..len]).map_err(|_| {
+                      //         io::Error::new(io::ErrorKind::Other, "Char conversion failed")
+                      //     })?;
+                      //     (s, false, BuffyStyles::default())
+                      // }
+                      // BuffyFormatArg::Path(p) => {
+                      //     let s = p.to_str().ok_or_else(|| {
+                      //         io::Error::new(io::ErrorKind::Other, "Path conversion failed")
+                      //     })?;
+                      //     (s, false, BuffyStyles::default())
+                      // }
 
-                    // Styled variants
-                    BuffyFormatArg::CharStyled(c, st) => {
-                        let mut char_buf = [0u8; 4];
-                        let char_str = c.encode_utf8(&mut char_buf);
-                        let len = char_str.len();
-                        num_buf[..len].copy_from_slice(char_str.as_bytes());
-                        let s = std::str::from_utf8(&num_buf[..len]).map_err(|_| {
-                            io::Error::new(io::ErrorKind::Other, "Char conversion failed")
-                        })?;
-                        (s, true, *st)
-                    }
-                    BuffyFormatArg::StrStyled(s, st) => (*s, true, *st),
-                    // BuffyFormatArg::U8Styled(n, st) => {
-                    //     let s = format_u64_to_buffer(*n as u64, &mut num_buf).ok_or_else(|| {
-                    //         io::Error::new(io::ErrorKind::Other, "Number conversion failed")
-                    //     })?;
-                    //     (s, true, *st)
-                    // }
-                    // BuffyFormatArg::U64Styled(n, st) => {
-                    //     let s = format_u64_to_buffer(*n, &mut num_buf).ok_or_else(|| {
-                    //         io::Error::new(io::ErrorKind::Other, "Number conversion failed")
-                    //     })?;
-                    //     (s, true, *st)
-                    // }
-                    // BuffyFormatArg::UsizeStyled(n, st) => {
-                    //     let s = format_u64_to_buffer(*n as u64, &mut num_buf).ok_or_else(|| {
-                    //         io::Error::new(io::ErrorKind::Other, "Number conversion failed")
-                    //     })?;
-                    //     (s, true, *st)
-                    // }
-                    // BuffyFormatArg::U8HexStyled(n, st) => {
-                    //     let s = format_u8_hex_to_buffer(*n, &mut num_buf).ok_or_else(|| {
-                    //         io::Error::new(io::ErrorKind::Other, "Hex conversion failed")
-                    //     })?;
-                    //     (s, true, *st)
-                    // }
+                      // // Styled variants
+                      // BuffyFormatArg::CharStyled(c, st) => {
+                      //     let mut char_buf = [0u8; 4];
+                      //     let char_str = c.encode_utf8(&mut char_buf);
+                      //     let len = char_str.len();
+                      //     num_buf[..len].copy_from_slice(char_str.as_bytes());
+                      //     let s = std::str::from_utf8(&num_buf[..len]).map_err(|_| {
+                      //         io::Error::new(io::ErrorKind::Other, "Char conversion failed")
+                      //     })?;
+                      //     (s, true, *st)
+                      // }
+                      // BuffyFormatArg::StrStyled(s, st) => (*s, true, *st),
+                      // BuffyFormatArg::U8Styled(n, st) => {
+                      //     let s = format_u64_to_buffer(*n as u64, &mut num_buf).ok_or_else(|| {
+                      //         io::Error::new(io::ErrorKind::Other, "Number conversion failed")
+                      //     })?;
+                      //     (s, true, *st)
+                      // }
+                      // BuffyFormatArg::U64Styled(n, st) => {
+                      //     let s = format_u64_to_buffer(*n, &mut num_buf).ok_or_else(|| {
+                      //         io::Error::new(io::ErrorKind::Other, "Number conversion failed")
+                      //     })?;
+                      //     (s, true, *st)
+                      // }
+                      // BuffyFormatArg::UsizeStyled(n, st) => {
+                      //     let s = format_u64_to_buffer(*n as u64, &mut num_buf).ok_or_else(|| {
+                      //         io::Error::new(io::ErrorKind::Other, "Number conversion failed")
+                      //     })?;
+                      //     (s, true, *st)
+                      // }
+                      // BuffyFormatArg::U8HexStyled(n, st) => {
+                      //     let s = format_u8_hex_to_buffer(*n, &mut num_buf).ok_or_else(|| {
+                      //         io::Error::new(io::ErrorKind::Other, "Hex conversion failed")
+                      //     })?;
+                      //     (s, true, *st)
+                      // }
                 };
 
                 // Apply style if needed
@@ -20456,523 +20458,523 @@ mod buffy_format_tests {
 // - No background highlighting: foreground colour only (word colouring)
 // - No per-token parser: pure positional byte matching
 
-/// Two-category syntax highlight result.
-///
-/// ## Project Context
-/// Returned by buffy_get_syntax_highlight() to indicate what foreground
-/// colour (if any) should be applied to the character at a given position.
-///
-/// ## Variants
-/// - None:           No highlighting. Write character directly.
-/// - SyntaxSymbol:   Single punctuation/operator character. Render in cyan.
-/// - DefinitionWord: Start of a definition keyword (e.g. "fn ", "let ").
-///                   The entire keyword including its trailing space is
-///                   consumed as one logical token. Render in yellow.
-///
-/// ## Memory
-/// Stack-only enum. No heap. Safe to copy.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SyntaxHighlight {
-    /// No highlighting applies. Write the character with no ANSI codes.
-    None,
+// /// Two-category syntax highlight result.
+// ///
+// /// ## Project Context
+// /// Returned by buffy_get_syntax_highlight() to indicate what foreground
+// /// colour (if any) should be applied to the character at a given position.
+// ///
+// /// ## Variants
+// /// - None:           No highlighting. Write character directly.
+// /// - SyntaxSymbol:   Single punctuation/operator character. Render in cyan.
+// /// - DefinitionWord: Start of a definition keyword (e.g. "fn ", "let ").
+// ///                   The entire keyword including its trailing space is
+// ///                   consumed as one logical token. Render in yellow.
+// ///
+// /// ## Memory
+// /// Stack-only enum. No heap. Safe to copy.
+// #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+// pub enum SyntaxHighlight {
+//     /// No highlighting applies. Write the character with no ANSI codes.
+//     None,
 
-    /// Character is a syntax punctuation symbol.
-    /// Caller should render it in cyan.
-    /// Applies to: ( ) [ ] { } < > = : ; " ' \ & ! # / * , `
-    SyntaxSymbol,
+//     /// Character is a syntax punctuation symbol.
+//     /// Caller should render it in cyan.
+//     /// Applies to: ( ) [ ] { } < > = : ; " ' \ & ! # / * , `
+//     SyntaxSymbol,
 
-    /// Character starts a definition keyword (including trailing space).
-    /// Caller should render the entire keyword span in yellow.
-    /// The `keyword_byte_len` field tells the caller how many bytes
-    /// the full keyword token occupies (e.g. "fn " = 3 bytes).
-    /// Caller advances its byte position by this amount after writing.
-    DefinitionWord {
-        /// Number of bytes in the matched keyword including trailing space.
-        /// Example: "fn " -> 3, "struct " -> 7, "static " -> 7
-        keyword_byte_len: usize,
-    },
-}
+//     /// Character starts a definition keyword (including trailing space).
+//     /// Caller should render the entire keyword span in yellow.
+//     /// The `keyword_byte_len` field tells the caller how many bytes
+//     /// the full keyword token occupies (e.g. "fn " = 3 bytes).
+//     /// Caller advances its byte position by this amount after writing.
+//     DefinitionWord {
+//         /// Number of bytes in the matched keyword including trailing space.
+//         /// Example: "fn " -> 3, "struct " -> 7, "static " -> 7
+//         keyword_byte_len: usize,
+//     },
+// }
 
-/// Returns true if the file at the given path has a plain-text extension
-/// that should NOT receive syntax highlighting.
-///
-/// ## Project Context
-/// Called once per rendered row, before the character loop, to decide
-/// whether to attempt syntax highlighting at all. The opt-out list is
-/// intentionally short: only file types that are truly plain prose where
-/// keyword colouring would be distracting or misleading.
-///
-/// Opt-out extensions (no highlighting):
-///   .txt   .log
-///
-/// Everything else (including no extension, or None path) receives
-/// highlighting. This default-highlight approach is simpler than trying
-/// to enumerate every possible code file extension.
-///
-/// ## Behaviour on Edge Cases
-/// - path is None:          returns false  (highlight by default)
-/// - path has no extension: returns false  (highlight by default)
-/// - extension not valid UTF-8: returns false (highlight by default, safe)
-/// - extension is ".TXT" (uppercase): returns false (case-sensitive match,
-///   no heap conversion, conservative: only exact lowercase match opts out)
-///
-/// ## Memory
-/// No heap. Extension slice borrowed from path. Comparison on &[u8] bytes.
-///
-/// ## Arguments
-/// * `path` - Optional reference to the file path from EditorState.
-///            Typically &state.original_file_path (which is Option<PathBuf>).
-///            Pass as path.as_deref() to get Option<&Path>.
-///
-/// ## Returns
-/// * true  - plain text, skip syntax highlighting
-/// * false - not plain text (or unknown), apply syntax highlighting
-pub fn buffy_is_plain_text_extension(path: Option<&Path>) -> bool {
-    // Plain-text extensions that opt OUT of syntax highlighting.
-    // Matched as raw bytes against the file extension.
-    // Case-sensitive: ".txt" matches, ".TXT" does not.
-    // Extend this list conservatively: only add extensions where keyword
-    // colouring would be actively misleading or distracting.
-    const PLAIN_TEXT_EXTENSIONS: &[&[u8]] = &[b"txt", b"log"];
+// /// Returns true if the file at the given path has a plain-text extension
+// /// that should NOT receive syntax highlighting.
+// ///
+// /// ## Project Context
+// /// Called once per rendered row, before the character loop, to decide
+// /// whether to attempt syntax highlighting at all. The opt-out list is
+// /// intentionally short: only file types that are truly plain prose where
+// /// keyword colouring would be distracting or misleading.
+// ///
+// /// Opt-out extensions (no highlighting):
+// ///   .txt   .log
+// ///
+// /// Everything else (including no extension, or None path) receives
+// /// highlighting. This default-highlight approach is simpler than trying
+// /// to enumerate every possible code file extension.
+// ///
+// /// ## Behaviour on Edge Cases
+// /// - path is None:          returns false  (highlight by default)
+// /// - path has no extension: returns false  (highlight by default)
+// /// - extension not valid UTF-8: returns false (highlight by default, safe)
+// /// - extension is ".TXT" (uppercase): returns false (case-sensitive match,
+// ///   no heap conversion, conservative: only exact lowercase match opts out)
+// ///
+// /// ## Memory
+// /// No heap. Extension slice borrowed from path. Comparison on &[u8] bytes.
+// ///
+// /// ## Arguments
+// /// * `path` - Optional reference to the file path from EditorState.
+// ///            Typically &state.original_file_path (which is Option<PathBuf>).
+// ///            Pass as path.as_deref() to get Option<&Path>.
+// ///
+// /// ## Returns
+// /// * true  - plain text, skip syntax highlighting
+// /// * false - not plain text (or unknown), apply syntax highlighting
+// pub fn buffy_is_plain_text_extension(path: Option<&Path>) -> bool {
+//     // Plain-text extensions that opt OUT of syntax highlighting.
+//     // Matched as raw bytes against the file extension.
+//     // Case-sensitive: ".txt" matches, ".TXT" does not.
+//     // Extend this list conservatively: only add extensions where keyword
+//     // colouring would be actively misleading or distracting.
+//     const PLAIN_TEXT_EXTENSIONS: &[&[u8]] = &[b"txt", b"log"];
 
-    // Defensive: no path means we cannot determine extension.
-    // Default to highlight (return false = not plain text).
-    let path = match path {
-        Some(p) => p,
-        None => return false,
-    };
+//     // Defensive: no path means we cannot determine extension.
+//     // Default to highlight (return false = not plain text).
+//     let path = match path {
+//         Some(p) => p,
+//         None => return false,
+//     };
 
-    // Extract extension as a str slice (no allocation).
-    // Path::extension() returns Option<&OsStr>.
-    // OsStr::as_encoded_bytes() gives us raw bytes without allocation.
-    let ext_bytes = match path.extension() {
-        Some(ext) => ext.as_encoded_bytes(),
-        None => return false, // No extension: highlight by default
-    };
+//     // Extract extension as a str slice (no allocation).
+//     // Path::extension() returns Option<&OsStr>.
+//     // OsStr::as_encoded_bytes() gives us raw bytes without allocation.
+//     let ext_bytes = match path.extension() {
+//         Some(ext) => ext.as_encoded_bytes(),
+//         None => return false, // No extension: highlight by default
+//     };
 
-    // Compare extension bytes against the opt-out list.
-    // Linear scan over a tiny fixed list: no overhead worth optimising.
-    for &plain_ext in PLAIN_TEXT_EXTENSIONS {
-        if ext_bytes == plain_ext {
-            return true; // Plain text: skip highlighting
-        }
-    }
+//     // Compare extension bytes against the opt-out list.
+//     // Linear scan over a tiny fixed list: no overhead worth optimising.
+//     for &plain_ext in PLAIN_TEXT_EXTENSIONS {
+//         if ext_bytes == plain_ext {
+//             return true; // Plain text: skip highlighting
+//         }
+//     }
 
-    false // Not in opt-out list: apply highlighting
-}
+//     false // Not in opt-out list: apply highlighting
+// }
 
-/// Returns the syntax highlight category for the character at the given
-/// byte position within a row string.
-///
-/// ## Project Context
-/// Called inside the character rendering loop of render_utf8txt_row_with_cursor().
-/// The caller has already handled cursor and visual-selection priority.
-/// This function is only reached for "normal" characters that need
-/// syntax highlight checking.
-///
-/// ## Two-Category System
-///
-/// ### Category 1: SyntaxSymbol (cyan)
-/// Single-character punctuation/operator symbols.
-/// Matched character-by-character. The caller writes one character and
-/// advances by one UTF-8 character (1-4 bytes).
-///
-/// Symbol set:  ( ) [ ] { } < > = : ; " ' \ & ! # / * , `
-///
-/// ### Category 2: DefinitionWord (yellow)
-/// Multi-character keywords, each followed by a space (space is part of
-/// the match and is highlighted together with the keyword). The space is
-/// included because:
-/// - It makes the match unambiguous (avoids matching "type" inside "typeof")
-/// - The space is visually invisible so including it in the coloured span
-///   costs nothing visually
-/// - No need to abstractly separate the space from the keyword
-///
-/// Keyword set (each stored with trailing space as part of the literal):
-///   "fn "  "def "  "let "  "struct "  "enum "  "class "
-///   "impl "  "type "  "const "  "static "  "pub "  "use "  "mod "
-///
-/// When a keyword matches, SyntaxHighlight::DefinitionWord { keyword_byte_len }
-/// is returned. The caller must:
-///   1. Write the entire keyword span (keyword_byte_len bytes) in yellow
-///   2. Advance its byte position by keyword_byte_len
-///   3. Advance its character counter by the number of chars in the keyword
-///      (caller can count these, or use the provided char count - see note)
-///
-/// ## Priority
-/// SyntaxSymbol is checked first. In practice there is no overlap
-/// (no keyword begins with a syntax symbol character), but checking
-/// symbols first is cheaper (single char lookup vs prefix scan).
-///
-/// ## Cursor and Selection Priority
-/// This function does NOT check cursor or selection state. The caller
-/// is responsible for checking those conditions BEFORE calling this
-/// function. If the character is under the cursor or inside a visual
-/// selection, the caller should NOT call this function.
-///
-/// ## Byte Position vs Character Index
-/// `byte_pos` is the byte offset of the current character's first byte
-/// within `row_content`. This is what is needed for prefix matching
-/// (slicing `row_content` from `byte_pos` forward).
-///
-/// The caller tracks the character index (for cursor column comparison)
-/// as a SEPARATE counter that increments once per complete UTF-8 character.
-/// That character index is NOT passed to this function and NOT used here.
-/// See render_utf8txt_row_with_cursor() for the byte-vs-char tracking pattern.
-///
-/// ## Memory
-/// No heap. All keyword literals are &'static str. Matching is byte
-/// comparison via str::starts_with() on a sub-slice.
-///
-/// ## Arguments
-/// * `byte_pos`    - Byte offset of the current character's first byte
-///                   within `row_content`. Must be a valid UTF-8 boundary.
-/// * `row_content` - The full row string being rendered (content portion only,
-///                   line number prefix already excluded by caller).
-///
-/// ## Returns
-/// * SyntaxHighlight::None            - no highlighting, write char normally
-/// * SyntaxHighlight::SyntaxSymbol    - render this char in cyan
-/// * SyntaxHighlight::DefinitionWord { keyword_byte_len }
-///                                    - render keyword_byte_len bytes in yellow,
-///                                      then advance byte_pos by keyword_byte_len
-pub fn buffy_get_syntax_highlight(byte_pos: usize, row_content: &str) -> SyntaxHighlight {
-    // -------------------------------------------------------------------------
-    // BOUNDS CHECK: byte_pos must be within row_content
-    // -------------------------------------------------------------------------
-    // Defensive: if byte_pos is out of range, return None safely.
-    // This should not happen if the caller iterates correctly, but hardware
-    // faults or logic errors must not cause a panic in production.
-    if byte_pos >= row_content.len() {
-        return SyntaxHighlight::None;
-    }
+// /// Returns the syntax highlight category for the character at the given
+// /// byte position within a row string.
+// ///
+// /// ## Project Context
+// /// Called inside the character rendering loop of render_utf8txt_row_with_cursor().
+// /// The caller has already handled cursor and visual-selection priority.
+// /// This function is only reached for "normal" characters that need
+// /// syntax highlight checking.
+// ///
+// /// ## Two-Category System
+// ///
+// /// ### Category 1: SyntaxSymbol (cyan)
+// /// Single-character punctuation/operator symbols.
+// /// Matched character-by-character. The caller writes one character and
+// /// advances by one UTF-8 character (1-4 bytes).
+// ///
+// /// Symbol set:  ( ) [ ] { } < > = : ; " ' \ & ! # / * , `
+// ///
+// /// ### Category 2: DefinitionWord (yellow)
+// /// Multi-character keywords, each followed by a space (space is part of
+// /// the match and is highlighted together with the keyword). The space is
+// /// included because:
+// /// - It makes the match unambiguous (avoids matching "type" inside "typeof")
+// /// - The space is visually invisible so including it in the coloured span
+// ///   costs nothing visually
+// /// - No need to abstractly separate the space from the keyword
+// ///
+// /// Keyword set (each stored with trailing space as part of the literal):
+// ///   "fn "  "def "  "let "  "struct "  "enum "  "class "
+// ///   "impl "  "type "  "const "  "static "  "pub "  "use "  "mod "
+// ///
+// /// When a keyword matches, SyntaxHighlight::DefinitionWord { keyword_byte_len }
+// /// is returned. The caller must:
+// ///   1. Write the entire keyword span (keyword_byte_len bytes) in yellow
+// ///   2. Advance its byte position by keyword_byte_len
+// ///   3. Advance its character counter by the number of chars in the keyword
+// ///      (caller can count these, or use the provided char count - see note)
+// ///
+// /// ## Priority
+// /// SyntaxSymbol is checked first. In practice there is no overlap
+// /// (no keyword begins with a syntax symbol character), but checking
+// /// symbols first is cheaper (single char lookup vs prefix scan).
+// ///
+// /// ## Cursor and Selection Priority
+// /// This function does NOT check cursor or selection state. The caller
+// /// is responsible for checking those conditions BEFORE calling this
+// /// function. If the character is under the cursor or inside a visual
+// /// selection, the caller should NOT call this function.
+// ///
+// /// ## Byte Position vs Character Index
+// /// `byte_pos` is the byte offset of the current character's first byte
+// /// within `row_content`. This is what is needed for prefix matching
+// /// (slicing `row_content` from `byte_pos` forward).
+// ///
+// /// The caller tracks the character index (for cursor column comparison)
+// /// as a SEPARATE counter that increments once per complete UTF-8 character.
+// /// That character index is NOT passed to this function and NOT used here.
+// /// See render_utf8txt_row_with_cursor() for the byte-vs-char tracking pattern.
+// ///
+// /// ## Memory
+// /// No heap. All keyword literals are &'static str. Matching is byte
+// /// comparison via str::starts_with() on a sub-slice.
+// ///
+// /// ## Arguments
+// /// * `byte_pos`    - Byte offset of the current character's first byte
+// ///                   within `row_content`. Must be a valid UTF-8 boundary.
+// /// * `row_content` - The full row string being rendered (content portion only,
+// ///                   line number prefix already excluded by caller).
+// ///
+// /// ## Returns
+// /// * SyntaxHighlight::None            - no highlighting, write char normally
+// /// * SyntaxHighlight::SyntaxSymbol    - render this char in cyan
+// /// * SyntaxHighlight::DefinitionWord { keyword_byte_len }
+// ///                                    - render keyword_byte_len bytes in yellow,
+// ///                                      then advance byte_pos by keyword_byte_len
+// pub fn buffy_get_syntax_highlight(byte_pos: usize, row_content: &str) -> SyntaxHighlight {
+//     // -------------------------------------------------------------------------
+//     // BOUNDS CHECK: byte_pos must be within row_content
+//     // -------------------------------------------------------------------------
+//     // Defensive: if byte_pos is out of range, return None safely.
+//     // This should not happen if the caller iterates correctly, but hardware
+//     // faults or logic errors must not cause a panic in production.
+//     if byte_pos >= row_content.len() {
+//         return SyntaxHighlight::None;
+//     }
 
-    // -------------------------------------------------------------------------
-    // DEFINITION KEYWORDS (Category 2, yellow)
-    // Checked BEFORE symbol check for one reason: keyword matching requires
-    // reading ahead multiple bytes anyway, and we want to colour the whole
-    // keyword span (not just its first character) as a single token.
-    //
-    // Each entry is the complete match token: keyword + trailing space.
-    // The trailing space is part of the highlighted span.
-    // "fn " = 3 bytes, "struct " = 7 bytes, "static " = 7 bytes, etc.
-    //
-    // Order: longer keywords first where a shorter keyword is a prefix of
-    // a longer one (none exist in this set currently, but "mod" vs nothing
-    // is fine). Order does not otherwise affect correctness.
-    // -------------------------------------------------------------------------
-    const DEFINITION_KEYWORDS: &[&str] = &[
-        "static ", // 7 bytes - before "struct" to avoid any future ambiguity
-        "struct ", // 7 bytes
-        "class ",  // 6 bytes
-        "const ",  // 6 bytes
-        "impl ",   // 5 bytes
-        "type ",   // 5 bytes
-        "enum ",   // 5 bytes
-        "use ",    // 4 bytes
-        "pub ",    // 4 bytes
-        "mod ",    // 4 bytes
-        "let ",    // 4 bytes
-        "def ",    // 4 bytes
-        "fn ",     // 3 bytes
-        // Other
-        "for ",   //
-        "while ", //
-        "match ", //
-        "if ",    //
-        "loop ",  //
-    ];
+//     // -------------------------------------------------------------------------
+//     // DEFINITION KEYWORDS (Category 2, yellow)
+//     // Checked BEFORE symbol check for one reason: keyword matching requires
+//     // reading ahead multiple bytes anyway, and we want to colour the whole
+//     // keyword span (not just its first character) as a single token.
+//     //
+//     // Each entry is the complete match token: keyword + trailing space.
+//     // The trailing space is part of the highlighted span.
+//     // "fn " = 3 bytes, "struct " = 7 bytes, "static " = 7 bytes, etc.
+//     //
+//     // Order: longer keywords first where a shorter keyword is a prefix of
+//     // a longer one (none exist in this set currently, but "mod" vs nothing
+//     // is fine). Order does not otherwise affect correctness.
+//     // -------------------------------------------------------------------------
+//     const DEFINITION_KEYWORDS: &[&str] = &[
+//         "static ", // 7 bytes - before "struct" to avoid any future ambiguity
+//         "struct ", // 7 bytes
+//         "class ",  // 6 bytes
+//         "const ",  // 6 bytes
+//         "impl ",   // 5 bytes
+//         "type ",   // 5 bytes
+//         "enum ",   // 5 bytes
+//         "use ",    // 4 bytes
+//         "pub ",    // 4 bytes
+//         "mod ",    // 4 bytes
+//         "let ",    // 4 bytes
+//         "def ",    // 4 bytes
+//         "fn ",     // 3 bytes
+//         // Other
+//         "for ",   //
+//         "while ", //
+//         "match ", //
+//         "if ",    //
+//         "loop ",  //
+//     ];
 
-    // Slice the row content from the current byte position forward.
-    // No allocation: this is a borrowed sub-slice of the existing &str.
-    let remaining = &row_content[byte_pos..];
+//     // Slice the row content from the current byte position forward.
+//     // No allocation: this is a borrowed sub-slice of the existing &str.
+//     let remaining = &row_content[byte_pos..];
 
-    // Scan keyword list. Linear scan over a tiny fixed list.
-    for &keyword in DEFINITION_KEYWORDS {
-        if remaining.starts_with(keyword) {
-            return SyntaxHighlight::DefinitionWord {
-                keyword_byte_len: keyword.len(),
-            };
-        }
-    }
+//     // Scan keyword list. Linear scan over a tiny fixed list.
+//     for &keyword in DEFINITION_KEYWORDS {
+//         if remaining.starts_with(keyword) {
+//             return SyntaxHighlight::DefinitionWord {
+//                 keyword_byte_len: keyword.len(),
+//             };
+//         }
+//     }
 
-    // -------------------------------------------------------------------------
-    // SYNTAX SYMBOLS (Category 1, cyan)
-    // Single-character punctuation that makes code structure visible.
-    // Checked after keywords so that the first character of a keyword
-    // (which is always alphabetic) never reaches this check anyway.
-    // In practice: no overlap is possible (no keyword starts with a symbol).
-    //
-    // The character at byte_pos is extracted by getting the first char
-    // of the remaining slice. For ASCII symbols this is always 1 byte.
-    // For safety we use chars().next() which handles UTF-8 correctly.
-    // -------------------------------------------------------------------------
-    const SYNTAX_SYMBOLS: &[char] = &[
-        '(', ')', '[', ']', '{', '}', '<', '>', '=', ':', ';', '\\', '&', '!', '#', '/', '*', ',',
-        '`',
-    ];
-    // maybe/maybe-not: ", '
+//     // -------------------------------------------------------------------------
+//     // SYNTAX SYMBOLS (Category 1, cyan)
+//     // Single-character punctuation that makes code structure visible.
+//     // Checked after keywords so that the first character of a keyword
+//     // (which is always alphabetic) never reaches this check anyway.
+//     // In practice: no overlap is possible (no keyword starts with a symbol).
+//     //
+//     // The character at byte_pos is extracted by getting the first char
+//     // of the remaining slice. For ASCII symbols this is always 1 byte.
+//     // For safety we use chars().next() which handles UTF-8 correctly.
+//     // -------------------------------------------------------------------------
+//     const SYNTAX_SYMBOLS: &[char] = &[
+//         '(', ')', '[', ']', '{', '}', '<', '>', '=', ':', ';', '\\', '&', '!', '#', '/', '*', ',',
+//         '`',
+//     ];
+//     // maybe/maybe-not: ", '
 
-    // Get the first character at this byte position.
-    // chars().next() is safe: we already checked byte_pos < row_content.len()
-    // and remaining is a valid UTF-8 sub-slice.
-    if let Some(ch) = remaining.chars().next() {
-        for &symbol in SYNTAX_SYMBOLS {
-            if ch == symbol {
-                return SyntaxHighlight::SyntaxSymbol;
-            }
-        }
-    }
+//     // Get the first character at this byte position.
+//     // chars().next() is safe: we already checked byte_pos < row_content.len()
+//     // and remaining is a valid UTF-8 sub-slice.
+//     if let Some(ch) = remaining.chars().next() {
+//         for &symbol in SYNTAX_SYMBOLS {
+//             if ch == symbol {
+//                 return SyntaxHighlight::SyntaxSymbol;
+//             }
+//         }
+//     }
 
-    // -------------------------------------------------------------------------
-    // No match: plain character, no highlighting.
-    // -------------------------------------------------------------------------
-    SyntaxHighlight::None
-}
+//     // -------------------------------------------------------------------------
+//     // No match: plain character, no highlighting.
+//     // -------------------------------------------------------------------------
+//     SyntaxHighlight::None
+// }
 
-// =============================================================================
-// TESTS: Syntax Highlighting
-// =============================================================================
+// // =============================================================================
+// // TESTS: Syntax Highlighting
+// // =============================================================================
 
-#[cfg(test)]
-mod syntax_highlight_tests {
-    use super::*;
-    use std::path::Path;
+// #[cfg(test)]
+// mod syntax_highlight_tests {
+//     use super::*;
+//     use std::path::Path;
 
-    // --- buffy_is_plain_text_extension ---
+//     // --- buffy_is_plain_text_extension ---
 
-    #[test]
-    fn test_plain_text_extension_txt_is_plain() {
-        let path = Path::new("readme.txt");
-        assert!(
-            buffy_is_plain_text_extension(Some(path)),
-            "buffy_is_plain_text_extension: .txt should be plain text"
-        );
-    }
+//     #[test]
+//     fn test_plain_text_extension_txt_is_plain() {
+//         let path = Path::new("readme.txt");
+//         assert!(
+//             buffy_is_plain_text_extension(Some(path)),
+//             "buffy_is_plain_text_extension: .txt should be plain text"
+//         );
+//     }
 
-    #[test]
-    fn test_plain_text_extension_log_is_plain() {
-        let path = Path::new("app.log");
-        assert!(
-            buffy_is_plain_text_extension(Some(path)),
-            "buffy_is_plain_text_extension: .log should be plain text"
-        );
-    }
+//     #[test]
+//     fn test_plain_text_extension_log_is_plain() {
+//         let path = Path::new("app.log");
+//         assert!(
+//             buffy_is_plain_text_extension(Some(path)),
+//             "buffy_is_plain_text_extension: .log should be plain text"
+//         );
+//     }
 
-    #[test]
-    fn test_plain_text_extension_rs_is_not_plain() {
-        let path = Path::new("main.rs");
-        assert!(
-            !buffy_is_plain_text_extension(Some(path)),
-            "buffy_is_plain_text_extension: .rs should NOT be plain text"
-        );
-    }
+//     #[test]
+//     fn test_plain_text_extension_rs_is_not_plain() {
+//         let path = Path::new("main.rs");
+//         assert!(
+//             !buffy_is_plain_text_extension(Some(path)),
+//             "buffy_is_plain_text_extension: .rs should NOT be plain text"
+//         );
+//     }
 
-    #[test]
-    fn test_plain_text_extension_py_is_not_plain() {
-        let path = Path::new("script.py");
-        assert!(
-            !buffy_is_plain_text_extension(Some(path)),
-            "buffy_is_plain_text_extension: .py should NOT be plain text"
-        );
-    }
+//     #[test]
+//     fn test_plain_text_extension_py_is_not_plain() {
+//         let path = Path::new("script.py");
+//         assert!(
+//             !buffy_is_plain_text_extension(Some(path)),
+//             "buffy_is_plain_text_extension: .py should NOT be plain text"
+//         );
+//     }
 
-    #[test]
-    fn test_plain_text_extension_none_path_is_not_plain() {
-        assert!(
-            !buffy_is_plain_text_extension(None),
-            "buffy_is_plain_text_extension: None path should default to not plain (highlight)"
-        );
-    }
+//     #[test]
+//     fn test_plain_text_extension_none_path_is_not_plain() {
+//         assert!(
+//             !buffy_is_plain_text_extension(None),
+//             "buffy_is_plain_text_extension: None path should default to not plain (highlight)"
+//         );
+//     }
 
-    #[test]
-    fn test_plain_text_extension_no_extension_is_not_plain() {
-        let path = Path::new("Makefile");
-        assert!(
-            !buffy_is_plain_text_extension(Some(path)),
-            "buffy_is_plain_text_extension: no extension should default to not plain (highlight)"
-        );
-    }
+//     #[test]
+//     fn test_plain_text_extension_no_extension_is_not_plain() {
+//         let path = Path::new("Makefile");
+//         assert!(
+//             !buffy_is_plain_text_extension(Some(path)),
+//             "buffy_is_plain_text_extension: no extension should default to not plain (highlight)"
+//         );
+//     }
 
-    #[test]
-    fn test_plain_text_extension_uppercase_txt_is_not_plain() {
-        // Case-sensitive match: .TXT does not opt out (conservative, no heap conversion)
-        let path = Path::new("readme.TXT");
-        assert!(
-            !buffy_is_plain_text_extension(Some(path)),
-            "buffy_is_plain_text_extension: .TXT uppercase should not match (case-sensitive)"
-        );
-    }
+//     #[test]
+//     fn test_plain_text_extension_uppercase_txt_is_not_plain() {
+//         // Case-sensitive match: .TXT does not opt out (conservative, no heap conversion)
+//         let path = Path::new("readme.TXT");
+//         assert!(
+//             !buffy_is_plain_text_extension(Some(path)),
+//             "buffy_is_plain_text_extension: .TXT uppercase should not match (case-sensitive)"
+//         );
+//     }
 
-    // --- buffy_get_syntax_highlight: SyntaxSymbol ---
+//     // --- buffy_get_syntax_highlight: SyntaxSymbol ---
 
-    #[test]
-    fn test_syntax_highlight_open_paren_is_symbol() {
-        let row = "foo(bar)";
-        let result = buffy_get_syntax_highlight(3, row);
-        assert_eq!(
-            result,
-            SyntaxHighlight::SyntaxSymbol,
-            "buffy_get_syntax_highlight: '(' should be SyntaxSymbol"
-        );
-    }
+//     #[test]
+//     fn test_syntax_highlight_open_paren_is_symbol() {
+//         let row = "foo(bar)";
+//         let result = buffy_get_syntax_highlight(3, row);
+//         assert_eq!(
+//             result,
+//             SyntaxHighlight::SyntaxSymbol,
+//             "buffy_get_syntax_highlight: '(' should be SyntaxSymbol"
+//         );
+//     }
 
-    #[test]
-    fn test_syntax_highlight_close_brace_is_symbol() {
-        let row = "fn foo() {}";
-        // '}' is at byte index 10
-        let result = buffy_get_syntax_highlight(10, row);
-        assert_eq!(
-            result,
-            SyntaxHighlight::SyntaxSymbol,
-            "buffy_get_syntax_highlight: '}}' should be SyntaxSymbol"
-        );
-    }
+//     #[test]
+//     fn test_syntax_highlight_close_brace_is_symbol() {
+//         let row = "fn foo() {}";
+//         // '}' is at byte index 10
+//         let result = buffy_get_syntax_highlight(10, row);
+//         assert_eq!(
+//             result,
+//             SyntaxHighlight::SyntaxSymbol,
+//             "buffy_get_syntax_highlight: '}}' should be SyntaxSymbol"
+//         );
+//     }
 
-    #[test]
-    fn test_syntax_highlight_colon_is_symbol() {
-        let row = "x: u32";
-        let result = buffy_get_syntax_highlight(1, row);
-        assert_eq!(
-            result,
-            SyntaxHighlight::SyntaxSymbol,
-            "buffy_get_syntax_highlight: ':' should be SyntaxSymbol"
-        );
-    }
+//     #[test]
+//     fn test_syntax_highlight_colon_is_symbol() {
+//         let row = "x: u32";
+//         let result = buffy_get_syntax_highlight(1, row);
+//         assert_eq!(
+//             result,
+//             SyntaxHighlight::SyntaxSymbol,
+//             "buffy_get_syntax_highlight: ':' should be SyntaxSymbol"
+//         );
+//     }
 
-    #[test]
-    fn test_syntax_highlight_plain_letter_is_none() {
-        let row = "hello";
-        let result = buffy_get_syntax_highlight(0, row);
-        assert_eq!(
-            result,
-            SyntaxHighlight::None,
-            "buffy_get_syntax_highlight: plain letter should be None"
-        );
-    }
+//     #[test]
+//     fn test_syntax_highlight_plain_letter_is_none() {
+//         let row = "hello";
+//         let result = buffy_get_syntax_highlight(0, row);
+//         assert_eq!(
+//             result,
+//             SyntaxHighlight::None,
+//             "buffy_get_syntax_highlight: plain letter should be None"
+//         );
+//     }
 
-    // --- buffy_get_syntax_highlight: DefinitionWord ---
+//     // --- buffy_get_syntax_highlight: DefinitionWord ---
 
-    #[test]
-    fn test_syntax_highlight_fn_keyword() {
-        let row = "fn main() {}";
-        let result = buffy_get_syntax_highlight(0, row);
-        assert_eq!(
-            result,
-            SyntaxHighlight::DefinitionWord {
-                keyword_byte_len: 3
-            },
-            "buffy_get_syntax_highlight: 'fn ' should be DefinitionWord with byte_len 3"
-        );
-    }
+//     #[test]
+//     fn test_syntax_highlight_fn_keyword() {
+//         let row = "fn main() {}";
+//         let result = buffy_get_syntax_highlight(0, row);
+//         assert_eq!(
+//             result,
+//             SyntaxHighlight::DefinitionWord {
+//                 keyword_byte_len: 3
+//             },
+//             "buffy_get_syntax_highlight: 'fn ' should be DefinitionWord with byte_len 3"
+//         );
+//     }
 
-    #[test]
-    fn test_syntax_highlight_struct_keyword() {
-        let row = "struct Foo {";
-        let result = buffy_get_syntax_highlight(0, row);
-        assert_eq!(
-            result,
-            SyntaxHighlight::DefinitionWord {
-                keyword_byte_len: 7
-            },
-            "buffy_get_syntax_highlight: 'struct ' should be DefinitionWord with byte_len 7"
-        );
-    }
+//     #[test]
+//     fn test_syntax_highlight_struct_keyword() {
+//         let row = "struct Foo {";
+//         let result = buffy_get_syntax_highlight(0, row);
+//         assert_eq!(
+//             result,
+//             SyntaxHighlight::DefinitionWord {
+//                 keyword_byte_len: 7
+//             },
+//             "buffy_get_syntax_highlight: 'struct ' should be DefinitionWord with byte_len 7"
+//         );
+//     }
 
-    #[test]
-    fn test_syntax_highlight_let_keyword() {
-        let row = "    let x = 5;";
-        // "let " starts at byte 4
-        let result = buffy_get_syntax_highlight(4, row);
-        assert_eq!(
-            result,
-            SyntaxHighlight::DefinitionWord {
-                keyword_byte_len: 4
-            },
-            "buffy_get_syntax_highlight: 'let ' should be DefinitionWord with byte_len 4"
-        );
-    }
+//     #[test]
+//     fn test_syntax_highlight_let_keyword() {
+//         let row = "    let x = 5;";
+//         // "let " starts at byte 4
+//         let result = buffy_get_syntax_highlight(4, row);
+//         assert_eq!(
+//             result,
+//             SyntaxHighlight::DefinitionWord {
+//                 keyword_byte_len: 4
+//             },
+//             "buffy_get_syntax_highlight: 'let ' should be DefinitionWord with byte_len 4"
+//         );
+//     }
 
-    #[test]
-    fn test_syntax_highlight_static_keyword() {
-        let row = "static FOO: u32 = 1;";
-        let result = buffy_get_syntax_highlight(0, row);
-        assert_eq!(
-            result,
-            SyntaxHighlight::DefinitionWord {
-                keyword_byte_len: 7
-            },
-            "buffy_get_syntax_highlight: 'static ' should be DefinitionWord with byte_len 7"
-        );
-    }
+//     #[test]
+//     fn test_syntax_highlight_static_keyword() {
+//         let row = "static FOO: u32 = 1;";
+//         let result = buffy_get_syntax_highlight(0, row);
+//         assert_eq!(
+//             result,
+//             SyntaxHighlight::DefinitionWord {
+//                 keyword_byte_len: 7
+//             },
+//             "buffy_get_syntax_highlight: 'static ' should be DefinitionWord with byte_len 7"
+//         );
+//     }
 
-    #[test]
-    fn test_syntax_highlight_pub_keyword() {
-        let row = "pub fn foo() {}";
-        let result = buffy_get_syntax_highlight(0, row);
-        assert_eq!(
-            result,
-            SyntaxHighlight::DefinitionWord {
-                keyword_byte_len: 4
-            },
-            "buffy_get_syntax_highlight: 'pub ' should be DefinitionWord with byte_len 4"
-        );
-    }
+//     #[test]
+//     fn test_syntax_highlight_pub_keyword() {
+//         let row = "pub fn foo() {}";
+//         let result = buffy_get_syntax_highlight(0, row);
+//         assert_eq!(
+//             result,
+//             SyntaxHighlight::DefinitionWord {
+//                 keyword_byte_len: 4
+//             },
+//             "buffy_get_syntax_highlight: 'pub ' should be DefinitionWord with byte_len 4"
+//         );
+//     }
 
-    #[test]
-    fn test_syntax_highlight_fn_not_at_start_of_word() {
-        // "fn" appears inside "unfn" - no space before it, but we match from byte_pos
-        // If byte_pos points mid-word, we still match if it starts with "fn "
-        // This is the known limitation: no word-boundary check.
-        // This test documents actual behaviour (not asserting it is wrong,
-        // just documenting that context-free matching is the design).
-        let row = "xfn foo()";
-        // byte_pos=1 points to 'f' of "fn foo()"
-        let result = buffy_get_syntax_highlight(1, row);
-        // "fn " starts at byte 1: this WILL match (no word boundary check by design)
-        assert_eq!(
-            result,
-            SyntaxHighlight::DefinitionWord {
-                keyword_byte_len: 3
-            },
-            "buffy_get_syntax_highlight: known behaviour: no word-boundary check, 'fn ' matches mid-string"
-        );
-    }
+//     #[test]
+//     fn test_syntax_highlight_fn_not_at_start_of_word() {
+//         // "fn" appears inside "unfn" - no space before it, but we match from byte_pos
+//         // If byte_pos points mid-word, we still match if it starts with "fn "
+//         // This is the known limitation: no word-boundary check.
+//         // This test documents actual behaviour (not asserting it is wrong,
+//         // just documenting that context-free matching is the design).
+//         let row = "xfn foo()";
+//         // byte_pos=1 points to 'f' of "fn foo()"
+//         let result = buffy_get_syntax_highlight(1, row);
+//         // "fn " starts at byte 1: this WILL match (no word boundary check by design)
+//         assert_eq!(
+//             result,
+//             SyntaxHighlight::DefinitionWord {
+//                 keyword_byte_len: 3
+//             },
+//             "buffy_get_syntax_highlight: known behaviour: no word-boundary check, 'fn ' matches mid-string"
+//         );
+//     }
 
-    #[test]
-    fn test_syntax_highlight_out_of_bounds_returns_none() {
-        let row = "hi";
-        // byte_pos beyond string length
-        let result = buffy_get_syntax_highlight(99, row);
-        assert_eq!(
-            result,
-            SyntaxHighlight::None,
-            "buffy_get_syntax_highlight: out-of-bounds byte_pos should return None safely"
-        );
-    }
+//     #[test]
+//     fn test_syntax_highlight_out_of_bounds_returns_none() {
+//         let row = "hi";
+//         // byte_pos beyond string length
+//         let result = buffy_get_syntax_highlight(99, row);
+//         assert_eq!(
+//             result,
+//             SyntaxHighlight::None,
+//             "buffy_get_syntax_highlight: out-of-bounds byte_pos should return None safely"
+//         );
+//     }
 
-    #[test]
-    fn test_syntax_highlight_empty_string_returns_none() {
-        let result = buffy_get_syntax_highlight(0, "");
-        assert_eq!(
-            result,
-            SyntaxHighlight::None,
-            "buffy_get_syntax_highlight: empty string should return None safely"
-        );
-    }
+//     #[test]
+//     fn test_syntax_highlight_empty_string_returns_none() {
+//         let result = buffy_get_syntax_highlight(0, "");
+//         assert_eq!(
+//             result,
+//             SyntaxHighlight::None,
+//             "buffy_get_syntax_highlight: empty string should return None safely"
+//         );
+//     }
 
-    #[test]
-    fn test_syntax_highlight_multibyte_char_is_none() {
-        // '世' is 3 bytes (E4 B8 96), not a symbol or keyword, should be None
-        let row = "世界";
-        let result = buffy_get_syntax_highlight(0, row);
-        assert_eq!(
-            result,
-            SyntaxHighlight::None,
-            "buffy_get_syntax_highlight: multi-byte non-symbol char should be None"
-        );
-    }
-}
+//     #[test]
+//     fn test_syntax_highlight_multibyte_char_is_none() {
+//         // '世' is 3 bytes (E4 B8 96), not a symbol or keyword, should be None
+//         let row = "世界";
+//         let result = buffy_get_syntax_highlight(0, row);
+//         assert_eq!(
+//             result,
+//             SyntaxHighlight::None,
+//             "buffy_get_syntax_highlight: multi-byte non-symbol char should be None"
+//         );
+//     }
+// }
 
 // ============================================================================
 // SECTION 55: Bootstrap — Apply Parsed Config Line to Partial Config
@@ -23705,44 +23707,6 @@ fn write_u16_decimal_into_line_buffer(
 // ----------------------------------------------------------------------------
 // Internal helper: emit one bounded portion of the board buffer as a line
 // ----------------------------------------------------------------------------
-
-// TODO: also no good error messages! needs fixing
-/// Split the ASCII board rendering produced by
-/// `format_board_state_as_ascii` into individual lines, calling
-/// `emit_line` once per line.
-///
-/// The board buffer is a sequence of lines separated by `\n`.
-/// Trailing newlines on each line are stripped before the emit
-/// (the closure may add its own terminator if it wants one).
-///
-/// ## Memory & Panic Policy
-///
-/// No heap. No panics. Bounded loop (at most `board_byte_length`
-/// iterations).
-fn emit_board_lines_from_rendered_buffer(
-    rendered_board_buffer: &[u8],
-    board_byte_length: usize,
-    emit_line: &mut dyn FnMut(&[u8]),
-) {
-    let mut line_start_position: usize = 0;
-    let mut scan_position: usize = 0;
-
-    while scan_position < board_byte_length {
-        if rendered_board_buffer[scan_position] == b'\n' {
-            let line_slice = &rendered_board_buffer[line_start_position..scan_position];
-            emit_line(line_slice);
-            line_start_position = scan_position + 1;
-        }
-        scan_position += 1;
-    }
-
-    // Emit any trailing bytes after the last newline (defensive: the
-    // board format may or may not end in a newline).
-    if line_start_position < board_byte_length {
-        let trailing_slice = &rendered_board_buffer[line_start_position..board_byte_length];
-        emit_line(trailing_slice);
-    }
-}
 
 // ----------------------------------------------------------------------------
 // Internal helper: write the "Status:" line for the current GameStatus

@@ -1674,3 +1674,41 @@ fn apply_timeflag_to_game_status(board: BoardState, game_time: GameTimeState) ->
 //         Path::new(""),
 //     )
 // }
+
+// // TODO: also no good error messages! needs fixing
+// /// Split the ASCII board rendering produced by
+// /// `format_board_state_as_ascii` into individual lines, calling
+// /// `emit_line` once per line.
+// ///
+// /// The board buffer is a sequence of lines separated by `\n`.
+// /// Trailing newlines on each line are stripped before the emit
+// /// (the closure may add its own terminator if it wants one).
+// ///
+// /// ## Memory & Panic Policy
+// ///
+// /// No heap. No panics. Bounded loop (at most `board_byte_length`
+// /// iterations).
+// fn emit_board_lines_from_rendered_buffer(
+//     rendered_board_buffer: &[u8],
+//     board_byte_length: usize,
+//     emit_line: &mut dyn FnMut(&[u8]),
+// ) {
+//     let mut line_start_position: usize = 0;
+//     let mut scan_position: usize = 0;
+
+//     while scan_position < board_byte_length {
+//         if rendered_board_buffer[scan_position] == b'\n' {
+//             let line_slice = &rendered_board_buffer[line_start_position..scan_position];
+//             emit_line(line_slice);
+//             line_start_position = scan_position + 1;
+//         }
+//         scan_position += 1;
+//     }
+
+//     // Emit any trailing bytes after the last newline (defensive: the
+//     // board format may or may not end in a newline).
+//     if line_start_position < board_byte_length {
+//         let trailing_slice = &rendered_board_buffer[line_start_position..board_byte_length];
+//         emit_line(trailing_slice);
+//     }
+// }
