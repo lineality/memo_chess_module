@@ -24707,3 +24707,424 @@ pub fn run_memochess_dungeon_master_loop(initial_state: DungeonMasterState) -> D
         }
     }
 }
+
+// ============================================================================
+// SECTION 65: Move-Replay Bootstrap — replay_existing_moves_from_chrono_index
+// ============================================================================
+//
+// ## Project Context
+//
+// When the dungeon-master process starts, the memo directory may
+// already contain move files from a game in progress (e.g., the
+// process was restarted, or the user launched the TUI after both
+// players have already exchanged several moves via file sync).
+//
+// The config-bootstrap (`q_and_a_setup_bootstrap`, Section 59) reads
+// only configuration memos. It does not process moves. The live game
+// loop (`run_memochess_dungeon_master_loop`, Section 64) processes
+// one move per `refresh_rate_seconds` tick — far too slow to replay
+// 20+ historical moves at startup.
+//
+// This function bridges the gap. It is called once, between bootstrap
+// and the live loop, and replays all existing moves as fast as the
+// CPU allows, with no sleeps and no wall-clock involvement in time
+// calculations. Move timestamps come exclusively from the TOML
+// `updated_at_timestamp` field of each memo file.
+//
+// ## Relationship to `run_one_dungeon_master_tick`
+//
+// This function reuses the same per-position classification
+// (`classify_chrono_position_for_player`) and move-resolution
+// pipeline (`resolve_parsed_move_to_legal_chess_move`,
+// `apply_chess_move_to_state`,
+// `process_move_timestamp_for_game_time`) that the live tick uses.
+// It does NOT call `run_one_dungeon_master_tick` itself, because
+// the tick function also performs chrono-hash checks and live
+// time-flag checks that are irrelevant during historical replay.
+//
+// ## What this function does
+//
+//   1. Refreshes the chrono-index against the live directory.
+//   2. Reads the committed file count.
+//   3. Iterates through chrono positions 0..file_count, alternating
+//      between the player whose turn it is (`state.board.side_to_move`).
+//   4. For each position, classifies it via
+//      `classify_chrono_position_for_player`.
+//   5. On finding a move candidate:
+//        a. Resolves notation against the current board.
+//        b. If legal: applies the move, charges game time from the
+//           TOML timestamp, advances the cursor.
+//        c. If illegal: advances the cursor past this file (same
+//           forward-progress rule as the live loop).
+//   6. On finding a resignation: ends the game.
+//   7. On skip-and-continue: advances the cursor.
+//   8. Stops when:
+//        - The game ends (checkmate, stalemate, resignation, or
+//          time flag detected from TOML timestamps alone).
+//        - Both player cursors have reached the end of the
+//          chrono-index without finding further moves.
+//
+// ## Time accounting during replay
+//
+// `process_move_timestamp_for_game_time` is called with the TOML
+// file's `updated_at_unix_timestamp` — never with wall-clock time.
+// This means the reconstructed `GameTimeState` reflects the same
+// cumulative thinking times that the live loop would have computed
+// had it been running continuously. Pre-moves (files whose timestamp
+// is earlier than the last processed move's timestamp) are handled
+// by the existing pre-move logic in
+// `process_move_timestamp_for_game_time` (zero time charged).
+//
+// ## Chrono-hash initialization
+//
+// After replay completes, the function computes the chrono-sort hash
+// over positions `[0, file_count)` and stores it in
+// `state.last_known_chrono_hash_through_n`. This seeds the live
+// loop's per-tick anomaly detection.
+//
+// ## N-move rule check during replay
+//
+// After each applied move, the function checks whether
+// `state.board.halfmove_clock` has reached or exceeded
+// `state.config.n_move_rule`. If so, it sets
+// `state.board.game_status = GameStatus::DrawForcedNmoveRule` and
+// stops replaying.
+//
+// ## Memory & Panic Policy
+//
+// No panics. No heap allocation beyond what the chrono-index module
+// uses internally (bounded, documented in that module). Per-position
+// work uses one `[u8; MAX_FULL_PATH_LEN]` stack buffer (inside
+// `classify_chrono_position_for_player`). The function processes
+// at most `MAX_GAME_FILES_FOR_BOOTSTRAP_SCAN` positions total.
+
+/// Replay all existing moves from the chrono-index into the
+/// dungeon-master state, returning the state advanced to the
+/// current board position.
+///
+/// ## Arguments
+///
+/// - `initial_state`: the starting `DungeonMasterState` as produced
+///   by `create_initial_dungeon_master_state`. Board is at the
+///   standard starting position, game time is zero, cursors are at
+///   position 0.
+///
+/// ## Returns
+///
+/// The `DungeonMasterState` after all existing moves have been
+/// replayed. If no move files exist, the returned state is
+/// identical to `initial_state` except that
+/// `last_known_chrono_hash_through_n` and `last_known_file_count`
+/// are populated.
+///
+/// On chrono-index failure (cannot update or read the index), the
+/// function returns `initial_state` unchanged. The live loop's
+/// first tick will retry the index and either succeed or return
+/// `ChronoIndexUnreadable`.
+pub fn replay_existing_moves_from_chrono_index(
+    initial_state: DungeonMasterState,
+) -> DungeonMasterState {
+    let mut state: DungeonMasterState = initial_state;
+
+    // ---- Step 1: refresh the chrono-index ----
+    let chrono_temp_path =
+        match core::str::from_utf8(state.config.chrono_sort_temp_directory_path_as_bytes()) {
+            Ok(valid_str) => valid_str,
+            Err(_) => return state,
+        };
+    let chrono_temp_dir: &Path = Path::new(chrono_temp_path);
+
+    let game_files_path =
+        match core::str::from_utf8(state.config.memo_toml_files_directory_path_as_bytes()) {
+            Ok(valid_str) => valid_str,
+            Err(_) => return state,
+        };
+    let game_files_dir: &Path = Path::new(game_files_path);
+
+    // Update the chrono-index to reflect the current directory contents.
+    if create_or_update_chrono_index(chrono_temp_dir, game_files_dir).is_err() {
+        return state;
+    }
+
+    // ---- Step 2: read the committed file count ----
+    let committed_file_count: u64 = match count_committed_files(chrono_temp_dir) {
+        Ok(count) => count,
+        Err(_) => return state,
+    };
+
+    // Apply the scan upper bound per project constant.
+    let scan_upper_bound: u64 = if committed_file_count > MAX_GAME_FILES_FOR_BOOTSTRAP_SCAN {
+        MAX_GAME_FILES_FOR_BOOTSTRAP_SCAN
+    } else {
+        committed_file_count
+    };
+
+    // If the directory is empty, seed the chrono-hash state and return.
+    if scan_upper_bound == 0 {
+        state.last_known_file_count = committed_file_count;
+        // No positions to hash; leave last_known_chrono_hash_through_n
+        // as None. The live loop will compute it when files appear.
+        return state;
+    }
+
+    // ---- Step 3: replay loop ----
+    //
+    // Strategy: advance through chrono positions. For each position,
+    // classify it for the player whose turn it currently is
+    // (state.board.side_to_move). If the file belongs to the other
+    // player or is otherwise irrelevant, advance the current
+    // player's cursor past it. If it is a move for the current
+    // player, resolve and apply. If it is a resignation, end.
+    //
+    // Both cursors advance independently. A file that belongs to
+    // the wrong player for this turn still advances that player's
+    // cursor (they pre-moved, but the pre-move is only consumable
+    // when it is their turn). However, we must also check the
+    // other player's files at each position to advance their cursor
+    // past config/non-move files.
+    //
+    // Simpler approach for replay: scan ALL positions in order.
+    // For each position, check if it is a move for the current
+    // side_to_move. If yes, process it. If no (wrong player,
+    // config file, malformed, etc.), skip. The per-player cursors
+    // are set at the end to the position after the last file
+    // examined, which is correct because the live loop should not
+    // re-examine any file the replay already saw.
+    //
+    // Bounded loop: at most scan_upper_bound iterations.
+
+    let mut chrono_position: u64 = 0;
+
+    // Failsafe iteration counter per NASA P10 rule 2.
+    // Maximum iterations equals scan_upper_bound (each iteration
+    // processes exactly one chrono position). We add a small margin
+    // for defensive comfort.
+    let failsafe_max_iterations: u64 = scan_upper_bound.saturating_add(1);
+    let mut iteration_count: u64 = 0;
+
+    while chrono_position < scan_upper_bound {
+        // Failsafe check.
+        iteration_count = iteration_count.saturating_add(1);
+        if iteration_count > failsafe_max_iterations {
+            break;
+        }
+
+        // If the game has already ended (checkmate, stalemate from
+        // a prior applied move, or time flag from timestamp
+        // accounting), stop replaying.
+        if state.board.game_status != GameStatus::StillPlaying {
+            break;
+        }
+
+        // Determine whose turn it is.
+        let current_side: PieceColor = state.board.side_to_move;
+
+        // Classify this position for the current side to move.
+        let classification: ScanPositionClassification = classify_chrono_position_for_player(
+            chrono_temp_dir,
+            chrono_position,
+            current_side,
+            &state.config,
+        );
+
+        match classification {
+            ScanPositionClassification::SkipAndContinue => {
+                // This file is not a move for the current player.
+                // Advance past it.
+                chrono_position = chrono_position.saturating_add(1);
+            }
+
+            ScanPositionClassification::FoundMoveCandidate {
+                parsed_notation,
+                move_unix_timestamp,
+            } => {
+                // Attempt to resolve the notation against the
+                // current board.
+                let resolve_result =
+                    resolve_parsed_move_to_legal_chess_move(&state.board, &parsed_notation);
+
+                match resolve_result {
+                    Ok(legal_chess_move) => {
+                        // Apply the move to the board.
+                        let apply_result =
+                            apply_chess_move_to_state(&state.board, &legal_chess_move);
+
+                        match apply_result {
+                            Ok(new_board) => {
+                                // // Charge game time using the TOML
+                                // // file's timestamp — NOT wall clock.
+                                // process_move_timestamp_for_game_time(
+                                //     &mut state.game_time_state,
+                                //     current_side,
+                                //     move_unix_timestamp,
+                                // );
+
+                                // Charge game time using the TOML file's timestamp.
+                                process_move_timestamp_for_game_time(
+                                    &mut state.game_time_state,
+                                    current_side,
+                                    move_unix_timestamp,
+                                );
+
+                                // === DEBUG PRINT ===
+                                let side_str = match current_side {
+                                    PieceColor::White => "W",
+                                    PieceColor::Black => "B",
+                                };
+                                let _ = buffy_println(
+                                    "REPLAY move: side={} ts={} W_cum={} B_cum={} last_ts={:?}",
+                                    &[
+                                        BuffyFormatArg::Str(side_str),
+                                        BuffyFormatArg::Usize(move_unix_timestamp as usize),
+                                        BuffyFormatArg::Usize(
+                                            state.game_time_state.white_cumulative_seconds as usize,
+                                        ),
+                                        BuffyFormatArg::Usize(
+                                            state.game_time_state.black_cumulative_seconds as usize,
+                                        ),
+                                        // Can't print Option<u64> easily, but check if last_ts is Some
+                                    ],
+                                );
+                                // === END DEBUG PRINT ===
+
+                                // Check for time flag from the
+                                // timestamp-based charge. Use the
+                                // move's own timestamp as "now" so
+                                // no wall-clock leaks in.
+                                let _flag_check = check_for_time_flag(
+                                    &mut state.game_time_state,
+                                    &new_board,
+                                    move_unix_timestamp,
+                                );
+
+                                // Apply time flag to board status
+                                // if one was just detected.
+                                let status_updated_board =
+                                    apply_timeflag_to_game_status(new_board, state.game_time_state);
+
+                                // Check N-move rule.
+                                let final_board = if status_updated_board.game_status
+                                    == GameStatus::StillPlaying
+                                {
+                                    // halfmove_clock is in
+                                    // half-moves; n_move_rule is
+                                    // also in half-moves per
+                                    // project spec.
+                                    if status_updated_board.halfmove_clock as u16
+                                        >= state.config.n_move_rule
+                                    {
+                                        let mut drawn_board = status_updated_board;
+                                        drawn_board.game_status = GameStatus::DrawForcedNmoveRule;
+                                        drawn_board
+                                    } else {
+                                        status_updated_board
+                                    }
+                                } else {
+                                    status_updated_board
+                                };
+
+                                state.board = final_board;
+                            }
+                            Err(_) => {
+                                // apply_chess_move_to_state failed
+                                // (internal error). Skip this move
+                                // per forward-progress rule.
+                            }
+                        }
+                    }
+                    Err(_) => {
+                        // Illegal or ambiguous notation. Skip per
+                        // forward-progress rule.
+                    }
+                }
+
+                // Advance past this position regardless of whether
+                // the move was legal.
+                chrono_position = chrono_position.saturating_add(1);
+            }
+
+            ScanPositionClassification::FoundResignationCommand {
+                command_unix_timestamp,
+            } => {
+                // Process time charge for the resignation.
+                process_non_move_command_timestamp_for_game_time(
+                    &mut state.game_time_state,
+                    &state.board,
+                    command_unix_timestamp,
+                );
+
+                // Set game status based on who resigned.
+                let resignation_status: GameStatus = match current_side {
+                    PieceColor::White => GameStatus::WhiteResigned,
+                    PieceColor::Black => GameStatus::BlackResigned,
+                };
+                state.board.game_status = resignation_status;
+
+                chrono_position = chrono_position.saturating_add(1);
+                // Game has ended; the while-loop condition check at
+                // the top will break on the next iteration.
+            }
+        }
+    }
+
+    // ---- Step 4: set cursors for the live loop ----
+    //
+    // Both cursors advance to `chrono_position` (the position after
+    // the last file examined). The live loop starts scanning from
+    // here for both players. This prevents re-examining any file
+    // that the replay already classified.
+    state.white_next_file_chronoindex_to_check = chrono_position;
+    state.black_next_file_chronoindex_to_check = chrono_position;
+
+    // ---- Step 5: seed the chrono-hash for anomaly detection ----
+    state.last_known_file_count = committed_file_count;
+
+    if committed_file_count > 0 {
+        // Compute the order-sensitive hash over [0, committed_file_count - 1].
+        match chrono_sort_hash_to_n(chrono_temp_dir, committed_file_count - 1) {
+            Ok(hash_value) => {
+                state.last_known_chrono_hash_through_n = Some(hash_value);
+            }
+            Err(_) => {
+                // Failed to compute hash. Leave as None; the live
+                // loop will recompute or rebuild defensively.
+            }
+        }
+    }
+
+    // ---- Step 6: anchor the live clock reference to wall-clock now ----
+    //
+    // During replay, `last_normal_move_unix_timestamp` was set to the
+    // TOML timestamp of the last replayed move. This is correct for
+    // computing cumulative time between historical moves. But the
+    // live display function (`compute_player_time_remaining_seconds`)
+    // computes:
+    //
+    //   live_elapsed = wall_clock_now - last_normal_move_unix_timestamp
+    //
+    // If the process was not running between the last historical move
+    // and now (e.g., the TUI was restarted, or a long pause occurred),
+    // that gap would be incorrectly charged to the player currently
+    // on the clock.
+    //
+    // By resetting `last_normal_move_unix_timestamp` to wall-clock
+    // "now" at the end of replay, the live-elapsed counter starts
+    // from zero at process startup. The cumulative totals already
+    // contain all historical thinking time; only NEW thinking time
+    // (from this moment forward) should appear as live elapsed.
+    //
+    // If no moves were replayed (`last_normal_move_unix_timestamp`
+    // is still `None`), no adjustment is needed — the display
+    // function already returns `max_time_per_player_seconds` when
+    // no reference timestamp exists.
+    if state
+        .game_time_state
+        .last_normal_move_unix_timestamp
+        .is_some()
+    {
+        let now_seconds: u64 = read_current_unix_timestamp_seconds_best_effort();
+        state.game_time_state.last_normal_move_unix_timestamp = Some(now_seconds);
+    }
+
+    state
+}

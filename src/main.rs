@@ -175,10 +175,10 @@ fn main() {
     //  ─────────────
     //   Select Game
     //  ─────────────
-    // let game_files_directory = Path::new("./test_game_files_1_prawntakespawn").to_path_buf(); // pawn takes pawn
+    let game_files_directory = Path::new("./test_game_files_1_prawntakespawn").to_path_buf(); // pawn takes pawn
     // let game_files_directory = Path::new("./test_game_files_2_whitetime_test").to_path_buf(); // testing white clock
     // let game_files_directory = Path::new("./test_game_files_4_whitetime_test2").to_path_buf(); // pawn takes pawn
-    let game_files_directory = Path::new("./test_game_files_3_foolmates").to_path_buf(); // pawn takes pawn
+    // let game_files_directory = Path::new("./test_game_files_3_foolmates").to_path_buf(); // pawn takes pawn
 
     let chrono_sort_temp_directory = Path::new("./test_chrono_temp").to_path_buf();
     let memochess_logging_directory = Path::new("./test_logs").to_path_buf();
@@ -249,10 +249,19 @@ fn main() {
     let initial_state = memo_chess_tui_module::create_initial_dungeon_master_state(game_config);
 
     // ─────────────────────────────────────────────────────────────
-    // Step 4: Run the game loop until the game ends.
+    // Step 4: Board Setup: get existing moves
     // ─────────────────────────────────────────────────────────────
 
-    let final_state = memo_chess_tui_module::run_memochess_dungeon_master_loop(initial_state);
+    // Replay any existing moves from the directory (no sleep, no wall-clock).
+    let replayed_state =
+        memo_chess_tui_module::replay_existing_moves_from_chrono_index(initial_state);
+
+    // ─────────────────────────────────────────────────────────────
+    // Step 5: Run the game loop until the game ends.
+    // ─────────────────────────────────────────────────────────────
+
+    let final_state = memo_chess_tui_module::run_memochess_dungeon_master_loop(replayed_state);
+    // let final_state = memo_chess_tui_module::run_memochess_dungeon_master_loop(initial_state);
 
     // ─────────────────────────────────────────────────────────────
     // Step 5: Print a summary of the outcome.
