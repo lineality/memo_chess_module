@@ -22314,7 +22314,7 @@ use std::time::Duration;
 // }
 
 // fn render_prompt_tui_render_mode() {
-//     let _print_result = buffy_println("{}", &[BuffyFormatArg::Str("memo_chess bootstrap:")]);
+//     let _print_result = buffy_println("{}", &[BuffyFormatArg::Str("Setup: Add a config file")]);
 
 //     #[cfg(debug_assertions)]
 //     eprintln!(
@@ -22381,7 +22381,7 @@ use std::time::Duration;
 
 /// Emit the prompt for the missing `plays_white` config item.
 fn render_prompt_plays_white() {
-    let r1 = buffy_println("{}", &[BuffyFormatArg::Str("memo_chess bootstrap:")]);
+    let r1 = buffy_println("{}", &[BuffyFormatArg::Str("Setup: Add a config file")]);
     #[cfg(debug_assertions)]
     eprintln!("render_prompt_plays_white line1: {:?}", r1);
 
@@ -22407,7 +22407,7 @@ fn render_prompt_plays_white() {
 
 /// Emit the prompt for the missing `plays_black` config item.
 fn render_prompt_plays_black() {
-    let r1 = buffy_println("{}", &[BuffyFormatArg::Str("memo_chess bootstrap:")]);
+    let r1 = buffy_println("{}", &[BuffyFormatArg::Str("Setup: Add a config file")]);
     #[cfg(debug_assertions)]
     eprintln!("render_prompt_plays_black line1: {:?}", r1);
 
@@ -22433,7 +22433,7 @@ fn render_prompt_plays_black() {
 
 /// Emit the prompt for the missing per-player time config item.
 fn render_prompt_player_time() {
-    let r1 = buffy_println("{}", &[BuffyFormatArg::Str("memo_chess bootstrap:")]);
+    let r1 = buffy_println("{}", &[BuffyFormatArg::Str("Setup: Add a config file")]);
     #[cfg(debug_assertions)]
     eprintln!("render_prompt_player_time line1: {:?}", r1);
 
@@ -22464,7 +22464,7 @@ fn render_prompt_player_time() {
 
 /// Emit the prompt for the missing refresh-rate config item.
 fn render_prompt_refresh_rate() {
-    let r1 = buffy_println("{}", &[BuffyFormatArg::Str("memo_chess bootstrap:")]);
+    let r1 = buffy_println("{}", &[BuffyFormatArg::Str("Setup: Add a config file")]);
     #[cfg(debug_assertions)]
     eprintln!("render_prompt_refresh_rate line1: {:?}", r1);
 
@@ -22493,7 +22493,7 @@ fn render_prompt_refresh_rate() {
 
 /// Emit the prompt for the missing n-move-rule config item.
 fn render_prompt_n_move_rule() {
-    let r1 = buffy_println("{}", &[BuffyFormatArg::Str("memo_chess bootstrap:")]);
+    let r1 = buffy_println("{}", &[BuffyFormatArg::Str("Setup: Add a config file")]);
     #[cfg(debug_assertions)]
     eprintln!("render_prompt_n_move_rule line1: {:?}", r1);
 
@@ -22530,7 +22530,7 @@ fn render_prompt_tui_render_mode() {
         )],
     );
 
-    let r1 = buffy_println("{}", &[BuffyFormatArg::Str("memo_chess bootstrap:")]);
+    let r1 = buffy_println("{}", &[BuffyFormatArg::Str("Setup: Add a config file")]);
     #[cfg(debug_assertions)]
     eprintln!("render_prompt_tui_render_mode line1: {:?}", r1);
 
@@ -22570,7 +22570,7 @@ fn render_prompt_tui_render_mode() {
 /// Emit the prompt shown when all required fields are set but the
 /// configuration constructor rejected the values.
 fn render_prompt_configuration_rejected() {
-    let r1 = buffy_println("{}", &[BuffyFormatArg::Str("memo_chess bootstrap:")]);
+    let r1 = buffy_println("{}", &[BuffyFormatArg::Str("Setup: Add a config file")]);
     #[cfg(debug_assertions)]
     eprintln!("render_prompt_configuration_rejected line1: {:?}", r1);
 
@@ -22835,7 +22835,17 @@ pub fn q_and_a_setup_bootstrap(
 
     // ----- Main loop -----
     loop {
-        // Step 1: attempt finalization if all required fields are set.
+
+        // Step 1: run one directory-scan pass.
+        run_one_bootstrap_scan_pass(
+            game_files_directory_path,
+            chrono_sort_temp_directory_path,
+            memochess_logging_directory_path,
+            bootstrap_run_unix_timestamp,
+            &mut partial_config,
+        );
+
+        // Step 2: attempt finalization if all required fields are set.
         if partial_config.all_required_fields_are_set() {
             let finalization_attempt = build_memochess_config_if_complete(
                 &partial_config,
@@ -22852,19 +22862,10 @@ pub fn q_and_a_setup_bootstrap(
             // Fall through to prompt rendering and another scan pass.
         }
 
-        // Step 2: render the prompt for the first missing field, or
+        // Step 3: render the prompt for the first missing field, or
         // the configuration-rejected prompt if all fields are set
         // but finalization failed.
         render_first_missing_field_prompt(&partial_config);
-
-        // Step 3: run one directory-scan pass.
-        run_one_bootstrap_scan_pass(
-            game_files_directory_path,
-            chrono_sort_temp_directory_path,
-            memochess_logging_directory_path,
-            bootstrap_run_unix_timestamp,
-            &mut partial_config,
-        );
 
         // Step 4: sleep before the next iteration.
         // `sleep` does not return a Result; nothing to handle.
