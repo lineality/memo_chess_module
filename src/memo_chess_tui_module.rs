@@ -1791,6 +1791,7 @@ mod run_one_dungeon_master_tick_tests {
             10u8,
             50u16,
             1_000_000_000,
+            TuiRenderMode::Ascii,
         );
         match result {
             Ok(config) => config,
@@ -8460,6 +8461,30 @@ pub enum MemochessGameConfigError {
 // SECTION 30: Memochess Game Config — Struct
 // ============================================================================
 
+/// TUI rendering mode for the chess board and pieces.
+///
+/// ## Project Context
+///
+/// Determines whether the board is rendered using ASCII characters
+/// (e.g., "K Q R B N P") or Unicode chess symbols with ANSI styling
+/// (e.g., "♔ ♕ ♖ ♗ ♘ ♙" in color).
+///
+/// Configured at bootstrap and never changed during a game.
+/// Read by the TUI renderer (Section 62) to decide which format to use.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TuiRenderMode {
+    /// ASCII pieces: uppercase for White (K Q R B N P),
+    /// lowercase for Black (k q r b n p).
+    /// Works on any terminal, no ANSI codes needed.
+    Ascii,
+
+    /// Unicode chess symbols with ANSI color codes.
+    /// White pieces in one color (e.g., bright white or cyan),
+    /// Black pieces in another (e.g., dark gray or yellow).
+    /// Requires a terminal that supports Unicode and ANSI codes.
+    UnicodeAnsi,
+}
+
 /// Configuration for one memo_chess game.
 ///
 /// ## Project Context
@@ -8588,6 +8613,9 @@ pub struct MemochessGameConfig {
     /// The full `u64` range is valid. No range validation is applied
     /// at construction time.
     pub bootstrap_run_unix_timestamp_seconds: u64,
+
+    /// TUI rendering mode: ASCII or Unicode+ANSI.
+    pub tui_render_mode: TuiRenderMode,
 }
 
 // ============================================================================
@@ -8713,6 +8741,7 @@ impl MemochessGameConfig {
         refresh_rate_seconds: u8,
         n_move_rule: u16,
         bootstrap_run_unix_timestamp_seconds: u64,
+        tui_render_mode: TuiRenderMode,
     ) -> Result<MemochessGameConfig, MemochessGameConfigError> {
         // ---- Validate the three filesystem paths ----
 
@@ -8843,6 +8872,7 @@ impl MemochessGameConfig {
             refresh_rate_seconds: refresh_rate_seconds,
             n_move_rule: n_move_rule,
             bootstrap_run_unix_timestamp_seconds: bootstrap_run_unix_timestamp_seconds,
+            tui_render_mode: tui_render_mode,
         })
     }
 
@@ -9163,8 +9193,19 @@ mod memochess_game_config_tests {
     #[test]
     fn constructs_with_all_valid_inputs() {
         let (m, c, l, u, w, b, t, r, n, bt) = valid_inputs_template();
-        let result =
-            MemochessGameConfig::try_construct_memochess_game_config(m, c, l, u, w, b, t, r, n, bt);
+        let result = MemochessGameConfig::try_construct_memochess_game_config(
+            m,
+            c,
+            l,
+            u,
+            w,
+            b,
+            t,
+            r,
+            n,
+            bt,
+            TuiRenderMode::Ascii,
+        );
         let config = match result {
             Ok(v) => v,
             Err(e) => panic!("expected valid config, got error: {:?}", e),
@@ -9184,7 +9225,17 @@ mod memochess_game_config_tests {
     fn rejects_empty_memo_toml_files_directory_path() {
         let (_, c, l, u, w, b, t, r, n, bt) = valid_inputs_template();
         let result = MemochessGameConfig::try_construct_memochess_game_config(
-            b"", c, l, u, w, b, t, r, n, bt,
+            b"",
+            c,
+            l,
+            u,
+            w,
+            b,
+            t,
+            r,
+            n,
+            bt,
+            TuiRenderMode::Ascii,
         );
         assert_eq!(
             result,
@@ -9197,7 +9248,17 @@ mod memochess_game_config_tests {
         let overlong = vec![b'a'; MAX_DIRECTORY_PATH_BYTES + 1];
         let (_, c, l, u, w, b, t, r, n, bt) = valid_inputs_template();
         let result = MemochessGameConfig::try_construct_memochess_game_config(
-            &overlong, c, l, u, w, b, t, r, n, bt,
+            &overlong,
+            c,
+            l,
+            u,
+            w,
+            b,
+            t,
+            r,
+            n,
+            bt,
+            TuiRenderMode::Ascii,
         );
         assert_eq!(
             result,
@@ -9209,7 +9270,17 @@ mod memochess_game_config_tests {
     fn rejects_empty_chrono_sort_temp_directory_path() {
         let (m, _, l, u, w, b, t, r, n, bt) = valid_inputs_template();
         let result = MemochessGameConfig::try_construct_memochess_game_config(
-            m, b"", l, u, w, b, t, r, n, bt,
+            m,
+            b"",
+            l,
+            u,
+            w,
+            b,
+            t,
+            r,
+            n,
+            bt,
+            TuiRenderMode::Ascii,
         );
         assert_eq!(
             result,
@@ -9222,7 +9293,17 @@ mod memochess_game_config_tests {
         let overlong = vec![b'a'; MAX_DIRECTORY_PATH_BYTES + 1];
         let (m, _, l, u, w, b, t, r, n, bt) = valid_inputs_template();
         let result = MemochessGameConfig::try_construct_memochess_game_config(
-            m, &overlong, l, u, w, b, t, r, n, bt,
+            m,
+            &overlong,
+            l,
+            u,
+            w,
+            b,
+            t,
+            r,
+            n,
+            bt,
+            TuiRenderMode::Ascii,
         );
         assert_eq!(
             result,
@@ -9234,7 +9315,17 @@ mod memochess_game_config_tests {
     fn rejects_empty_memo_chess_log_directory_path() {
         let (m, c, _, u, w, b, t, r, n, bt) = valid_inputs_template();
         let result = MemochessGameConfig::try_construct_memochess_game_config(
-            m, c, b"", u, w, b, t, r, n, bt,
+            m,
+            c,
+            b"",
+            u,
+            w,
+            b,
+            t,
+            r,
+            n,
+            bt,
+            TuiRenderMode::Ascii,
         );
         assert_eq!(
             result,
@@ -9247,7 +9338,17 @@ mod memochess_game_config_tests {
         let overlong = vec![b'a'; MAX_DIRECTORY_PATH_BYTES + 1];
         let (m, c, _, u, w, b, t, r, n, bt) = valid_inputs_template();
         let result = MemochessGameConfig::try_construct_memochess_game_config(
-            m, c, &overlong, u, w, b, t, r, n, bt,
+            m,
+            c,
+            &overlong,
+            u,
+            w,
+            b,
+            t,
+            r,
+            n,
+            bt,
+            TuiRenderMode::Ascii,
         );
         assert_eq!(
             result,
@@ -9259,7 +9360,17 @@ mod memochess_game_config_tests {
     fn rejects_empty_local_user_name() {
         let (m, c, l, _, w, b, t, r, n, bt) = valid_inputs_template();
         let result = MemochessGameConfig::try_construct_memochess_game_config(
-            m, c, l, b"", w, b, t, r, n, bt,
+            m,
+            c,
+            l,
+            b"",
+            w,
+            b,
+            t,
+            r,
+            n,
+            bt,
+            TuiRenderMode::Ascii,
         );
         assert_eq!(result, Err(MemochessGameConfigError::LocalUserNameEmpty));
     }
@@ -9269,7 +9380,17 @@ mod memochess_game_config_tests {
         let overlong = vec![b'x'; MAX_USERNAME_BYTES + 1];
         let (m, c, l, _, w, b, t, r, n, bt) = valid_inputs_template();
         let result = MemochessGameConfig::try_construct_memochess_game_config(
-            m, c, l, &overlong, w, b, t, r, n, bt,
+            m,
+            c,
+            l,
+            &overlong,
+            w,
+            b,
+            t,
+            r,
+            n,
+            bt,
+            TuiRenderMode::Ascii,
         );
         assert_eq!(result, Err(MemochessGameConfigError::LocalUserNameTooLong));
     }
@@ -9278,7 +9399,17 @@ mod memochess_game_config_tests {
     fn rejects_empty_white_player_name() {
         let (m, c, l, u, _, b, t, r, n, bt) = valid_inputs_template();
         let result = MemochessGameConfig::try_construct_memochess_game_config(
-            m, c, l, u, b"", b, t, r, n, bt,
+            m,
+            c,
+            l,
+            u,
+            b"",
+            b,
+            t,
+            r,
+            n,
+            bt,
+            TuiRenderMode::Ascii,
         );
         assert_eq!(result, Err(MemochessGameConfigError::WhitePlayerNameEmpty));
     }
@@ -9287,7 +9418,17 @@ mod memochess_game_config_tests {
     fn rejects_empty_black_player_name() {
         let (m, c, l, u, w, _, t, r, n, bt) = valid_inputs_template();
         let result = MemochessGameConfig::try_construct_memochess_game_config(
-            m, c, l, u, w, b"", t, r, n, bt,
+            m,
+            c,
+            l,
+            u,
+            w,
+            b"",
+            t,
+            r,
+            n,
+            bt,
+            TuiRenderMode::Ascii,
         );
         assert_eq!(result, Err(MemochessGameConfigError::BlackPlayerNameEmpty));
     }
@@ -9295,8 +9436,19 @@ mod memochess_game_config_tests {
     #[test]
     fn rejects_identical_white_and_black_player_names() {
         let (m, c, l, u, w, _, t, r, n, bt) = valid_inputs_template();
-        let result =
-            MemochessGameConfig::try_construct_memochess_game_config(m, c, l, u, w, w, t, r, n, bt);
+        let result = MemochessGameConfig::try_construct_memochess_game_config(
+            m,
+            c,
+            l,
+            u,
+            w,
+            w,
+            t,
+            r,
+            n,
+            bt,
+            TuiRenderMode::Ascii,
+        );
         assert_eq!(
             result,
             Err(MemochessGameConfigError::WhiteAndBlackPlayerNamesIdentical)
@@ -9308,7 +9460,17 @@ mod memochess_game_config_tests {
         let (m, c, l, u, w, b, _, r, n, bt) = valid_inputs_template();
         let too_low = MIN_TIME_LIMIT_PER_PLAYER_SECONDS - 1;
         let result = MemochessGameConfig::try_construct_memochess_game_config(
-            m, c, l, u, w, b, too_low, r, n, bt,
+            m,
+            c,
+            l,
+            u,
+            w,
+            b,
+            too_low,
+            r,
+            n,
+            bt,
+            TuiRenderMode::Ascii,
         );
         assert_eq!(
             result,
@@ -9321,7 +9483,17 @@ mod memochess_game_config_tests {
         let (m, c, l, u, w, b, t, _, n, bt) = valid_inputs_template();
         let too_low = MIN_REFRESH_RATE_SECONDS - 1;
         let result = MemochessGameConfig::try_construct_memochess_game_config(
-            m, c, l, u, w, b, t, too_low, n, bt,
+            m,
+            c,
+            l,
+            u,
+            w,
+            b,
+            t,
+            too_low,
+            n,
+            bt,
+            TuiRenderMode::Ascii,
         );
         assert_eq!(result, Err(MemochessGameConfigError::RefreshRateOutOfRange));
     }
@@ -9331,7 +9503,17 @@ mod memochess_game_config_tests {
         let (m, c, l, u, w, b, t, _, n, bt) = valid_inputs_template();
         let too_high = MAX_REFRESH_RATE_SECONDS + 1;
         let result = MemochessGameConfig::try_construct_memochess_game_config(
-            m, c, l, u, w, b, t, too_high, n, bt,
+            m,
+            c,
+            l,
+            u,
+            w,
+            b,
+            t,
+            too_high,
+            n,
+            bt,
+            TuiRenderMode::Ascii,
         );
         assert_eq!(result, Err(MemochessGameConfigError::RefreshRateOutOfRange));
     }
@@ -9341,7 +9523,17 @@ mod memochess_game_config_tests {
         let (m, c, l, u, w, b, t, r, _, bt) = valid_inputs_template();
         let too_low = MIN_N_MOVE_RULE_VALUE - 1;
         let result = MemochessGameConfig::try_construct_memochess_game_config(
-            m, c, l, u, w, b, t, r, too_low, bt,
+            m,
+            c,
+            l,
+            u,
+            w,
+            b,
+            t,
+            r,
+            too_low,
+            bt,
+            TuiRenderMode::Ascii,
         );
         assert_eq!(result, Err(MemochessGameConfigError::NMoveRuleOutOfRange));
     }
@@ -9351,7 +9543,17 @@ mod memochess_game_config_tests {
         let (m, c, l, u, w, b, t, r, _, bt) = valid_inputs_template();
         let too_high = MAX_N_MOVE_RULE_VALUE + 1;
         let result = MemochessGameConfig::try_construct_memochess_game_config(
-            m, c, l, u, w, b, t, r, too_high, bt,
+            m,
+            c,
+            l,
+            u,
+            w,
+            b,
+            t,
+            r,
+            too_high,
+            bt,
+            TuiRenderMode::Ascii,
         );
         assert_eq!(result, Err(MemochessGameConfigError::NMoveRuleOutOfRange));
     }
@@ -11218,6 +11420,8 @@ pub enum RecognizedConfigKey {
     NMoveRule,
     /// Wire format: `3_time_rep`. Value is `yes` or `no`.
     ThreeTimeRepetition,
+    /// Type of TUI
+    TuiRenderMode,
 }
 
 /// Return the wire-format byte string for a recognized key.
@@ -11233,6 +11437,7 @@ pub const fn recognized_config_key_as_bytes(key: RecognizedConfigKey) -> &'stati
         RecognizedConfigKey::RefreshRateSeconds => b"refresh_rate",
         RecognizedConfigKey::NMoveRule => b"n_move_rule",
         RecognizedConfigKey::ThreeTimeRepetition => b"3_time_rep",
+        RecognizedConfigKey::TuiRenderMode => b"tui_mode",
     }
 }
 
@@ -11980,6 +12185,22 @@ pub fn parse_n_move_rule_value(value_bytes: &[u8]) -> Option<u16> {
     Some(accumulator)
 }
 
+/// Parse a `tui_mode` value into a `TuiRenderMode`.
+///
+/// Accepted input: `"ascii"` or `"unicode"` (case-insensitive after pre-screen
+/// lowercasing).
+///
+/// Returns `Some(TuiRenderMode::Ascii)` for `"ascii"`.
+/// Returns `Some(TuiRenderMode::UnicodeAnsi)` for `"unicode"`.
+/// Returns `None` for anything else.
+pub fn parse_tui_render_mode_value(value_bytes: &[u8]) -> Option<TuiRenderMode> {
+    match value_bytes {
+        b"ascii" => Some(TuiRenderMode::Ascii),
+        b"unicode" => Some(TuiRenderMode::UnicodeAnsi),
+        _ => None,
+    }
+}
+
 // ============================================================================
 // SECTION 48: Config Value Semantic Parsers — Cargo Tests
 // ============================================================================
@@ -12291,34 +12512,9 @@ pub struct PartialBootstrapConfig {
     /// more than 200+ moves.
     /// This field is required.
     pub n_move_rule: Option<u16>,
+
+    pub tui_render_mode: Option<TuiRenderMode>,
 }
-
-// impl PartialBootstrapConfig {
-//     /// Construct an empty accumulator. All fields `None`.
-//     pub const fn new_empty_partial_bootstrap_config() -> PartialBootstrapConfig {
-//         PartialBootstrapConfig {
-//             white_player_name: None,
-//             black_player_name: None,
-//             player_time_minutes: None,
-//             refresh_rate_seconds: None,
-//             n_move_rule: None,
-//         }
-//     }
-
-//     /// Returns `true` if every *required* field has been set.
-//     /// `n_move_rule` is not checked because it is optional.
-//     ///
-//     /// This is a fast check used each loop iteration to decide whether
-//     /// to attempt finalization. It does not validate field values;
-//     /// final validation (range checks, distinct white/black names)
-//     /// is performed by `build_memochess_config_if_complete`.
-//     pub const fn all_required_fields_are_set(&self) -> bool {
-//         self.white_player_name.is_some()
-//             && self.black_player_name.is_some()
-//             && self.player_time_minutes.is_some()
-//             && self.refresh_rate_seconds.is_some()
-//     }
-// }
 
 impl PartialBootstrapConfig {
     /// Construct an empty accumulator. All fields `None`.
@@ -12329,6 +12525,7 @@ impl PartialBootstrapConfig {
             player_time_minutes: None,
             refresh_rate_seconds: None,
             n_move_rule: None,
+            tui_render_mode: None,
         }
     }
 
@@ -12348,6 +12545,7 @@ impl PartialBootstrapConfig {
             && self.player_time_minutes.is_some()
             && self.refresh_rate_seconds.is_some()
             && self.n_move_rule.is_some()
+            && self.tui_render_mode.is_some()
     }
 }
 
@@ -12443,8 +12641,23 @@ mod partial_bootstrap_config_tests {
     // ... (unchanged tests omitted for brevity) ...
 
     /// Verify that `all_required_fields_are_set` returns false until
-    /// every one of the five required fields has been set, and true
+    /// every one of the six required fields has been set, and true
     /// once they all have.
+    ///
+    /// The six required fields, in the order this test sets them:
+    ///   1. white_player_name
+    ///   2. black_player_name
+    ///   3. player_time_minutes
+    ///   4. refresh_rate_seconds
+    ///   5. n_move_rule
+    ///   6. tui_render_mode
+    ///
+    /// At each step the test asserts that completeness is still
+    /// `false`, then on the final step asserts that it has become
+    /// `true`. The set of fields, not their values, is what this
+    /// test exercises; value-validation lives in
+    /// `try_construct_memochess_game_config` and is covered by
+    /// separate tests.
     #[test]
     fn all_required_fields_are_set_requires_every_field() {
         let mut partial = PartialBootstrapConfig::new_empty_partial_bootstrap_config();
@@ -12468,12 +12681,18 @@ mod partial_bootstrap_config_tests {
         partial.player_time_minutes = Some(10u32);
         assert!(!partial.all_required_fields_are_set());
 
-        // Add refresh rate: not complete (n_move_rule still missing).
+        // Add refresh rate: not complete (n_move_rule and
+        // tui_render_mode still missing).
         partial.refresh_rate_seconds = Some(10u8);
         assert!(!partial.all_required_fields_are_set());
 
-        // Add n_move_rule: now complete.
+        // Add n_move_rule: still not complete (tui_render_mode
+        // still missing).
         partial.n_move_rule = Some(50u16);
+        assert!(!partial.all_required_fields_are_set());
+
+        // Add tui_render_mode: now complete.
+        partial.tui_render_mode = Some(TuiRenderMode::Ascii);
         assert!(partial.all_required_fields_are_set());
     }
 
@@ -12686,6 +12905,10 @@ pub fn build_memochess_config_if_complete(
         Some(value) => value,
         None => return None,
     };
+    let tui_render_mode = match partial_config.tui_render_mode {
+        Some(value) => value,
+        None => return None,
+    };
 
     // ── Step 2: minutes → seconds, with overflow check ──────────────
     let max_time_limit_per_player_seconds =
@@ -12728,6 +12951,7 @@ pub fn build_memochess_config_if_complete(
         refresh_rate_seconds,
         n_move_rule,
         bootstrap_run_unix_timestamp_seconds,
+        tui_render_mode,
     );
 
     match construction_result {
@@ -12904,6 +13128,23 @@ mod build_memochess_config_if_complete_tests {
 
     /// Construct a fully-populated `PartialBootstrapConfig` for use in
     /// tests below.
+    ///
+    /// "Fully-populated" means every required field of
+    /// `PartialBootstrapConfig` is set to `Some(...)`, such that
+    /// `all_required_fields_are_set()` returns `true` and
+    /// `build_memochess_config_if_complete` will attempt finalization.
+    ///
+    /// Field values:
+    ///   - white_player_name:    b"alice"
+    ///   - black_player_name:    b"bob"
+    ///   - player_time_minutes:  10  (becomes 600 seconds after finalization)
+    ///   - refresh_rate_seconds: 10
+    ///   - n_move_rule:          50
+    ///   - tui_render_mode:      TuiRenderMode::Ascii
+    ///
+    /// The `Ascii` render mode is chosen because it is the more
+    /// portable default and the test's purpose is to exercise the
+    /// finalization pipeline, not the choice of renderer.
     fn fully_populated_partial_config() -> PartialBootstrapConfig {
         let mut partial = PartialBootstrapConfig::new_empty_partial_bootstrap_config();
 
@@ -12918,8 +13159,67 @@ mod build_memochess_config_if_complete_tests {
         partial.player_time_minutes = Some(10u32);
         partial.refresh_rate_seconds = Some(10u8);
         partial.n_move_rule = Some(50u16);
+        partial.tui_render_mode = Some(TuiRenderMode::Ascii);
 
         partial
+    }
+
+    /// Verify the gating role of `tui_render_mode` specifically:
+    /// when every other required field is set, completeness is
+    /// still false if and only if `tui_render_mode` is `None`.
+    ///
+    /// This isolates the new field's contribution to the
+    /// completeness gate, so a future change to the field set
+    /// will produce a clear, localized test failure here rather
+    /// than only an unclear ripple through the ladder test.
+    #[test]
+    fn tui_render_mode_alone_gates_completeness() {
+        // Start from a fully-populated partial, then clear the
+        // tui_render_mode field; the gate must now reject.
+        let mut partial = fully_populated_partial_config();
+        partial.tui_render_mode = None;
+        assert!(
+            !partial.all_required_fields_are_set(),
+            "completeness must require tui_render_mode"
+        );
+
+        // Restoring tui_render_mode (to either variant) restores
+        // completeness.
+        partial.tui_render_mode = Some(TuiRenderMode::Ascii);
+        assert!(partial.all_required_fields_are_set());
+
+        partial.tui_render_mode = Some(TuiRenderMode::UnicodeAnsi);
+        assert!(partial.all_required_fields_are_set());
+    }
+
+    /// Verify that the `UnicodeAnsi` render mode round-trips
+    /// through finalization.
+    ///
+    /// Companion to `finalizes_fully_populated_partial_config`,
+    /// which uses the `Ascii` variant. Together the two tests
+    /// cover both render-mode variants through the finalization
+    /// pipeline.
+    #[test]
+    fn finalizes_partial_config_with_unicode_ansi_render_mode() {
+        let mut partial = fully_populated_partial_config();
+        partial.tui_render_mode = Some(TuiRenderMode::UnicodeAnsi);
+
+        let finalized = build_memochess_config_if_complete(
+            &partial,
+            TEST_MEMO_TOML_FILES_PATH,
+            TEST_CHRONO_SORT_TEMP_PATH,
+            TEST_MEMO_CHESS_LOG_PATH,
+            TEST_LOCAL_USER_NAME,
+            TEST_TIMESTAMP,
+        );
+        let config = match finalized {
+            Some(c) => c,
+            None => panic!(
+                "expected fully-populated partial with UnicodeAnsi \
+                 render mode to finalize successfully"
+            ),
+        };
+        assert_eq!(config.tui_render_mode, TuiRenderMode::UnicodeAnsi);
     }
 
     /// Standard valid path and user-name bytes for tests below.
@@ -12962,6 +13262,7 @@ mod build_memochess_config_if_complete_tests {
         assert_eq!(config.max_time_limit_per_player_seconds, 600u32); // 10 min * 60
         assert_eq!(config.refresh_rate_seconds, 10u8);
         assert_eq!(config.n_move_rule, 50u16);
+        assert_eq!(config.tui_render_mode, TuiRenderMode::Ascii);
     }
 
     #[test]
@@ -20656,6 +20957,19 @@ pub fn apply_parsed_config_line_to_partial_config(
             }
         }
 
+        RecognizedConfigKey::TuiRenderMode => {
+            if partial_config.tui_render_mode.is_some() {
+                return ApplyConfigLineOutcome::FieldAlreadySet;
+            }
+            match parse_tui_render_mode_value(parsed_line.value_as_bytes()) {
+                Some(mode) => {
+                    partial_config.tui_render_mode = Some(mode);
+                    ApplyConfigLineOutcome::FieldNewlySet
+                }
+                None => ApplyConfigLineOutcome::ValueSemanticInvalid,
+            }
+        }
+
         RecognizedConfigKey::ThreeTimeRepetition => {
             // MVP-1: threefold-repetition is out of scope per
             // `PartialBootstrapConfig` documentation. A recognized
@@ -21964,6 +22278,19 @@ fn render_prompt_n_move_rule() {
     );
 }
 
+fn render_prompt_tui_render_mode() {
+    let _print_result = buffy_println(
+        "{}",
+        &[BuffyFormatArg::Str(
+            "memo_chess bootstrap:\n\
+             6. TUI Mode: Text User Interface: simple ascii vs. unicode + ansi\n\
+             Write a memo with text_message:\n\
+             tui_mode:<mode>\n\
+             (Write one of:\n  tui_mode:ascii\n  tui_mode:unicode)\n",
+        )],
+    );
+}
+
 /// Emit a generic prompt when all required fields are set but
 /// finalization is still failing.
 ///
@@ -22014,6 +22341,10 @@ fn render_first_missing_field_prompt(partial_config: &PartialBootstrapConfig) {
     }
     if partial_config.n_move_rule.is_none() {
         render_prompt_n_move_rule();
+        return;
+    }
+    if partial_config.tui_render_mode.is_none() {
+        render_prompt_tui_render_mode();
         return;
     }
     // All required fields set; the calling code only reaches here
@@ -22496,6 +22827,7 @@ mod dungeon_master_state_tests {
             refresh_rate_seconds,
             n_move_rule,
             test_timestamp,
+            TuiRenderMode::Ascii,
         );
 
         match constructed_config_result {
@@ -23544,6 +23876,410 @@ fn emit_one_formatted_line(
 // Public entry point
 // ----------------------------------------------------------------------------
 
+// /// Compose the current dungeon-master state into a sequence of
+// /// content lines and emit them, in order, through the supplied
+// /// `emit_line` closure.
+// ///
+// /// ## Project Context
+// ///
+// /// Called once per refresh cycle by the outer wrapper (Section 64).
+// /// In production the wrapper passes a closure that writes each line
+// /// to the terminal via Buffy and appends the same line to the
+// /// game-log file. In tests the closure captures emitted lines for
+// /// assertion.
+// ///
+// /// ## Side effects
+// ///
+// /// Writes the ANSI clear-screen sequence directly to the terminal
+// /// via Buffy at the start of each frame. This is NOT routed through
+// /// `emit_line`, so the log file receives content lines only.
+// ///
+// /// On Buffy write failure (unlikely; the terminal sink is typically
+// /// always-writable), the clear-screen sequence is silently dropped.
+// /// The rest of the frame still emits.
+// ///
+// /// ## Arguments
+// ///
+// /// - `state`: the dungeon-master state to render.
+// /// - `current_unix_timestamp`: the wall-clock moment for the frame,
+// ///   used by the clock-line formatters. Per project policy the
+// ///   wrapper samples this once per tick and passes it in.
+// /// - `emit_line`: closure invoked once per content line. The slice
+// ///   passed to the closure has no trailing newline; the closure is
+// ///   free to add one if its destination (terminal, log file)
+// ///   requires it.
+// ///
+// /// ## Render mode
+// ///
+// /// `state.config.tui_render_mode` selects the board renderer:
+// ///   - `TuiRenderMode::Ascii`: uppercase/lowercase letter pieces,
+// ///     no ANSI codes. Works on any terminal.
+// ///   - `TuiRenderMode::UnicodeAnsi`: Unicode chess symbols with
+// ///     ANSI color. Requires a Unicode+ANSI-capable terminal.
+// ///
+// /// The selection is made once per frame, before the board buffer is
+// /// filled. The rest of the frame (status lines, clock lines) is the
+// /// same regardless of render mode.
+// ///
+// /// ## Memory & Panic Policy
+// ///
+// /// No heap inside this function. No panics. The board scratch
+// /// buffer (256 bytes) and per-line buffer (96 bytes) are stack
+// /// resident.
+// pub fn write_dungeon_master_state_to_tui_and_log(
+//     state: &DungeonMasterState,
+//     current_unix_timestamp: u64,
+//     emit_line: &mut dyn FnMut(&[u8]),
+// ) {
+//     // ----- Step 1: clear the terminal screen directly (not via emit_line).
+//     let _ = buffy_print(
+//         "{}",
+//         &[BuffyFormatArg::Str(
+//             core::str::from_utf8(ANSI_CLEAR_SCREEN_AND_HOME).unwrap_or(""),
+//         )],
+//     );
+
+//     // ----- Step 2: render board into a stack buffer, then emit per line.
+//     let mut board_render_buffer: [u8; TUI_BOARD_RENDER_BUFFER_BYTES] =
+//         [0; TUI_BOARD_RENDER_BUFFER_BYTES];
+
+//     let render_from_white_view = should_render_from_white_view(&state.config);
+
+//     match format_board_state_as_ascii(
+//         &state.board,
+//         render_from_white_view,
+//         &mut board_render_buffer,
+//     ) {
+//         Ok(board_byte_length) => {
+//             emit_board_lines_from_rendered_buffer(
+//                 &board_render_buffer,
+//                 board_byte_length,
+//                 emit_line,
+//             );
+//         }
+//         Err(_) => {
+//             // Defensive: format_board_state_as_ascii only fails on
+//             // buffer-too-small, which is unreachable given the chosen
+//             // TUI_BOARD_RENDER_BUFFER_BYTES sizing. Emit a fallback
+//             // so the user sees something rather than a silent gap.
+//             emit_line(b"(board render error)");
+//         }
+//     }
+
+//     // ----- Step 3: emit the six status block lines.
+//     emit_one_formatted_line(
+//         |output_buffer| write_status_line_into_buffer(state, output_buffer),
+//         emit_line,
+//     );
+
+//     emit_one_formatted_line(
+//         |output_buffer| write_whole_move_is_next_line_into_buffer(state, output_buffer),
+//         emit_line,
+//     );
+
+//     emit_one_formatted_line(
+//         |output_buffer| write_move_number_line_into_buffer(state, output_buffer),
+//         emit_line,
+//     );
+
+//     emit_one_formatted_line(
+//         |output_buffer| {
+//             write_clock_line_into_buffer(
+//                 state,
+//                 PieceColor::White,
+//                 current_unix_timestamp,
+//                 output_buffer,
+//             )
+//         },
+//         emit_line,
+//     );
+
+//     emit_one_formatted_line(
+//         |output_buffer| {
+//             write_clock_line_into_buffer(
+//                 state,
+//                 PieceColor::Black,
+//                 current_unix_timestamp,
+//                 output_buffer,
+//             )
+//         },
+//         emit_line,
+//     );
+
+//     emit_one_formatted_line(
+//         |output_buffer| {
+//             write_total_time_line_into_buffer(state, current_unix_timestamp, output_buffer)
+//         },
+//         emit_line,
+//     );
+// }
+
+// ============================================================================
+// ANSI escape sequence constants for Unicode board rendering.
+// ============================================================================
+//
+// These are the SGR (Select Graphic Rendition) sequences used by
+// `format_board_state_as_unicode_ansi`. They are kept as named
+// constants so the color scheme can be retuned without hunting
+// through the render loop.
+//
+// Color scheme (initial; tune as needed):
+//   - White pieces: bright-white foreground (\x1b[97m)
+//   - Black pieces: yellow foreground (\x1b[33m)
+//   - Light squares: bright-black ("gray") background (\x1b[100m)
+//   - Dark squares: no background color set
+//   - Empty squares: middle-dot glyph, no foreground color override
+//
+// Per project policy these are byte-slice literals so we can write
+// them via `write_bytes_to_buffer` without UTF-8 conversion at the
+// call site (they are pure ASCII).
+
+/// ANSI: reset all attributes (color, background, intensity).
+const ANSI_SGR_RESET: &[u8] = b"\x1b[0m";
+
+/// ANSI: set foreground to bright white. Used for White's pieces.
+const ANSI_SGR_FOREGROUND_BRIGHT_WHITE: &[u8] = b"\x1b[97m";
+
+/// ANSI: set foreground to yellow. Used for Black's pieces.
+const ANSI_SGR_FOREGROUND_YELLOW: &[u8] = b"\x1b[33m";
+
+/// ANSI: set background to bright black (gray). Used for light squares.
+const ANSI_SGR_BACKGROUND_LIGHT_SQUARE: &[u8] = b"\x1b[100m";
+
+// ============================================================================
+// Unicode chess glyphs as UTF-8 byte sequences.
+// ============================================================================
+//
+// Each Unicode chess piece is encoded in three bytes in UTF-8. We
+// hard-code the byte sequences rather than relying on string
+// literal conversion so the renderer never touches the str type
+// (Buffy compatibility) and the byte cost is auditable.
+//
+// Reference (U+2654 through U+265F):
+//   ♔ U+2654 White King   -> E2 99 94
+//   ♕ U+2655 White Queen  -> E2 99 95
+//   ♖ U+2656 White Rook   -> E2 99 96
+//   ♗ U+2657 White Bishop -> E2 99 97
+//   ♘ U+2658 White Knight -> E2 99 98
+//   ♙ U+2659 White Pawn   -> E2 99 99
+//   ♚ U+265A Black King   -> E2 99 9A
+//   ♛ U+265B Black Queen  -> E2 99 9B
+//   ♜ U+265C Black Rook   -> E2 99 9C
+//   ♝ U+265D Black Bishop -> E2 99 9D
+//   ♞ U+265E Black Knight -> E2 99 9E
+//   ♟ U+265F Black Pawn   -> E2 99 9F
+//   · U+00B7 Middle Dot   -> C2 B7
+
+const UNICODE_GLYPH_WHITE_KING: &[u8] = &[0xE2, 0x99, 0x94];
+const UNICODE_GLYPH_WHITE_QUEEN: &[u8] = &[0xE2, 0x99, 0x95];
+const UNICODE_GLYPH_WHITE_ROOK: &[u8] = &[0xE2, 0x99, 0x96];
+const UNICODE_GLYPH_WHITE_BISHOP: &[u8] = &[0xE2, 0x99, 0x97];
+const UNICODE_GLYPH_WHITE_KNIGHT: &[u8] = &[0xE2, 0x99, 0x98];
+const UNICODE_GLYPH_WHITE_PAWN: &[u8] = &[0xE2, 0x99, 0x99];
+const UNICODE_GLYPH_BLACK_KING: &[u8] = &[0xE2, 0x99, 0x9A];
+const UNICODE_GLYPH_BLACK_QUEEN: &[u8] = &[0xE2, 0x99, 0x9B];
+const UNICODE_GLYPH_BLACK_ROOK: &[u8] = &[0xE2, 0x99, 0x9C];
+const UNICODE_GLYPH_BLACK_BISHOP: &[u8] = &[0xE2, 0x99, 0x9D];
+const UNICODE_GLYPH_BLACK_KNIGHT: &[u8] = &[0xE2, 0x99, 0x9E];
+const UNICODE_GLYPH_BLACK_PAWN: &[u8] = &[0xE2, 0x99, 0x9F];
+const UNICODE_GLYPH_EMPTY_SQUARE: &[u8] = &[0xC2, 0xB7];
+
+/// Return the UTF-8 byte sequence for the given piece's Unicode chess glyph.
+///
+/// ## Project Context
+///
+/// Companion to `ascii_character_for_piece` for the Unicode-ANSI
+/// renderer. Returns a `'static` byte slice so the caller writes
+/// the bytes directly into its output buffer with no allocation.
+///
+/// ## Memory & Panic Policy
+///
+/// No heap. No panics. Total branch coverage of `PieceKind` x
+/// `PieceColor`.
+fn unicode_bytes_for_piece(piece_value: Piece) -> &'static [u8] {
+    match (piece_value.piece_color, piece_value.piece_kind) {
+        (PieceColor::White, PieceKind::King) => UNICODE_GLYPH_WHITE_KING,
+        (PieceColor::White, PieceKind::Queen) => UNICODE_GLYPH_WHITE_QUEEN,
+        (PieceColor::White, PieceKind::Rook) => UNICODE_GLYPH_WHITE_ROOK,
+        (PieceColor::White, PieceKind::Bishop) => UNICODE_GLYPH_WHITE_BISHOP,
+        (PieceColor::White, PieceKind::Knight) => UNICODE_GLYPH_WHITE_KNIGHT,
+        (PieceColor::White, PieceKind::Pawn) => UNICODE_GLYPH_WHITE_PAWN,
+        (PieceColor::Black, PieceKind::King) => UNICODE_GLYPH_BLACK_KING,
+        (PieceColor::Black, PieceKind::Queen) => UNICODE_GLYPH_BLACK_QUEEN,
+        (PieceColor::Black, PieceKind::Rook) => UNICODE_GLYPH_BLACK_ROOK,
+        (PieceColor::Black, PieceKind::Bishop) => UNICODE_GLYPH_BLACK_BISHOP,
+        (PieceColor::Black, PieceKind::Knight) => UNICODE_GLYPH_BLACK_KNIGHT,
+        (PieceColor::Black, PieceKind::Pawn) => UNICODE_GLYPH_BLACK_PAWN,
+    }
+}
+
+/// Renders the given `BoardState` as Unicode chess symbols with ANSI
+/// color codes into the provided buffer.
+///
+/// ## Piece encoding
+///
+/// White pieces: ♔ ♕ ♖ ♗ ♘ ♙  rendered with ANSI bright-white foreground.
+/// Black pieces: ♚ ♛ ♜ ♝ ♞ ♟  rendered with ANSI yellow foreground.
+/// Empty squares: · (U+00B7 MIDDLE DOT), no color code.
+///
+/// ## Square shading
+///
+/// Light squares (where `file + rank` is odd, with a1 = file 0, rank 0
+/// being a dark square per standard chess convention) receive an ANSI
+/// bright-black ("gray") background. Dark squares receive no
+/// background SGR. This was chosen to keep dark squares as the
+/// terminal default and only paint the light squares.
+///
+/// ## Output format
+///
+/// Identical grid layout to `format_board_state_as_ascii`:
+/// rank labels on the left, file labels on the bottom. Each piece
+/// glyph (or empty-square dot) is bracketed by ANSI SGR sequences
+/// for color and background, followed by an SGR reset.
+///
+/// ## Buffer sizing
+///
+/// Per-square worst-case byte cost:
+///   background-on (6) + foreground (5) + glyph (3) + reset (4) +
+///   trailing space (1) = 19 bytes.
+/// Board grid total: 64 * 19 = 1216 bytes.
+/// Rank labels, newlines, and the file-label footer add ~100 bytes.
+/// Recommended `TUI_BOARD_RENDER_BUFFER_BYTES` for this renderer:
+/// 2048 bytes. The constant must be raised from its current 256
+/// before this function is wired into the TUI; otherwise the
+/// renderer returns `Err(InternalIndexOutOfBounds)` and the TUI
+/// shows its fallback message ("(board render error)").
+///
+/// ## Arguments
+///
+/// - `state`: the board state to render.
+/// - `render_from_white_view`: if true, rank 8 is at the top (White
+///   orientation). If false, the board is flipped (Black view).
+/// - `output_buffer`: caller-provided stack buffer. No allocation.
+///
+/// ## Returns
+///
+/// On success, `Ok(bytes_written)`. On insufficient buffer space,
+/// `Err(MoveValidationError::InternalIndexOutOfBounds)`.
+///
+/// ## Memory & Panic Policy
+///
+/// No heap. No panics. All writes go through `write_byte_to_buffer`
+/// and `write_bytes_to_buffer`, which bounds-check on every write.
+pub fn format_board_state_as_unicode_ansi(
+    state: &BoardState,
+    render_from_white_view: bool,
+    output_buffer: &mut [u8],
+) -> Result<usize, MoveValidationError> {
+    let mut write_position: usize = 0;
+
+    // Iterate ranks in display order. White view: rank 7 first.
+    // Black view: rank 0 first. Bounded loop, no recursion.
+    let mut rank_iteration_step: u8 = 0;
+    while rank_iteration_step < BOARD_RANK_COUNT {
+        let actual_rank_index: u8 = if render_from_white_view {
+            BOARD_RANK_COUNT - 1 - rank_iteration_step
+        } else {
+            rank_iteration_step
+        };
+
+        // Rank label: leading space, digit, two spaces.
+        write_position = write_byte_to_buffer(output_buffer, write_position, b' ')?;
+        let rank_label_byte: u8 = b'1' + actual_rank_index;
+        write_position = write_byte_to_buffer(output_buffer, write_position, rank_label_byte)?;
+        write_position = write_byte_to_buffer(output_buffer, write_position, b' ')?;
+        write_position = write_byte_to_buffer(output_buffer, write_position, b' ')?;
+
+        // Iterate files left to right in display order.
+        let mut file_iteration_step: u8 = 0;
+        while file_iteration_step < BOARD_FILE_COUNT {
+            let actual_file_index: u8 = if render_from_white_view {
+                file_iteration_step
+            } else {
+                BOARD_FILE_COUNT - 1 - file_iteration_step
+            };
+
+            let square_index =
+                square_index_from_file_and_rank(actual_file_index, actual_rank_index)?;
+            let square_contents = state.board_squares[square_index as usize];
+
+            // Light squares: (file + rank) odd. a1 (0,0) is dark.
+            let square_is_light: bool =
+                (actual_file_index as u16 + actual_rank_index as u16) % 2 == 1;
+
+            // ----- Emit background SGR for light squares only.
+            if square_is_light {
+                write_position = write_bytes_to_buffer(
+                    output_buffer,
+                    write_position,
+                    ANSI_SGR_BACKGROUND_LIGHT_SQUARE,
+                )?;
+            }
+
+            // ----- Emit foreground SGR (for pieces only; empty squares
+            //       use whatever foreground is currently active, which
+            //       is the terminal default since we reset after each
+            //       square).
+            match square_contents {
+                Some(piece_here) => {
+                    let foreground_bytes: &[u8] = match piece_here.piece_color {
+                        PieceColor::White => ANSI_SGR_FOREGROUND_BRIGHT_WHITE,
+                        PieceColor::Black => ANSI_SGR_FOREGROUND_YELLOW,
+                    };
+                    write_position =
+                        write_bytes_to_buffer(output_buffer, write_position, foreground_bytes)?;
+
+                    let glyph_bytes = unicode_bytes_for_piece(piece_here);
+                    write_position =
+                        write_bytes_to_buffer(output_buffer, write_position, glyph_bytes)?;
+                }
+                None => {
+                    write_position = write_bytes_to_buffer(
+                        output_buffer,
+                        write_position,
+                        UNICODE_GLYPH_EMPTY_SQUARE,
+                    )?;
+                }
+            }
+
+            // ----- Always reset SGR after each square so background and
+            //       foreground do not leak into the trailing separator
+            //       space or the next square. This costs 4 bytes per
+            //       square but keeps state explicit and auditable.
+            write_position = write_bytes_to_buffer(output_buffer, write_position, ANSI_SGR_RESET)?;
+
+            // Separating space after each square.
+            write_position = write_byte_to_buffer(output_buffer, write_position, b' ')?;
+
+            file_iteration_step += 1;
+        }
+
+        // End of rank: newline.
+        write_position = write_byte_to_buffer(output_buffer, write_position, b'\n')?;
+        rank_iteration_step += 1;
+    }
+
+    // Blank line and file labels (uncolored, ASCII only).
+    write_position = write_byte_to_buffer(output_buffer, write_position, b'\n')?;
+    write_position = write_bytes_to_buffer(output_buffer, write_position, b"    ")?;
+
+    let mut file_label_step: u8 = 0;
+    while file_label_step < BOARD_FILE_COUNT {
+        let actual_file_index: u8 = if render_from_white_view {
+            file_label_step
+        } else {
+            BOARD_FILE_COUNT - 1 - file_label_step
+        };
+        let file_label_byte: u8 = b'a' + actual_file_index;
+        write_position = write_byte_to_buffer(output_buffer, write_position, file_label_byte)?;
+        write_position = write_byte_to_buffer(output_buffer, write_position, b' ')?;
+        file_label_step += 1;
+    }
+    write_position = write_byte_to_buffer(output_buffer, write_position, b'\n')?;
+
+    Ok(write_position)
+}
+
 /// Compose the current dungeon-master state into a sequence of
 /// content lines and emit them, in order, through the supplied
 /// `emit_line` closure.
@@ -23577,17 +24313,25 @@ fn emit_one_formatted_line(
 ///   free to add one if its destination (terminal, log file)
 ///   requires it.
 ///
+/// ## Rendering mode
+///
+/// The board is rendered in ASCII or Unicode+ANSI depending on
+/// `state.config.tui_render_mode`. All other output (status lines,
+/// clock lines) is unaffected by this setting.
+///
 /// ## Memory & Panic Policy
 ///
 /// No heap inside this function. No panics. The board scratch
-/// buffer (256 bytes) and per-line buffer (96 bytes) are stack
-/// resident.
+/// buffer (`TUI_BOARD_RENDER_BUFFER_BYTES` = 256 bytes) and per-line
+/// buffer (`TUI_LINE_BUFFER_BYTES` = 96 bytes) are stack resident.
 pub fn write_dungeon_master_state_to_tui_and_log(
     state: &DungeonMasterState,
     current_unix_timestamp: u64,
     emit_line: &mut dyn FnMut(&[u8]),
 ) {
     // ----- Step 1: clear the terminal screen directly (not via emit_line).
+    // The clear-screen sequence is a terminal control operation, not
+    // content; it must not appear in the log file.
     let _ = buffy_print(
         "{}",
         &[BuffyFormatArg::Str(
@@ -23596,16 +24340,29 @@ pub fn write_dungeon_master_state_to_tui_and_log(
     );
 
     // ----- Step 2: render board into a stack buffer, then emit per line.
+    // The rendering function is selected by tui_render_mode. Both
+    // functions share the same signature and write into the same buffer,
+    // so the rest of this function is identical for both modes.
     let mut board_render_buffer: [u8; TUI_BOARD_RENDER_BUFFER_BYTES] =
-        [0; TUI_BOARD_RENDER_BUFFER_BYTES];
+        [0u8; TUI_BOARD_RENDER_BUFFER_BYTES];
 
-    let render_from_white_view = should_render_from_white_view(&state.config);
+    let render_from_white_view: bool = should_render_from_white_view(&state.config);
 
-    match format_board_state_as_ascii(
-        &state.board,
-        render_from_white_view,
-        &mut board_render_buffer,
-    ) {
+    let board_render_result: Result<usize, MoveValidationError> = match state.config.tui_render_mode
+    {
+        TuiRenderMode::Ascii => format_board_state_as_ascii(
+            &state.board,
+            render_from_white_view,
+            &mut board_render_buffer,
+        ),
+        TuiRenderMode::UnicodeAnsi => format_board_state_as_unicode_ansi(
+            &state.board,
+            render_from_white_view,
+            &mut board_render_buffer,
+        ),
+    };
+
+    match board_render_result {
         Ok(board_byte_length) => {
             emit_board_lines_from_rendered_buffer(
                 &board_render_buffer,
@@ -23614,15 +24371,18 @@ pub fn write_dungeon_master_state_to_tui_and_log(
             );
         }
         Err(_) => {
-            // Defensive: format_board_state_as_ascii only fails on
+            // Defensive: both render functions only fail on
             // buffer-too-small, which is unreachable given the chosen
-            // TUI_BOARD_RENDER_BUFFER_BYTES sizing. Emit a fallback
-            // so the user sees something rather than a silent gap.
+            // TUI_BOARD_RENDER_BUFFER_BYTES sizing. Emit a visible
+            // placeholder so the user sees something rather than a
+            // silent gap.
             emit_line(b"(board render error)");
         }
     }
 
     // ----- Step 3: emit the six status block lines.
+    // These are mode-independent: clock values and status text are
+    // plain ASCII regardless of tui_render_mode.
     emit_one_formatted_line(
         |output_buffer| write_status_line_into_buffer(state, output_buffer),
         emit_line,
@@ -23694,7 +24454,8 @@ mod section_62_write_dungeon_master_state_to_tui_and_log_tests {
             600, // 10-minute per-player budget
             10,
             50,
-            1_000_000_000, // bootstrap_run_unix_timestamp_seconds
+            1_000_000_000, // bootstrap_run_unix_timestamp_seconds,
+            TuiRenderMode::Ascii,
         )
         .expect("test config must construct")
     }
