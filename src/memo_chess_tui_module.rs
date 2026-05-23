@@ -20135,26 +20135,46 @@ fn parse_format_spec(placeholder: &str) -> Option<FormatSpec> {
     Some(FormatSpec { alignment, width })
 }
 
-/// Apply alignment to a value, writing result to buffer
-/// Returns number of bytes written, or None if buffer too small
-fn apply_alignment<'a>(value: &str, spec: FormatSpec, buf: &'a mut [u8]) -> Option<&'a str> {
+/// Apply alignment to a value, returning a string slice that points
+/// either at the original `value` (when no width directive applies)
+/// or into `buf` (when padding was required).
+///
+/// ## Why the no-width path returns `value` directly
+///
+/// When the format spec has no width (the bare `"{}"` case, which is
+/// by far the most common in practice), no padding is needed and no
+/// transformation of `value` is needed. The previous version copied
+/// `value` into `buf` and returned a slice of `buf`; that imposed
+/// `buf.len()` as an artificial upper bound on the length of any
+/// bare-placeholder value. A 132-byte string passed to `"{}"` with a
+/// 128-byte `buf` returned `None`, causing the caller to fail. The
+/// no-width branch now returns the input slice directly, removing
+/// `buf` as a bottleneck for the common case. `buf`'s size still
+/// caps width-directive paths (`{:<N}`, `{:>N}`, `{:^N}`) because
+/// those genuinely require a copy to insert padding.
+///
+/// ## Returns
+///
+/// `Some(slice)` on success. `None` only when a width directive is
+/// active AND the resulting padded output would not fit into `buf`.
+fn apply_alignment<'a>(value: &'a str, spec: FormatSpec, buf: &'a mut [u8]) -> Option<&'a str> {
     let width = match spec.width {
         Some(w) => w,
         None => {
-            // No width specified, just copy value
-            let value_bytes = value.as_bytes();
-            if value_bytes.len() > buf.len() {
-                return None;
-            }
-            buf[..value_bytes.len()].copy_from_slice(value_bytes);
-            return std::str::from_utf8(&buf[..value_bytes.len()]).ok();
+            // No width specified. Return the input directly — no copy,
+            // no buf-size cap. Per the doc-block above, this is the
+            // hot path for bare `"{}"` placeholders.
+            return Some(value);
         }
     };
 
     let value_len = value.len();
 
     if value_len >= width {
-        // Value already meets or exceeds width
+        // Value already meets or exceeds width — no padding needed,
+        // but we must still go through `buf` because callers may
+        // assume the returned slice is buf-backed in this branch.
+        // Same length check as before.
         if value_len > buf.len() {
             return None;
         }
@@ -20170,23 +20190,22 @@ fn apply_alignment<'a>(value: &str, spec: FormatSpec, buf: &'a mut [u8]) -> Opti
 
     match spec.alignment {
         Alignment::Left => {
-            // Value then spaces
+            // Value then spaces.
             buf[..value_len].copy_from_slice(value.as_bytes());
             for i in value_len..width {
                 buf[i] = b' ';
             }
         }
         Alignment::Right => {
-            // Spaces then value
+            // Spaces then value.
             for i in 0..padding {
                 buf[i] = b' ';
             }
             buf[padding..width].copy_from_slice(value.as_bytes());
         }
         Alignment::Center => {
-            // Spaces, value, spaces
+            // Spaces, value, spaces.
             let left_pad = padding / 2;
-            // Right pad not needed - calculated as (width - left_pad - value_len)
             for i in 0..left_pad {
                 buf[i] = b' ';
             }
@@ -20199,6 +20218,71 @@ fn apply_alignment<'a>(value: &str, spec: FormatSpec, buf: &'a mut [u8]) -> Opti
 
     std::str::from_utf8(&buf[..width]).ok()
 }
+
+// /// Apply alignment to a value, writing result to buffer
+// /// Returns number of bytes written, or None if buffer too small
+// fn apply_alignment<'a>(value: &str, spec: FormatSpec, buf: &'a mut [u8]) -> Option<&'a str> {
+//     let width = match spec.width {
+//         Some(w) => w,
+//         None => {
+//             // No width specified, just copy value
+//             let value_bytes = value.as_bytes();
+//             if value_bytes.len() > buf.len() {
+//                 return None;
+//             }
+//             buf[..value_bytes.len()].copy_from_slice(value_bytes);
+//             return std::str::from_utf8(&buf[..value_bytes.len()]).ok();
+//         }
+//     };
+
+//     let value_len = value.len();
+
+//     if value_len >= width {
+//         // Value already meets or exceeds width
+//         if value_len > buf.len() {
+//             return None;
+//         }
+//         buf[..value_len].copy_from_slice(value.as_bytes());
+//         return std::str::from_utf8(&buf[..value_len]).ok();
+//     }
+
+//     if width > buf.len() {
+//         return None;
+//     }
+
+//     let padding = width - value_len;
+
+//     match spec.alignment {
+//         Alignment::Left => {
+//             // Value then spaces
+//             buf[..value_len].copy_from_slice(value.as_bytes());
+//             for i in value_len..width {
+//                 buf[i] = b' ';
+//             }
+//         }
+//         Alignment::Right => {
+//             // Spaces then value
+//             for i in 0..padding {
+//                 buf[i] = b' ';
+//             }
+//             buf[padding..width].copy_from_slice(value.as_bytes());
+//         }
+//         Alignment::Center => {
+//             // Spaces, value, spaces
+//             let left_pad = padding / 2;
+//             // Right pad not needed - calculated as (width - left_pad - value_len)
+//             for i in 0..left_pad {
+//                 buf[i] = b' ';
+//             }
+//             buf[left_pad..left_pad + value_len].copy_from_slice(value.as_bytes());
+//             for i in (left_pad + value_len)..width {
+//                 buf[i] = b' ';
+//             }
+//         }
+//     }
+
+//     std::str::from_utf8(&buf[..width]).ok()
+// }
 
 // =============================================================================
 // DIRECT TERMINAL OUTPUT - TRUE ZERO HEAP
@@ -25094,15 +25178,27 @@ pub fn format_board_state_as_unicode_ansi(
                 }
             }
 
-            // Always reset SGR after each square so background and
-            // foreground do not leak into the trailing separator
-            // space or the next square. 4 bytes per square keeps the
-            // state explicit and auditable.
+            // // Always reset SGR after each square so background and
+            // // foreground do not leak into the trailing separator
+            // // space or the next square. 4 bytes per square keeps the
+            // // state explicit and auditable.
+            // write_position =
+            //     write_bytes_to_buffer(line_scratch_buffer, write_position, ANSI_SGR_RESET)?;
+
+            // // Separating space after each square.
+            // write_position = write_byte_to_buffer(line_scratch_buffer, write_position, b' ')?;
+
+            // Separating space FIRST (still within whatever
+            // background SGR is active for this square), so the
+            // background paints a 2-character-wide cell instead of
+            // a 1-character-wide cell with a gap.
+            write_position = write_byte_to_buffer(line_scratch_buffer, write_position, b' ')?;
+
+            // Reset SGR AFTER the separator space so background and
+            // foreground do not leak into the next square. Per-square
+            // reset keeps the state explicit and auditable.
             write_position =
                 write_bytes_to_buffer(line_scratch_buffer, write_position, ANSI_SGR_RESET)?;
-
-            // Separating space after each square.
-            write_position = write_byte_to_buffer(line_scratch_buffer, write_position, b' ')?;
 
             file_iteration_step += 1;
         }
@@ -25766,6 +25862,54 @@ pub fn build_game_log_filename_into_buffer(
 // Terminal-write helper (best effort)
 // ----------------------------------------------------------------------------
 
+// /// Write one content line to the terminal via Buffy, followed by a
+// /// newline.
+// ///
+// /// ## Project Context
+// ///
+// /// Used by the wrapper's double-publish closure as the terminal
+// /// half. The line content is whatever
+// /// `write_dungeon_master_state_to_tui_and_log` (Section 62) emits;
+// /// the terminator (`\n`) is added here so that Section 62 itself
+// /// emits no trailing newlines.
+// ///
+// /// ## Best-effort semantics
+// ///
+// /// Buffy's `buffy_println` returns `io::Result<()>`. Failure paths
+// /// (e.g., stdout is closed, terminal is unreachable) are silently
+// /// dropped. The game continues.
+// ///
+// /// ## Arguments
+// ///
+// /// - `line_bytes`: the line content. May contain any ASCII or
+// ///   UTF-8 bytes. Non-UTF-8 sequences are written via a fallback
+// ///   path that emits a defensive placeholder, since `buffy_println`
+// ///   requires `&str`.
+// ///
+// /// ## Memory & Panic Policy
+// ///
+// /// No heap. No panics. Buffy is stack-only.
+// pub fn write_one_line_to_terminal_via_buffy_best_effort(line_bytes: &[u8]) {
+//     // Buffy requires &str; attempt UTF-8 conversion.
+//     match core::str::from_utf8(line_bytes) {
+//         Ok(line_as_str) => {
+//             // Format string "{}" plus the line as a single Str arg.
+//             // Discarding the io::Result per best-effort semantics.
+//             let _ = buffy_println("{}", &[BuffyFormatArg::Str(line_as_str)]);
+//         }
+//         Err(_) => {
+//             // Defensive fallback. The renderer in Section 62 produces
+//             // ASCII-only output (ANSI escape sequences plus board
+//             // characters plus status text), so this branch is
+//             // unreachable in normal operation. Emit a visible marker
+//             // so a future change that introduces non-UTF-8 bytes
+//             // produces an observable artifact rather than a silent
+//             // dropped line.
+//             let _ = buffy_println("(non-utf8 line)", &[]);
+//         }
+//     }
+// }
+
 /// Write one content line to the terminal via Buffy, followed by a
 /// newline.
 ///
@@ -25777,11 +25921,24 @@ pub fn build_game_log_filename_into_buffer(
 /// the terminator (`\n`) is added here so that Section 62 itself
 /// emits no trailing newlines.
 ///
-/// ## Best-effort semantics
+/// ## Best-effort semantics, with observable failure
 ///
 /// Buffy's `buffy_println` returns `io::Result<()>`. Failure paths
-/// (e.g., stdout is closed, terminal is unreachable) are silently
-/// dropped. The game continues.
+/// (e.g., stdout is closed, terminal is unreachable, an internal
+/// Buffy buffer overflows) are NOT silently dropped:
+///
+///   - In debug builds (`debug_assertions`), a one-line diagnostic
+///     is written directly to stderr via `std::io::Write` so the
+///     failure is visible during development. Stderr is used (not
+///     Buffy) because Buffy is what failed.
+///
+///   - In production builds, a terse marker line is written to
+///     stdout via a direct `std::io::Write` call (no Buffy). This
+///     bypasses whatever made Buffy fail. The marker prefix
+///     `WOLTTV` (write_one_line_to_terminal_via_buffy) makes the
+///     failure attributable.
+///
+/// The game continues either way.
 ///
 /// ## Arguments
 ///
@@ -25792,24 +25949,53 @@ pub fn build_game_log_filename_into_buffer(
 ///
 /// ## Memory & Panic Policy
 ///
-/// No heap. No panics. Buffy is stack-only.
+/// No heap. No panics. The debug-build diagnostic uses stack-
+/// resident `write!` formatting through `std::io::Write`; the
+/// production-build marker is a fixed byte slice.
 pub fn write_one_line_to_terminal_via_buffy_best_effort(line_bytes: &[u8]) {
+    use std::io::Write;
+
     // Buffy requires &str; attempt UTF-8 conversion.
-    match core::str::from_utf8(line_bytes) {
-        Ok(line_as_str) => {
-            // Format string "{}" plus the line as a single Str arg.
-            // Discarding the io::Result per best-effort semantics.
-            let _ = buffy_println("{}", &[BuffyFormatArg::Str(line_as_str)]);
-        }
+    let buffy_result: std::io::Result<()> = match core::str::from_utf8(line_bytes) {
+        Ok(line_as_str) => buffy_println("{}", &[BuffyFormatArg::Str(line_as_str)]),
         Err(_) => {
             // Defensive fallback. The renderer in Section 62 produces
-            // ASCII-only output (ANSI escape sequences plus board
+            // ASCII or UTF-8 output (ANSI escape sequences plus board
             // characters plus status text), so this branch is
             // unreachable in normal operation. Emit a visible marker
             // so a future change that introduces non-UTF-8 bytes
             // produces an observable artifact rather than a silent
             // dropped line.
-            let _ = buffy_println("(non-utf8 line)", &[]);
+            buffy_println("(WOLTTV non-utf8 line)", &[])
+        }
+    };
+
+    if let Err(buffy_failure) = buffy_result {
+        // Buffy could not write this line. Do NOT silently drop it.
+        // Stderr in debug; terse stdout marker in production.
+        #[cfg(debug_assertions)]
+        {
+            let mut stderr_handle = std::io::stderr();
+            // Length and error kind only — no line content (which
+            // could contain user-influenced bytes) per the project's
+            // production-error-content rules.
+            let _ = writeln!(
+                stderr_handle,
+                "[debug] WOLTTV buffy_println failed: len={} kind={:?}",
+                line_bytes.len(),
+                buffy_failure.kind()
+            );
+            let _ = stderr_handle.flush();
+        }
+        #[cfg(not(debug_assertions))]
+        {
+            // Production: write a terse marker directly through
+            // std::io, bypassing Buffy (since Buffy is what failed).
+            // No content from the dropped line, no error details
+            // beyond a fixed prefix.
+            let mut stdout_handle = std::io::stdout();
+            let _ = stdout_handle.write_all(b"(WOLTTV buffy drop)\n");
+            let _ = stdout_handle.flush();
         }
     }
 }
@@ -26591,7 +26777,7 @@ pub fn replay_existing_moves_from_chrono_index(
                                     PieceColor::Black => "B",
                                 };
                                 let _ = buffy_println(
-                                    "REPLAY move: side={} ts={} W_cum={} B_cum={} last_ts={:?}",
+                                    "\nREPLAY move: side={} ts={} W_cum={} B_cum={} last_ts={:?}",
                                     &[
                                         BuffyFormatArg::Str(side_str),
                                         BuffyFormatArg::Usize(move_unix_timestamp as usize),
