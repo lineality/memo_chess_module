@@ -544,6 +544,31 @@ fn run_hardcoded_demo() -> ExitCode {
     )
 }
 
+/// Pause for user acknowledgment before the process exits.
+///
+/// This is useful in re-launched contexts (new terminal, tmux pane) where
+/// the window/pane would close immediately after game completion, making
+/// the final summary unreadable. The user presses Enter to dismiss the
+/// prompt and allow the process to exit normally.
+///
+/// # Error handling
+///
+/// If stdin is broken or the read fails for any reason, we silently
+/// continue and exit anyway. This preserves the exit code and prevents
+/// a read error from escalating into a panic or special exit code.
+fn pause_for_user_acknowledgment() {
+    use std::io::{self, BufRead};
+
+    eprint!("Press Enter to continue...");
+    // Flush stderr to ensure the prompt is visible before we block on stdin.
+    let _ = std::io::Write::flush(&mut std::io::stderr());
+
+    let stdin = io::stdin();
+    let mut reader = stdin.lock();
+    let mut throwaway_buffer = String::new();
+    let _ = reader.read_line(&mut throwaway_buffer);
+}
+
 /// Execute the full bootstrap → state-init → replay → game-loop pipeline.
 ///
 /// This is the single point where this binary talks to the chess engine.
@@ -646,6 +671,11 @@ fn drive_full_game_pipeline(
         logging_directory_path.display()
     );
     println!();
+
+    // Pause so the user can read the summary before the window/pane closes.
+    // This is especially valuable in re-launched contexts (--new-terminal,
+    // --tmux-split-vertical, etc.).
+    pause_for_user_acknowledgment();
 
     ExitCode::from(EXIT_CODE_SUCCESS)
 }
