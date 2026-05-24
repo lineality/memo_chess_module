@@ -246,10 +246,12 @@ pub enum GameStatus {
     CheckmateBlackwin,
 
     /// One player offers a draw
-    ///
+    /// maybe deprecated
     DrawOffered,
 
     /// Both players agreed to a draw via successive draw commands.
+    /// relies on detecting two consecutive draw files by both colors
+    /// this has nothing to do with DrawOffered
     DrawAgreed,
 
     /// The game was drawn by threefold repetition. (Reserved for
@@ -1712,6 +1714,35 @@ pub fn run_one_dungeon_master_tick(
                     };
                 }
             }
+        }
+    }
+
+    // ----- Step 4b: agreed-draw scan over the last two consecutive files -----
+    //
+    // Stateless check. Reads no state, writes no state (other than
+    // game_status on the returned working copy). Independent of
+    // board.draw_offer_pending. Runs every tick at O(1) file reads.
+    //
+    // Placement rationale: runs AFTER the chrono-sort hash check
+    // (so we trust the chrono-index ordering) and BEFORE the time-
+    // flag check (because an agreed draw is a terminal outcome
+    // derived purely from committed files and should not be gated
+    // by the clock).
+    match scan_for_agreed_draw_from_consecutive_files(
+        chrono_sort_temp_path,
+        total_committed_file_count,
+        &current_state.config,
+    ) {
+        AgreedDrawScanResult::AgreedDrawDetected => {
+            let mut working_state_for_agreed_draw: DungeonMasterState = *current_state;
+            working_state_for_agreed_draw.board.game_status = GameStatus::DrawAgreed;
+            return TickResult {
+                new_state: working_state_for_agreed_draw,
+                outcome: TickOutcome::DrawAgreed,
+            };
+        }
+        AgreedDrawScanResult::NoAgreement => {
+            // No agreement on this tick. Fall through to Step 5.
         }
     }
 
@@ -26102,4 +26133,250 @@ pub fn replay_existing_moves_from_chrono_index(
     }
 
     state
+}
+
+// ================================================================================
+// SECTION 66: Draw Agreement by Chronologically Consecutive Opposite-Colour Files
+// ================================================================================
+
+/// Result of a one-shot agreed-draw scan over the two chronologically
+/// most-recent committed files.
+///
+/// ## Project Context
+///
+/// MVP-1 agreed-draw rule: when both players write a memo containing
+/// the literal `draw` command in chronologically-adjacent committed
+/// files, the game ends as `GameStatus::DrawAgreed`. This enum is
+/// the verdict of the stateless scan that detects that pattern.
+/// It is intentionally independent of `BoardState.draw_offer_pending`.
+///
+/// ## Variants
+///
+/// Unit variants only, per project policy of not leaking file
+/// contents, paths, or owner bytes through outcome values.
+///
+/// All transient per-file faults (path lookup failure, non-UTF-8
+/// path bytes, read I/O failure, missing TOML fields, owner not
+/// matching either configured player name, text body not the
+/// literal `Draw` command) collapse into `NoAgreement`. The next
+/// tick re-runs the scan; persistent fault conditions simply mean
+/// the game never reaches `AgreedDrawDetected` from those files,
+/// which is the safe outcome.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AgreedDrawScanResult {
+    /// The two chronologically-last committed files are both
+    /// parseable `Draw` commands AND their owners resolve to the
+    /// two opposite player colors. The caller should set
+    /// `GameStatus::DrawAgreed` and return.
+    AgreedDrawDetected,
+
+    /// No agreement detected. Default for every case other than the
+    /// strict pattern above: fewer than two committed files, any
+    /// per-file fault, same-color owners, either file not a `Draw`
+    /// command, or owner bytes not matching a configured player name.
+    NoAgreement,
+}
+
+/// Reads one chrono-index position and reports whether the file at
+/// that position is a parseable `Draw` command, and if so, which
+/// configured player color owns it.
+///
+/// ## Project Context
+///
+/// Building block for `scan_for_agreed_draw_from_consecutive_files`.
+/// Distinct from `classify_chrono_position_for_player`: that function
+/// is parameterized by an EXPECTED target color and filters on it;
+/// this helper has no expected color and REPORTS BACK whichever
+/// configured color (white or black) the file's `owner` field
+/// resolves to. A file whose `owner` matches neither configured
+/// player name returns `None`.
+///
+/// ## Arguments
+///
+/// - `chrono_temp_directory_path`: chrono-index temp root.
+/// - `chrono_position`: zero-based position into the committed
+///   chrono-index. Out-of-range positions return `None`.
+/// - `config`: holds the two configured player names, used to
+///   resolve the file's `owner` byte sequence to a `PieceColor`.
+///
+/// ## Returns
+///
+/// - `Some(PieceColor::White)`: file read successfully, its
+///   `text_message` parses as `NonMovePlayerCommand::Draw`, and
+///   its `owner` bytes equal the configured white player name.
+/// - `Some(PieceColor::Black)`: same conditions for the black
+///   player name.
+/// - `None`: every other case — out-of-range position, chrono
+///   lookup error, non-UTF-8 path bytes, memo read I/O failure,
+///   memo missing fields, command not `Draw` (including `Resign`
+///   or a chess move), or owner bytes matching neither configured
+///   player name.
+///
+/// ## Memory & Panic Policy
+///
+/// No heap. No panic. One stack-allocated
+/// `[u8; MAX_FULL_PATH_LEN]` path buffer per call.
+fn color_of_draw_command_at_chrono_position(
+    chrono_temp_directory_path: &Path,
+    chrono_position: u64,
+    config: &MemochessGameConfig,
+) -> Option<PieceColor> {
+    // Step 1: resolve the absolute file path for this chrono
+    // position into a stack buffer.
+    let mut path_byte_buffer: [u8; MAX_FULL_PATH_LEN] = [0u8; MAX_FULL_PATH_LEN];
+    let lookup_outcome = lookup_abs_file_path_at_mtime_chronological_index(
+        chrono_temp_directory_path,
+        chrono_position,
+        &mut path_byte_buffer,
+    );
+    let path_byte_length: usize = match lookup_outcome {
+        Ok(Some(lookup_summary)) => lookup_summary.path_byte_length,
+        Ok(None) => return None, // position out of committed range
+        Err(_) => return None,   // chrono-index I/O fault — treat as not-a-draw
+    };
+
+    // Step 2: convert path bytes to &str. The memo reader API
+    // takes &str; non-UTF-8 paths are not consulted further.
+    let absolute_file_path_str: &str =
+        match core::str::from_utf8(&path_byte_buffer[..path_byte_length]) {
+            Ok(valid_str) => valid_str,
+            Err(_) => return None,
+        };
+
+    // Step 3: read the memo file's owner and text_message fields.
+    let memo_contents = match read_memo_move_file(absolute_file_path_str) {
+        Ok(Some(contents)) => contents,
+        Ok(None) => return None, // file malformed or fields missing
+        Err(_) => return None,   // memo-read I/O fault
+    };
+
+    // Step 4: parse the text_message as a non-move command. Only
+    // the literal `Draw` command qualifies; `Resign` or a chess
+    // move disqualifies.
+    let text_message_bytes: &[u8] = memo_contents.text_message_as_bytes();
+    match parse_non_move_player_command(text_message_bytes) {
+        Some(NonMovePlayerCommand::Draw) => {
+            // proceed to owner resolution
+        }
+        Some(NonMovePlayerCommand::Resign) => return None,
+        None => return None,
+    }
+
+    // Step 5: resolve owner bytes to a configured PieceColor.
+    // Direct byte-slice compare; the player-name byte sequences in
+    // the config are the authoritative values for this comparison.
+    let owner_bytes: &[u8] = memo_contents.owner_as_bytes();
+    if owner_bytes == config.white_player_name_as_bytes() {
+        return Some(PieceColor::White);
+    }
+    if owner_bytes == config.black_player_name_as_bytes() {
+        return Some(PieceColor::Black);
+    }
+
+    // Owner matches neither configured player name. Treated as
+    // not-a-draw for purposes of the agreement check.
+    None
+}
+
+/// Scans the two chronologically-most-recent committed files for an
+/// agreed-draw pattern: both files must be parseable `Draw` commands
+/// owned by opposite player colors.
+///
+/// ## Project Context
+///
+/// MVP-1 agreed-draw rule: when both players write a memo containing
+/// the literal `draw` command in chronologically-adjacent committed
+/// files (no intervening move, resignation, or any other committed
+/// file), the game ends as `GameStatus::DrawAgreed`.
+///
+/// This function is the stateless detector of that condition. It is
+/// called once per dungeon-master tick between the chrono-sort hash
+/// check (Step 4 of `run_one_dungeon_master_tick`) and the time-flag
+/// check (Step 5). Whichever tick first sees the second of the two
+/// consecutive draw memos returns `AgreedDrawDetected`, terminating
+/// the game.
+///
+/// This scan is intentionally INDEPENDENT of
+/// `BoardState.draw_offer_pending`. It does not read that flag, does
+/// not write that flag, and its outcome is not influenced by it.
+///
+/// ## Why two-position lookback, not full history walk
+///
+/// Because the scan runs every tick, any earlier two-consecutive-
+/// draw pattern in history would have ended the game on the tick
+/// that observed it. Only the trailing two positions need to be
+/// checked per tick. Cost: two chrono-index lookups plus two memo-
+/// file reads per tick, regardless of game length.
+///
+/// ## Arguments
+///
+/// - `chrono_temp_directory_path`: chrono-index temp root.
+/// - `total_committed_file_count`: file count returned by
+///   `create_or_update_chrono_index` on this tick.
+/// - `config`: needed to resolve memo `owner` byte sequences to
+///   `PieceColor`.
+///
+/// ## Returns
+///
+/// - `AgreedDrawScanResult::AgreedDrawDetected`: both trailing
+///   files are readable `Draw` commands AND their owners resolve
+///   to opposite colors.
+/// - `AgreedDrawScanResult::NoAgreement`: every other case,
+///   including fewer than two committed files, any per-file fault,
+///   same-color owners, or either trailing file not being a `Draw`
+///   command.
+///
+/// ## Memory & Panic Policy
+///
+/// No heap. No panic. Two `[u8; MAX_FULL_PATH_LEN]` path buffers
+/// allocated by sequential helper calls (one per consulted
+/// position); no buffer overlap, no aliasing.
+pub fn scan_for_agreed_draw_from_consecutive_files(
+    chrono_temp_directory_path: &Path,
+    total_committed_file_count: u64,
+    config: &MemochessGameConfig,
+) -> AgreedDrawScanResult {
+    // A two-position consecutive pattern is impossible with fewer
+    // than two committed files.
+    if total_committed_file_count < 2 {
+        return AgreedDrawScanResult::NoAgreement;
+    }
+
+    // total_committed_file_count >= 2, so both subtractions are
+    // safe with respect to u64 underflow.
+    let last_position: u64 = total_committed_file_count - 1;
+    let second_last_position: u64 = total_committed_file_count - 2;
+
+    // Step 1: classify the LAST file. If it is not a draw command
+    // (or cannot be read), no agreement can hold on this tick: the
+    // agreement is declared when the second draw lands, so the
+    // trailing file must be a draw.
+    let last_position_color = match color_of_draw_command_at_chrono_position(
+        chrono_temp_directory_path,
+        last_position,
+        config,
+    ) {
+        Some(color_value) => color_value,
+        None => return AgreedDrawScanResult::NoAgreement,
+    };
+
+    // Step 2: classify the SECOND-LAST file. If it is also a draw
+    // command, the two adjacent positions both qualify.
+    let second_last_position_color = match color_of_draw_command_at_chrono_position(
+        chrono_temp_directory_path,
+        second_last_position,
+        config,
+    ) {
+        Some(color_value) => color_value,
+        None => return AgreedDrawScanResult::NoAgreement,
+    };
+
+    // Step 3: opposite-color owners are the agreement signal. A
+    // same-color pair (the same player wrote "draw" twice in
+    // immediate succession) does NOT constitute agreement.
+    if last_position_color != second_last_position_color {
+        AgreedDrawScanResult::AgreedDrawDetected
+    } else {
+        AgreedDrawScanResult::NoAgreement
+    }
 }
