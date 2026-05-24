@@ -586,11 +586,6 @@ pub struct BoardState {
     /// Indexed per the module-level board indexing convention:
     /// `index = rank * 8 + file`.
     pub board_squares: [Option<Piece>; BOARD_SQUARE_COUNT],
-    /// I do not think draw need to be color detail specific
-    /// I think the only signal needed is: last move was offer bool
-    /// if a player does anything other than 'draw' when offer-bool
-    /// is true that draw_offer_pending-bool is made false.
-    pub draw_offer_pending: bool,
     /// Whose turn it is to move.
     pub side_to_move: PieceColor,
     /// Castling rights for both players.
@@ -778,7 +773,6 @@ pub fn create_initial_board_state() -> BoardState {
 
     BoardState {
         board_squares: board_squares_array,
-        draw_offer_pending: false,
         side_to_move: PieceColor::White,
         castling_rights: CastlingRights::initial_castling_rights(),
         en_passant_target_square: None,
@@ -1720,8 +1714,8 @@ pub fn run_one_dungeon_master_tick(
     // ----- Step 4b: agreed-draw scan over the last two consecutive files -----
     //
     // Stateless check. Reads no state, writes no state (other than
-    // game_status on the returned working copy). Independent of
-    // board.draw_offer_pending. Runs every tick at O(1) file reads.
+    // game_status on the returned working copy).
+    // Runs every tick at O(1) file reads.
     //
     // Placement rationale: runs AFTER the chrono-sort hash check
     // (so we trust the chrono-index ordering) and BEFORE the time-
@@ -1818,17 +1812,7 @@ pub fn run_one_dungeon_master_tick(
                 &working_state.board,
                 command_unix_timestamp,
             );
-
-            // Check if a draw was already offered by the opponent.
-            if working_state.board.draw_offer_pending {
-                // Second draw offer from the OTHER player → agreement.
-                working_state.board.game_status = GameStatus::DrawAgreed;
-                TickOutcome::DrawAgreed
-            } else {
-                // First draw offer → set flag and continue.
-                working_state.board.draw_offer_pending = true;
-                TickOutcome::NoChange
-            }
+            TickOutcome::NoChange
         }
 
         ScanLoopOutcome::MoveCandidate {
@@ -1848,11 +1832,6 @@ pub fn run_one_dungeon_master_tick(
                     working_state.black_next_file_chronoindex_to_check = next_position_after;
                 }
             }
-
-            // Reset 'draw-offer' bool
-            // Any legal move (or even an attempted illegal move that passes
-            // through here) should reset the pending draw offer.
-            working_state.board.draw_offer_pending = false;
 
             // Try to resolve the parsed notation to a legal chess
             // move in the current board state.
@@ -2453,7 +2432,6 @@ mod batch_one_tests {
     fn make_empty_board_state_for_tests() -> BoardState {
         BoardState {
             board_squares: [None; BOARD_SQUARE_COUNT],
-            draw_offer_pending: false,
             side_to_move: PieceColor::White,
             castling_rights: CastlingRights {
                 white_kingside: false,
@@ -3177,7 +3155,6 @@ mod batch_two_tests {
     fn make_empty_board_state_for_tests() -> BoardState {
         BoardState {
             board_squares: [None; BOARD_SQUARE_COUNT],
-            draw_offer_pending: false,
             side_to_move: PieceColor::White,
             castling_rights: CastlingRights {
                 white_kingside: false,
@@ -3861,7 +3838,6 @@ mod batch_three_tests {
     fn make_empty_board_state_for_tests() -> BoardState {
         BoardState {
             board_squares: [None; BOARD_SQUARE_COUNT],
-            draw_offer_pending: false,
             side_to_move: PieceColor::White,
             castling_rights: CastlingRights {
                 white_kingside: false,
@@ -4668,7 +4644,6 @@ mod batch_four_tests {
     fn make_empty_board_state_for_tests() -> BoardState {
         BoardState {
             board_squares: [None; BOARD_SQUARE_COUNT],
-            draw_offer_pending: false,
             side_to_move: PieceColor::White,
             castling_rights: CastlingRights {
                 white_kingside: false,
@@ -5788,7 +5763,6 @@ mod batch_five_tests {
     fn make_empty_board_state_for_tests() -> BoardState {
         BoardState {
             board_squares: [None; BOARD_SQUARE_COUNT],
-            draw_offer_pending: false,
             side_to_move: PieceColor::White,
             castling_rights: CastlingRights {
                 white_kingside: false,
@@ -8195,7 +8169,6 @@ mod game_time_tests {
     fn make_test_board_state(side_to_move: PieceColor) -> BoardState {
         BoardState {
             board_squares: [None; BOARD_SQUARE_COUNT],
-            draw_offer_pending: false,
             side_to_move,
             castling_rights: CastlingRights::initial_castling_rights(),
             en_passant_target_square: None,
@@ -25923,20 +25896,6 @@ pub fn replay_existing_moves_from_chrono_index(
                     &state.board,
                     command_unix_timestamp,
                 );
-
-                // Check if a draw was already offered by the opponent.
-                if state.board.draw_offer_pending {
-                    println!("\nfound 2ndth draw!");
-                    // Second draw offer → agreement reached during replay.
-                    state.board.game_status = GameStatus::DrawAgreed;
-                    chrono_position = chrono_position.saturating_add(1);
-                    // Game has ended; the while-loop condition check will break.
-                } else {
-                    println!("\nfound first draw!");
-                    // First draw offer → set flag and continue replaying.
-                    state.board.draw_offer_pending = true;
-                    chrono_position = chrono_position.saturating_add(1);
-                }
             }
 
             ScanPositionClassification::FoundMoveCandidate {
@@ -26147,8 +26106,6 @@ pub fn replay_existing_moves_from_chrono_index(
 /// MVP-1 agreed-draw rule: when both players write a memo containing
 /// the literal `draw` command in chronologically-adjacent committed
 /// files, the game ends as `GameStatus::DrawAgreed`. This enum is
-/// the verdict of the stateless scan that detects that pattern.
-/// It is intentionally independent of `BoardState.draw_offer_pending`.
 ///
 /// ## Variants
 ///
@@ -26295,10 +26252,6 @@ fn color_of_draw_command_at_chrono_position(
 /// check (Step 5). Whichever tick first sees the second of the two
 /// consecutive draw memos returns `AgreedDrawDetected`, terminating
 /// the game.
-///
-/// This scan is intentionally INDEPENDENT of
-/// `BoardState.draw_offer_pending`. It does not read that flag, does
-/// not write that flag, and its outcome is not influenced by it.
 ///
 /// ## Why two-position lookback, not full history walk
 ///
