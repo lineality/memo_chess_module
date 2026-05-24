@@ -245,6 +245,10 @@ pub enum GameStatus {
     /// Black delivered checkmate. Black wins.
     CheckmateBlackwin,
 
+    /// One player offers a draw
+    ///
+    DrawOffered,
+
     /// Both players agreed to a draw via successive draw commands.
     DrawAgreed,
 
@@ -580,6 +584,11 @@ pub struct BoardState {
     /// Indexed per the module-level board indexing convention:
     /// `index = rank * 8 + file`.
     pub board_squares: [Option<Piece>; BOARD_SQUARE_COUNT],
+    /// I do not think draw need to be color detail specific
+    /// I think the only signal needed is: last move was offer bool
+    /// if a player does anything other than 'draw' when offer-bool
+    /// is true that draw_offer_pending-bool is made false.
+    pub draw_offer_pending: bool,
     /// Whose turn it is to move.
     pub side_to_move: PieceColor,
     /// Castling rights for both players.
@@ -767,6 +776,7 @@ pub fn create_initial_board_state() -> BoardState {
 
     BoardState {
         board_squares: board_squares_array,
+        draw_offer_pending: false,
         side_to_move: PieceColor::White,
         castling_rights: CastlingRights::initial_castling_rights(),
         en_passant_target_square: None,
@@ -1756,6 +1766,40 @@ pub fn run_one_dungeon_master_tick(
             TickOutcome::NoChange
         }
 
+        ScanLoopOutcome::DrawOfferCommand {
+            command_unix_timestamp,
+            found_at_position,
+        } => {
+            // Advance cursor past this position.
+            let next_position_after: u64 = found_at_position.saturating_add(1);
+            match side_to_move {
+                PieceColor::White => {
+                    working_state.white_next_file_chronoindex_to_check = next_position_after;
+                }
+                PieceColor::Black => {
+                    working_state.black_next_file_chronoindex_to_check = next_position_after;
+                }
+            }
+
+            // Charge thinking time to the player offering the draw.
+            process_non_move_command_timestamp_for_game_time(
+                &mut working_state.game_time_state,
+                &working_state.board,
+                command_unix_timestamp,
+            );
+
+            // Check if a draw was already offered by the opponent.
+            if working_state.board.draw_offer_pending {
+                // Second draw offer from the OTHER player → agreement.
+                working_state.board.game_status = GameStatus::DrawAgreed;
+                TickOutcome::DrawAgreed
+            } else {
+                // First draw offer → set flag and continue.
+                working_state.board.draw_offer_pending = true;
+                TickOutcome::NoChange
+            }
+        }
+
         ScanLoopOutcome::MoveCandidate {
             parsed_notation,
             move_unix_timestamp,
@@ -1773,6 +1817,11 @@ pub fn run_one_dungeon_master_tick(
                     working_state.black_next_file_chronoindex_to_check = next_position_after;
                 }
             }
+
+            // Reset 'draw-offer' bool
+            // Any legal move (or even an attempted illegal move that passes
+            // through here) should reset the pending draw offer.
+            working_state.board.draw_offer_pending = false;
 
             // Try to resolve the parsed notation to a legal chess
             // move in the current board state.
@@ -2373,6 +2422,7 @@ mod batch_one_tests {
     fn make_empty_board_state_for_tests() -> BoardState {
         BoardState {
             board_squares: [None; BOARD_SQUARE_COUNT],
+            draw_offer_pending: false,
             side_to_move: PieceColor::White,
             castling_rights: CastlingRights {
                 white_kingside: false,
@@ -3096,6 +3146,7 @@ mod batch_two_tests {
     fn make_empty_board_state_for_tests() -> BoardState {
         BoardState {
             board_squares: [None; BOARD_SQUARE_COUNT],
+            draw_offer_pending: false,
             side_to_move: PieceColor::White,
             castling_rights: CastlingRights {
                 white_kingside: false,
@@ -3779,6 +3830,7 @@ mod batch_three_tests {
     fn make_empty_board_state_for_tests() -> BoardState {
         BoardState {
             board_squares: [None; BOARD_SQUARE_COUNT],
+            draw_offer_pending: false,
             side_to_move: PieceColor::White,
             castling_rights: CastlingRights {
                 white_kingside: false,
@@ -4585,6 +4637,7 @@ mod batch_four_tests {
     fn make_empty_board_state_for_tests() -> BoardState {
         BoardState {
             board_squares: [None; BOARD_SQUARE_COUNT],
+            draw_offer_pending: false,
             side_to_move: PieceColor::White,
             castling_rights: CastlingRights {
                 white_kingside: false,
@@ -5704,6 +5757,7 @@ mod batch_five_tests {
     fn make_empty_board_state_for_tests() -> BoardState {
         BoardState {
             board_squares: [None; BOARD_SQUARE_COUNT],
+            draw_offer_pending: false,
             side_to_move: PieceColor::White,
             castling_rights: CastlingRights {
                 white_kingside: false,
@@ -8110,6 +8164,7 @@ mod game_time_tests {
     fn make_test_board_state(side_to_move: PieceColor) -> BoardState {
         BoardState {
             board_squares: [None; BOARD_SQUARE_COUNT],
+            draw_offer_pending: false,
             side_to_move,
             castling_rights: CastlingRights::initial_castling_rights(),
             en_passant_target_square: None,
@@ -23219,6 +23274,9 @@ pub enum TickOutcome {
     /// state is unchanged from the input state; the wrapper retries
     /// next tick.
     ChronoIndexUnreadable,
+
+    /// 2nd player move in a row offered draw
+    DrawAgreed,
 }
 
 /// Result of one tick of the dungeon-master game loop.
@@ -23250,6 +23308,7 @@ pub struct TickResult {
 /// a successful move-candidate and a successful resignation.
 #[derive(Debug, Clone, Copy)]
 enum ScanPositionClassification {
+    // TODO found draw offer?
     /// The file at this position is irrelevant to the current scan
     /// (any per-file failure: wrong owner, malformed content, I/O
     /// error, non-UTF-8 path, unparseable text). The caller advances
@@ -23267,7 +23326,13 @@ enum ScanPositionClassification {
     /// The file at this position contains a resignation command
     /// owned by the target player. The scan stops; the caller will
     /// end the game.
-    FoundResignationCommand { command_unix_timestamp: u64 },
+    FoundResignationCommand {
+        command_unix_timestamp: u64,
+    },
+
+    FoundDrawOfferCommand {
+        command_unix_timestamp: u64,
+    },
 }
 
 /// Examine one chrono-index position and classify what is found.
@@ -23333,8 +23398,7 @@ fn classify_chrono_position_for_player(
     }
 
     // Step 5: interpret the text_message. First check for non-move
-    // commands (draw / resign). For MVP-1 only resignation is acted
-    // on; draw offers are skipped silently.
+    // commands (draw / resign).
     let text_message_bytes: &[u8] = move_file_contents.text_message_as_bytes();
 
     match parse_non_move_player_command(text_message_bytes) {
@@ -23344,7 +23408,9 @@ fn classify_chrono_position_for_player(
             };
         }
         Some(NonMovePlayerCommand::Draw) => {
-            return ScanPositionClassification::SkipAndContinue;
+            return ScanPositionClassification::FoundDrawOfferCommand {
+                command_unix_timestamp: move_file_contents.updated_at_unix_timestamp,
+            };
         }
         None => {
             // Fall through to move parsing.
@@ -23367,6 +23433,7 @@ fn classify_chrono_position_for_player(
 // Internal: per-player range scan
 // ----------------------------------------------------------------------------
 
+// Why does this not have a draw agreed?
 /// Outcome of one per-player scan over a chrono-index range.
 #[derive(Debug, Clone, Copy)]
 enum ScanLoopOutcome {
@@ -23389,6 +23456,13 @@ enum ScanLoopOutcome {
     /// The scan found a resignation command at a specific position.
     /// The caller will advance the cursor to (position + 1).
     ResignationCommand {
+        command_unix_timestamp: u64,
+        found_at_position: u64,
+    },
+
+    /// one player says "draw"
+    DrawOfferCommand {
+        // NEW
         command_unix_timestamp: u64,
         found_at_position: u64,
     },
@@ -23436,6 +23510,14 @@ fn scan_chrono_range_for_player_move(
             ScanPositionClassification::SkipAndContinue => {
                 current_position = current_position.saturating_add(1);
                 continue;
+            }
+            ScanPositionClassification::FoundDrawOfferCommand {
+                command_unix_timestamp,
+            } => {
+                return ScanLoopOutcome::DrawOfferCommand {
+                    command_unix_timestamp,
+                    found_at_position: current_position,
+                };
             }
             ScanPositionClassification::FoundMoveCandidate {
                 parsed_notation,
@@ -23747,6 +23829,13 @@ fn write_status_line_into_buffer(
         GameStatus::CheckmateBlackwin => {
             current_position = write_literal_bytes_into_line_buffer(
                 b"Checkmate. Black wins.",
+                output_buffer,
+                current_position,
+            )?;
+        }
+        GameStatus::DrawOffered => {
+            current_position = write_literal_bytes_into_line_buffer(
+                b"Draw Offer",
                 output_buffer,
                 current_position,
             )?;
@@ -25534,6 +25623,7 @@ pub fn run_memochess_dungeon_master_loop(initial_state: DungeonMasterState) -> D
             TickOutcome::NoChange
             | TickOutcome::MoveApplied
             | TickOutcome::PlayerResigned
+            | TickOutcome::DrawAgreed
             | TickOutcome::TimeFlagged => {
                 // Normal outcomes: accept the new state.
                 current_state = tick_result.new_state;
@@ -25792,10 +25882,37 @@ pub fn replay_existing_moves_from_chrono_index(
                 chrono_position = chrono_position.saturating_add(1);
             }
 
+            ScanPositionClassification::FoundDrawOfferCommand {
+                command_unix_timestamp,
+            } => {
+                println!("\nfound a draw!");
+                // Charge time to the player offering the draw.
+                process_non_move_command_timestamp_for_game_time(
+                    &mut state.game_time_state,
+                    &state.board,
+                    command_unix_timestamp,
+                );
+
+                // Check if a draw was already offered by the opponent.
+                if state.board.draw_offer_pending {
+                    println!("\nfound 2ndth draw!");
+                    // Second draw offer → agreement reached during replay.
+                    state.board.game_status = GameStatus::DrawAgreed;
+                    chrono_position = chrono_position.saturating_add(1);
+                    // Game has ended; the while-loop condition check will break.
+                } else {
+                    println!("\nfound first draw!");
+                    // First draw offer → set flag and continue replaying.
+                    state.board.draw_offer_pending = true;
+                    chrono_position = chrono_position.saturating_add(1);
+                }
+            }
+
             ScanPositionClassification::FoundMoveCandidate {
                 parsed_notation,
                 move_unix_timestamp,
             } => {
+                println!("\nfound FoundMoveCandidate!");
                 // Attempt to resolve the notation against the
                 // current board.
                 let resolve_result =
