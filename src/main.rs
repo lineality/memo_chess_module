@@ -18,7 +18,7 @@
 //!
 //! ## Why a Thin Dispatcher
 //!
-//! The actual chess engine and game loop live in `memo_chess_tui_module`.
+//! The chess engine and game loop live in `memo_chess_tui_module`.
 //! Window/terminal placement lives in `launch_split_term_module`. This
 //! file owns only:
 //!
@@ -218,7 +218,7 @@ fn main() -> ExitCode {
 ///
 /// This is a hand-rolled, single-pass parser. It deliberately does not
 /// validate "all four inputs present" — that check happens only when the
-/// resolved launch mode actually needs the inputs, so the user sees a
+/// resolved launch mode needs the inputs, so the user sees a
 /// targeted error rather than a generic one.
 ///
 /// # Parsing rules
@@ -451,7 +451,7 @@ fn print_version_text_to_stdout() {
 }
 
 // ───────────────────────────────────────────────────────────────────────────
-// Inline run paths (the actual game).
+// Inline run paths (the game).
 // ───────────────────────────────────────────────────────────────────────────
 
 /// Resolve which set of inputs to run with and dispatch to the engine.
