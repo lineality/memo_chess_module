@@ -538,7 +538,14 @@ fn run_real_game_with_inputs(resolved_inputs: ResolvedRealRunInputs) -> ExitCode
 fn run_hardcoded_demo() -> ExitCode {
     // Demo inputs — intentionally hard-coded to preserve the original
     // MVP-1 demo behavior referenced in this binary's history.
+
+    // // Select a demo-game:
+    // let demo_memo_files_directory = Path::new("./test_game_files_1_prawntakespawn").to_path_buf(); // pawn takes pawn
+    // let demo_memo_files_directory = Path::new("./test_game_files_2_whitetime_test").to_path_buf(); // testing white clock
+    // let demo_memo_files_directory = Path::new("./test_game_files_4_whitetime_test2").to_path_buf(); // pawn takes pawn
+    // let demo_memo_files_directory = Path::new("./test_game_files_3_foolmates").to_path_buf(); // pawn takes pawn
     let demo_memo_files_directory = Path::new("./test_game_files_5_draw");
+
     let demo_chrono_sort_temp_directory = Path::new("./test_chrono_temp");
     let demo_logging_directory = Path::new("./test_logs");
     let demo_local_user_name: &[u8] = b"bob";
