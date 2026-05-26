@@ -11,12 +11,12 @@
 //!         - print help,
 //!         - print version,
 //!         - run the demo inline,
-//!         - run the real game inline,
+//!         - run the game inline,
 //!         - re-launch itself in a new terminal window,
 //!         - re-launch itself in a new tmux vertical split,
 //!         - re-launch itself in a new tmux horizontal split.
 //!
-//! ## Why a Thin Dispatcher
+//! ## Thin Dispatcher
 //!
 //! The chess engine and game loop live in `memo_chess_tui_module`.
 //! Window/terminal placement lives in `launch_split_term_module`. This
@@ -46,7 +46,7 @@
 //! ## Production-Rule Adherence
 //!
 //! - No `unsafe`.
-//! - No `unwrap` / `expect` / `panic!` in real code paths. All such uses
+//! - No `unwrap` / `expect` / `panic!` in code paths. All such uses
 //!   are confined to `#[cfg(test)]` blocks.
 //! - No third-party crates. CLI parsing is hand-rolled over the standard
 //!   library only.
@@ -121,7 +121,7 @@ enum LaunchModeSelection {
 ///
 /// All input-value fields are `Option<String>`. They are only required
 /// to be `Some(_)` when `is_demo_mode_requested` is `false` *and* the
-/// resolved launch mode actually needs to read them (i.e. running the
+/// resolved launch mode needs to read them (i.e. running the
 /// game inline). Validation of "all four present" happens at run time,
 /// not at parse time, so parse errors and validation errors stay
 /// distinct in the error path.
@@ -572,7 +572,7 @@ fn pause_for_user_acknowledgment() {
 /// Execute the full bootstrap → state-init → replay → game-loop pipeline.
 ///
 /// This is the single point where this binary talks to the chess engine.
-/// Both the demo path and the real path funnel through here so the
+/// Both the demo path and the path funnel through here so the
 /// pipeline is described exactly once.
 ///
 /// # Returns
@@ -812,7 +812,7 @@ fn build_child_argument_vector_for_relaunch(
 // Tests.
 //
 // Tests cover the pure-logic surface: CLI parsing, conflict detection,
-// child-argv construction. Spawning a real terminal or tmux is out of
+// child-argv construction. Spawning a terminal or tmux is out of
 // scope (non-hermetic, environment-dependent) — that is the launcher
 // module's concern, and it already declines to spawn from its own tests.
 // ───────────────────────────────────────────────────────────────────────────
