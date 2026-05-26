@@ -16,6 +16,13 @@
 //!         - re-launch itself in a new tmux vertical split,
 //!         - re-launch itself in a new tmux horizontal split.
 //!
+//! ## Four Inputs:
+//! The following four flags are required for for a (non-demo-test) chess game:
+//! --memo-file-dir-path  <PATH> Directory containing player memo files
+//! --user-name           <NAME> Local user name for memo attribution
+//! --log-path            <PATH> Directory where logs are written
+//! --chronosort-path     <PATH> Working directory for the chrono-index module
+//!
 //! ## Thin Dispatcher
 //!
 //! The chess engine and game loop live in `memo_chess_tui_module`.
